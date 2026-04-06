@@ -1,0 +1,4 @@
+pyautogui
+pyperclip
+pyobjc-framework-Quartz
+requests

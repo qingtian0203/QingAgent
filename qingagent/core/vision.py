@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+"""
+视觉引擎模块 — 截图采集 + AI 视觉识别
+
+负责对指定窗口区域截图，然后调用多模态大模型
+在截图中定位目标元素，返回归一化坐标。
+"""
+import io
+import json
+import base64
+import time
+import pyautogui
+import requests
+from .. import config
+
+
+def capture_screenshot(rect: tuple, save_path: str = None) -> str | None:
+    """
+    截取指定区域的屏幕截图。
+
+    参数:
+        rect: (x, y, w, h) 窗口物理坐标
+        save_path: 可选，保存截图到文件（调试用）
+
+    返回:
+        base64 编码的 PNG 图片字符串，失败返回 None
+    """
+    try:
+        screenshot = pyautogui.screenshot(region=rect)
+        if save_path:
+            screenshot.save(save_path)
+            print(f"📸 调试截图已保存：{save_path}")
+
+        buf = io.BytesIO()
+        screenshot.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:
+        print(f"❌ 截图失败（请检查屏幕录制权限）：{e}")
+        return None
+
+
+def find_element(
+    img_b64: str,
+    description: str,
+    context: str = "软件截图",
+) -> dict | None:
+    """
+    用 AI 视觉模型在截图中定位元素。
+
+    参数:
+        img_b64: base64 编码的截图
+        description: 要找的元素描述，如 "聊天输入框的中心"
+        context: 截图上下文描述，如 "微信聊天界面" / "IDE界面"
+
+    返回:
+        {"rx": 0-1000, "ry": 0-1000} 归一化坐标，失败返回 None
+    """
+    prompt = (
+        f"这是一张{context}。请找到【{description}】的精确中心位置。"
+        f"只返回 JSON 格式: {{\"rx\": 0-1000, \"ry\": 0-1000}}，"
+        f"其中 rx 和 ry 是该元素中心相对于图片宽高的千分比坐标。"
+        f"不要返回任何其他文字。"
+    )
+
+    payload = {
+        "model": config.VISION_MODEL,
+        "prompt": prompt,
+        "images": [img_b64],
+        "stream": False,
+    }
+
+    try:
+        res = requests.post(
+            config.OLLAMA_URL, json=payload, timeout=config.VISION_TIMEOUT
+        )
+        res.raise_for_status()
+        text = res.json().get("response", "")
+
+        # 提取 JSON
+        clean = text.replace("```json", "").replace("```", "").strip()
+        start = clean.find("{")
+        end = clean.rfind("}") + 1
+        if start == -1 or end == 0:
+            print(f"⚠️ AI 返回内容无法解析为 JSON：{text[:100]}")
+            return None
+
+        coords = json.loads(clean[start:end])
+
+        # 基本校验
+        rx, ry = coords.get("rx", -1), coords.get("ry", -1)
+        if not (0 <= rx <= 1000 and 0 <= ry <= 1000):
+            print(f"⚠️ AI 返回坐标超出范围：rx={rx}, ry={ry}")
+            return None
+
+        return coords
+    except requests.exceptions.Timeout:
+        print(f"❌ AI 识别超时（{config.VISION_TIMEOUT}s）")
+        return None
+    except Exception as e:
+        print(f"❌ AI 识别失败：{e}")
+        return None
+
+
+def find_element_with_retry(
+    img_b64: str,
+    description: str,
+    context: str = "软件截图",
+    max_retries: int = None,
+) -> dict | None:
+    """
+    带重试的元素定位 — 视觉 AI 不是 100% 准确，多试几次。
+
+    参数:
+        img_b64: 截图 base64
+        description: 元素描述
+        context: 截图上下文
+        max_retries: 最大重试次数（默认使用配置值）
+
+    返回:
+        归一化坐标或 None
+    """
+    retries = max_retries or config.VISION_MAX_RETRIES
+
+    for attempt in range(retries):
+        if attempt > 0:
+            print(f"🔄 第 {attempt + 1}/{retries} 次重试定位【{description}】...")
+            time.sleep(1)
+
+        result = find_element(img_b64, description, context)
+        if result:
+            return result
+
+    print(f"❌ 经过 {retries} 次尝试仍无法定位【{description}】")
+    return None
+
+
+def read_screen_content(
+    img_b64: str,
+    question: str,
+    context: str = "软件截图",
+) -> str | None:
+    """
+    用 AI 阅读截图内容 — 不是定位元素，而是提取信息。
+
+    用途：读取聊天消息、获取页面文字内容等
+
+    参数:
+        img_b64: 截图 base64
+        question: 要回答的问题，如 "这个聊天窗口中最新的3条消息内容是什么？"
+        context: 截图上下文描述
+
+    返回:
+        AI 的文字回答，失败返回 None
+    """
+    prompt = f"这是一张{context}。{question}\n请用中文回答，简洁明了。"
+
+    payload = {
+        "model": config.VISION_MODEL,
+        "prompt": prompt,
+        "images": [img_b64],
+        "stream": False,
+    }
+
+    try:
+        res = requests.post(
+            config.OLLAMA_URL, json=payload, timeout=config.VISION_TIMEOUT
+        )
+        res.raise_for_status()
+        return res.json().get("response", "").strip()
+    except Exception as e:
+        print(f"❌ AI 阅读截图失败：{e}")
+        return None

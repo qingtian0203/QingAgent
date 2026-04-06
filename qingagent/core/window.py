@@ -16,7 +16,7 @@ from Quartz import (
 from .. import config
 
 
-def find_window(app_aliases: list[str]) -> dict | None:
+def find_window(app_aliases: list[str], _retry_count: int = 0) -> dict | None:
     """
     在屏幕上查找匹配的应用窗口。
 
@@ -61,20 +61,27 @@ def find_window(app_aliases: list[str]) -> dict | None:
 
     # 如果窗口太小，可能是缩略图，尝试点击唤醒
     if best["rect"][2] < config.MIN_WINDOW_WIDTH:
-        print(f"⚠️ 检测到 {best['owner']} 缩略图，尝试唤醒...")
+        if _retry_count > 3:
+            print(f"❌ 唤醒缩略图失败多次，强行返回当前窗口大小。")
+            return {"rect": best["rect"], "owner": best["owner"]}
+
+        print(f"⚠️ 检测到 {best['owner']} 缩略图（宽: {best['rect'][2]}, 高: {best['rect'][3]}），尝试唤醒... ({_retry_count + 1}/3)")
         import pyautogui
         cx = best["rect"][0] + best["rect"][2] / 2
         cy = best["rect"][1] + best["rect"][3] / 2
-        pyautogui.click(cx, cy)
+        try:
+            pyautogui.click(cx, cy)
+        except Exception as e:
+            print(f"点击唤醒出错 (大概率无辅助功能权限): {e}")
         time.sleep(config.THUMBNAIL_WAKE_DELAY)
-        return find_window(app_aliases)  # 递归重新查找
+        return find_window(app_aliases, _retry_count + 1)  # 递归重新查找
 
     return {"rect": best["rect"], "owner": best["owner"]}
 
 
 def activate_app(app_name: str) -> bool:
     """
-    通过 AppleScript 激活（前置）指定应用。
+    通过 AppleScript 激活（前置）指定应用，并尝试重新打开主窗口。
 
     参数:
         app_name: 应用名称，如 "WeChat" 或 "微信"
@@ -82,9 +89,13 @@ def activate_app(app_name: str) -> bool:
     返回:
         是否成功（基于退出码）
     """
-    ret = os.system(
-        f'osascript -e \'tell application "{app_name}" to activate\' 2>/dev/null'
-    )
+    script = f'''
+    tell application "{app_name}"
+        activate
+        reopen
+    end tell
+    '''
+    ret = os.system(f"osascript -e '{script}' 2>/dev/null")
     if ret == 0:
         print(f"✅ 已激活应用：{app_name}")
         time.sleep(config.APP_SWITCH_DELAY)

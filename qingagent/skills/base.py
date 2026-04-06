@@ -68,7 +68,10 @@ class BaseSkill:
 
     def get_intent_descriptions(self) -> str:
         """生成意图描述文本（给 Planner 用）"""
-        lines = [f"# {self.app_name} 支持的操作：\n"]
+        # 标题包含别名，让 AI 知道简写对应关系
+        aliases = [a for a in self.app_aliases if a != self.app_name]
+        alias_text = f"（也叫：{'/'.join(aliases)}）" if aliases else ""
+        lines = [f"# {self.app_name}{alias_text} 支持的操作：\n"]
         for name, intent in self._intents.items():
             lines.append(f"## {name}: {intent.description}")
             if intent.required_slots:

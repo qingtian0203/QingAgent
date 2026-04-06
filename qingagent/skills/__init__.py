@@ -43,8 +43,16 @@ class SkillRegistry:
         return self._skills
 
     def get_skill_by_name(self, app_name: str) -> BaseSkill | None:
-        """按应用名获取 Skill"""
-        return self._skills.get(app_name)
+        """按应用名或别名获取 Skill"""
+        # 先精确匹配 app_name
+        if app_name in self._skills:
+            return self._skills[app_name]
+        # 再匹配别名（不区分大小写）
+        name_lower = app_name.lower()
+        for skill in self._skills.values():
+            if name_lower in [a.lower() for a in skill.app_aliases]:
+                return skill
+        return None
 
     def find_skill_for_intent(self, intent_name: str) -> tuple[BaseSkill, str] | None:
         """

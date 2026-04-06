@@ -51,6 +51,15 @@ class Planner:
 
 {self._capability_doc}
 
+重要规则：
+- 用户指令中明确提到了某个应用名或别名时，必须使用该应用，不要默认去微信
+- "给AG发消息说xxx" → app=Antigravity，不是微信！AG是Antigravity的简写
+- "给xx发微信" 才是微信，"给AG/Antigravity/编辑器/Cursor发消息" 是Antigravity
+- message/prompt 参数是最终要发给对方的内容，不要包含"问一下""告诉他""说一下"等指令描述词
+- 注意人称转换：用户说"问她干嘛呢"，实际发给对方应该是"你干嘛呢"
+- 示例："给丸子发微信问一下她干嘛呢" → app=微信, contact_name="丸子", message="你干嘛呢"
+- 示例："给AG发消息说 测试一下" → app=Antigravity, intent=send_prompt, prompt="测试一下"
+
 用户指令："{user_input}"
 
 请返回 JSON 格式（不要返回其他任何内容）：

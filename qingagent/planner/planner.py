@@ -14,6 +14,7 @@ import json
 import requests
 from .. import config
 from ..skills import SkillRegistry
+from ..memory import MemoryManager
 
 
 class Planner:
@@ -30,6 +31,8 @@ class Planner:
     def __init__(self, registry: SkillRegistry):
         self.registry = registry
         self._capability_doc = registry.get_full_capability_description()
+        # 初始化记忆管理器（加载 memory.json + 维护历史滑动窗口）
+        self.memory = MemoryManager()
 
     def parse_intent(self, user_input: str) -> dict | None:
         """
@@ -47,7 +50,13 @@ class Planner:
             }
             解析失败返回 None
         """
+        # 构建记忆上下文（用户信息 + 联系人 + 最近历史）
+        memory_context = self.memory.build_context_prompt()
+
         prompt = f"""你是一个指令解析器。根据用户的自然语言指令，识别出要操作的应用、具体操作和参数。
+
+{memory_context}
+
 
 {self._capability_doc}
 
@@ -107,12 +116,13 @@ class Planner:
             print(f"❌ Planner 解析失败：{e}")
             return None
 
-    def execute(self, user_input: str) -> dict:
+    def execute(self, user_input: str, cancel_check=None) -> dict:
         """
         完整执行流程：解析 → 查找 Skill → 执行。
 
         参数:
             user_input: 用户自然语言指令
+            cancel_check: 可选的回调函数，返回 boolean 代表是否在执行中途被用户主动取消
 
         返回:
             {"success": bool, "message": str, "data": any}
@@ -123,6 +133,9 @@ class Planner:
         print(f"\n{'='*50}")
         print(f"📥 收到指令：{user_input}")
         print(f"{'='*50}")
+
+        if cancel_check and cancel_check():
+            return {"success": False, "message": "指令已取消", "data": None}
 
         # 步骤 1：AI 解析意图
         print("\n🧠 正在理解指令...")
@@ -162,6 +175,15 @@ class Planner:
                     "data": None,
                 }
 
+        # 在高危的系统自动化操作前，做最后一次强校验
+        if cancel_check and cancel_check():
+            print(f"🛑 [中断拦截] 拦截了即将在 {skill.app_name} 执行的 {intent_name} 操作")
+            return {
+                "success": False,
+                "message": "已成功拦截阻断该操作！",
+                "data": None,
+            }
+
         # 步骤 3：执行
         print(f"\n🚀 开始执行：{skill.app_name}.{intent_name}...")
         t0 = _time.time()
@@ -173,6 +195,9 @@ class Planner:
         print(f"\n{status} {result['message']}")
         if result.get("data"):
             print(f"📄 返回数据：\n{result['data']}")
+
+        # 记录到历史滑动窗口
+        self.memory.append_history(user_input, f"{status} {result['message']}")
 
         print(f"\n⏱️ ===== 总耗时：{_time.time() - total_start:.1f}s =====")
         return result

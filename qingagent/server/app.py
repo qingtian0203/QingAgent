@@ -119,13 +119,17 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
     def _run_task(task_id: str, command: str):
         """在后台线程中执行任务"""
         try:
-            result = _planner.execute(command)
-            _tasks[task_id] = {"status": "done", "result": result}
+            cancel_check = lambda: _tasks.get(task_id, {}).get("status") == "cancelled"
+            result = _planner.execute(command, cancel_check=cancel_check)
+            # 如果在执行完毕后发现用户中途点了取消，就不要强行标记为 done（防止诈尸）
+            if not cancel_check():
+                _tasks[task_id] = {"status": "done", "result": result}
         except Exception as e:
-            _tasks[task_id] = {
-                "status": "done",
-                "result": {"success": False, "message": f"执行出错：{e}", "data": None},
-            }
+            if _tasks.get(task_id, {}).get("status") != "cancelled":
+                _tasks[task_id] = {
+                    "status": "done",
+                    "result": {"success": False, "message": f"执行出错：{e}", "data": None},
+                }
 
     def _api_task_status(self, task_id: str):
         """查询任务执行状态"""

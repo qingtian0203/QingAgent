@@ -27,6 +27,7 @@ class Intent:
     name: str
     description: str
     required_slots: list[str] = field(default_factory=list)
+    optional_slots: list[str] = field(default_factory=list)
     examples: list[str] = field(default_factory=list)
 
 

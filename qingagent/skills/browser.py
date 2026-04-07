@@ -63,6 +63,18 @@ class BrowserSkill(BaseSkill):
             ],
         ))
 
+        self.add_intent(Intent(
+            name="play_24point",
+            description="自动玩24点游戏：读取页面上的4个数字并计算出答案",
+            optional_slots=["rounds"],
+            examples=[
+                "帮我玩24点",
+                "打开24点游戏帮我玩",
+                "play 24 point",
+                "自动玩24点",
+            ],
+        ))
+
     # --- 具体执行流程 ---
 
     def execute_open_url(self, slots: dict) -> dict:
@@ -131,4 +143,116 @@ class BrowserSkill(BaseSkill):
             "success": True,
             "message": f"已在 {field_desc} 中输入内容",
             "data": None,
+        }
+
+    # --- 24点求解器（穷举法，保证100%正确） ---
+    @staticmethod
+    def _solve_24(numbers: list[int]) -> str | None:
+        """穷举所有可能的运算组合，找到等于24的表达式"""
+        from itertools import permutations, product
+        ops = ['+', '-', '*', '/']
+        # 五种括号模板
+        templates = [
+            '(({a}{o1}{b}){o2}{c}){o3}{d}',
+            '({a}{o1}({b}{o2}{c})){o3}{d}',
+            '({a}{o1}{b}){o2}({c}{o3}{d})',
+            '{a}{o1}(({b}{o2}{c}){o3}{d})',
+            '{a}{o1}({b}{o2}({c}{o3}{d}))',
+        ]
+        for perm in permutations(numbers):
+            for op_combo in product(ops, repeat=3):
+                for tmpl in templates:
+                    expr = tmpl.format(
+                        a=perm[0], b=perm[1], c=perm[2], d=perm[3],
+                        o1=op_combo[0], o2=op_combo[1], o3=op_combo[2]
+                    )
+                    try:
+                        if abs(eval(expr) - 24) < 0.001:
+                            return expr
+                    except (ZeroDivisionError, SyntaxError):
+                        continue
+        return None
+
+    def execute_play_24point(self, slots: dict) -> dict:
+        """
+        自动玩24点游戏：
+        1. 截图读取页面上的4个数字
+        2. 穷举算出答案
+        3. 点击输入框填入答案
+        4. 点击提交按钮
+        """
+        import time as _time
+        import re
+
+        rounds = int(slots.get('rounds', 1))
+        results = []
+
+        for r in range(rounds):
+            self.check_cancel()
+            if r > 0:
+                print(f"\n--- 第 {r+1} 轮 ---")
+
+            if not self.activate():
+                return {"success": False, "message": "浏览器未响应", "data": None}
+
+            # 步骤 1：截图读取数字
+            print("👁 正在读取页面上的4个数字...")
+            content = self.read_content(
+                "请读取页面中展示的4个数字卡片上的数字，只返回4个数字，用逗号分隔。例如: 3,8,7,2"
+            )
+            if not content:
+                return {"success": False, "message": "无法读取页面内容", "data": None}
+
+            # 提取数字
+            nums = re.findall(r'\d+', content)
+            if len(nums) < 4:
+                return {"success": False, "message": f"读取到的数字不足：{content}", "data": None}
+            numbers = [int(n) for n in nums[:4]]
+            print(f"🎴 读取到4个数字：{numbers}")
+
+            # 步骤 2：穷举求解
+            self.check_cancel()
+            print("🧠 正在计算答案...")
+            t0 = _time.time()
+            solution = self._solve_24(numbers)
+            print(f"⏱️ [求解] 耗时：{_time.time()-t0:.2f}s")
+
+            if not solution:
+                results.append(f"轮{r+1}: {numbers} → 无解")
+                print(f"❌ 无解：{numbers}")
+                if r < rounds - 1:
+                    self.find_and_click("下一题按钮")
+                    _time.sleep(1)
+                continue
+
+            print(f"✅ 找到答案：{solution} = 24")
+
+            # 步骤 3：点击输入框并填入答案
+            self.check_cancel()
+            click_ok = self.find_and_click("输入框或答案输入区域")
+            if not click_ok:
+                return {"success": False, "message": "找不到输入框", "data": None}
+
+            _time.sleep(0.3)
+            actions.type_text(solution)
+            _time.sleep(0.3)
+
+            # 步骤 4：点击提交
+            self.check_cancel()
+            self.find_and_click("提交按钮")
+            _time.sleep(1)
+
+            results.append(f"轮{r+1}: {numbers} → {solution} = 24 ✅")
+
+            # 如果有多轮，点下一题
+            if r < rounds - 1:
+                self.check_cancel()
+                self.find_and_click("下一题按钮")
+                _time.sleep(1.5)
+
+        summary = "\n".join(results)
+        return {
+            "success": True,
+            "message": f"24点游戏完成！共 {rounds} 轮",
+            "data": summary,
         }

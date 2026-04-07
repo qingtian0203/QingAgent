@@ -33,6 +33,7 @@ class WeChatSkill(BaseSkill):
     app_name = "微信"
     app_aliases = ["WeChat", "wechat", "微信"]
     app_context = "微信聊天界面截图"
+    cold_start_wait = 2.0   # 微信冷启动等待（搜索框会再吸收一些时间）
 
     def register_intents(self):
         self.add_intent(Intent(
@@ -122,9 +123,11 @@ class WeChatSkill(BaseSkill):
         actions.type_text(contact)
 
         # 3. 等搜索结果加载
+        self.check_cancel()
         _time.sleep(1.2)
 
         # 4. 点击第一个搜索结果
+        self.check_cancel()
         actions.click_at_normalized(rect, SEARCH_FIRST_RESULT, delay=0.8)
 
         # 5. 按 Esc 退出搜索状态（回到正常聊天界面）
@@ -166,14 +169,17 @@ class WeChatSkill(BaseSkill):
             return {"success": False, "message": f"找不到联系人：{contact}", "data": None}
 
         # 等聊天窗口完全打开
+        self.check_cancel()
         _time.sleep(0.8)
 
         # 步骤 3：点击输入框（位置固定）
+        self.check_cancel()
         t0 = _time.time()
         actions.click_at_normalized(self._window_rect, CHAT_INPUT_BOX)
         print(f"⏱️ [输入框直接定位] 耗时：{_time.time() - t0:.1f}s")
 
         # 步骤 4：输入并发送
+        self.check_cancel()
         actions.type_text(message)
         actions.press_key("enter")
 

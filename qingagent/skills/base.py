@@ -27,8 +27,12 @@ class Intent:
     name: str
     description: str
     required_slots: list[str] = field(default_factory=list)
-    optional_slots: list[str] = field(default_factory=list)
     examples: list[str] = field(default_factory=list)
+
+
+class UserCancelException(Exception):
+    """用户强行终止任务引发的异常"""
+    pass
 
 
 class BaseSkill:
@@ -52,7 +56,13 @@ class BaseSkill:
         self._intents: dict[str, Intent] = {}
         self._window_rect = None
         self._verifier = None
+        self._cancel_check = None
         self.register_intents()
+
+    def check_cancel(self):
+        """探测是否被用户强行终止，如果是，瞬间抛异常中止全链路。"""
+        if self._cancel_check and self._cancel_check():
+            raise UserCancelException("操作已被用户强行终止")
 
     def register_intents(self):
         """子类在这里注册自己支持的意图"""
@@ -83,23 +93,65 @@ class BaseSkill:
             lines.append("")
         return "\n".join(lines)
 
-    # --- 通用操作流程 ---
+    # 冷启动默认等待时长（子类可以覆盖）
+    cold_start_wait: float = 3.0
+
+    def _is_running(self) -> bool:
+        """检测应用是否已在运行（通过进程名匹配）"""
+        import subprocess
+        for alias in self.app_aliases:
+            result = subprocess.run(
+                ["pgrep", "-ix", alias],
+                capture_output=True
+            )
+            if result.returncode == 0:
+                return True
+        return False
 
     def activate(self) -> bool:
-        """激活应用并获取窗口"""
+        """激活应用并获取窗口（自动处理冷启动和台前调度唤醒的等待）"""
         import time as _time
         t0 = _time.time()
-        result = window.activate_and_find(self.app_aliases)
+
+        # 检测是否冷启动
+        is_cold = not self._is_running()
+        if is_cold:
+            print(f"🆕 {self.app_name} 未运行，冷启动中...")
+
+        # 激活应用（只激活一次）
+        window.activate_app(self.app_aliases[0])
+
+        # 轮询等待窗口出现（用真实经过时间，防止 find_window 耗时导致计数失准）
+        max_wait = self.cold_start_wait if is_cold else 8.0
+        poll_interval = 0.5
+        result = None
+        start_poll = _time.time()
+        first_miss = True
+
+        while _time.time() - start_poll <= max_wait:
+            self.check_cancel()  # 轮询时持续探测打断状态
+            result = window.find_window(self.app_aliases, silent=True)  # 轮询时静默
+            if result:
+                break
+            if first_miss:
+                print(f"⏳ 等待 {self.app_name} 窗口出现（最多 {max_wait:.0f}s）...")
+                first_miss = False
+            _time.sleep(poll_interval)
+
+        # 如果超时后还是没有，最后一次带日志输出查找一下
+        if not result:
+            result = window.find_window(self.app_aliases, silent=False)
+
         if result:
             self._window_rect = result["rect"]
             self._verifier = verify.StepVerifier(
                 self._window_rect, context=self.app_context
             )
-            print(f"✅ {self.app_name} 窗口就绪：{self._window_rect}")
+            print(f"✅ {self.app_name} 窗口就绪（等待了 {_time.time() - start_poll:.1f}s）：{self._window_rect}")
             print(f"⏱️ [激活应用] 耗时：{_time.time() - t0:.1f}s")
             return True
         else:
-            print(f"❌ 无法找到 {self.app_name} 窗口")
+            print(f"❌ 等待 {max_wait}s 仍无法找到 {self.app_name} 窗口")
             return False
 
     def screenshot(self, save_path: str = None) -> str | None:
@@ -130,6 +182,7 @@ class BaseSkill:
         print(f"⏱️ [截图] 耗时：{_time.time() - t0:.1f}s")
 
         # AI 视觉定位
+        self.check_cancel()
         t0 = _time.time()
         coords = vision.find_element_with_retry(
             img, element_desc, self.app_context
@@ -139,6 +192,7 @@ class BaseSkill:
             return False
 
         # 点击
+        self.check_cancel()
         actions.click_at_normalized(self._window_rect, coords)
 
         # 验证（如果需要）
@@ -157,17 +211,19 @@ class BaseSkill:
             return None
         return vision.read_screen_content(img, question, self.app_context)
 
-    def execute(self, intent_name: str, slots: dict) -> dict:
+    def execute(self, intent_name: str, slots: dict, cancel_check=None) -> dict:
         """
         执行指定意图。
 
         参数:
             intent_name: 意图名称
             slots: 提取到的参数
+            cancel_check: 中断探针闭包
 
         返回:
             {"success": bool, "message": str, "data": any}
         """
+        self._cancel_check = cancel_check
         if intent_name not in self._intents:
             return {
                 "success": False,
@@ -187,6 +243,13 @@ class BaseSkill:
 
         try:
             return method(slots)
+        except UserCancelException as e:
+            print(f"🛑 [强行中断] 任务已在底层被安全拦截隔离！")
+            return {
+                "success": False,
+                "message": str(e),
+                "data": None,
+            }
         except Exception as e:
             return {
                 "success": False,

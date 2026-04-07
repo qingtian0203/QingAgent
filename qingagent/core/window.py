@@ -16,12 +16,13 @@ from Quartz import (
 from .. import config
 
 
-def find_window(app_aliases: list[str], _retry_count: int = 0) -> dict | None:
+def find_window(app_aliases: list[str], _retry_count: int = 0, silent: bool = False) -> dict | None:
     """
     在屏幕上查找匹配的应用窗口。
 
     参数:
         app_aliases: 应用名称列表（支持模糊匹配），如 ["微信", "WeChat"]
+        silent: 为 True 时不打印找不到窗口的日志（轮询场景使用）
 
     返回:
         {"rect": (x, y, w, h), "owner": "进程名"} 或 None
@@ -49,10 +50,11 @@ def find_window(app_aliases: list[str], _retry_count: int = 0) -> dict | None:
                 })
 
     if not found:
-        print(f"❌ 找不到匹配 {app_aliases} 的窗口")
-        print("📋 当前屏幕可见进程：")
-        for name in sorted(list(all_owners))[:15]:
-            print(f"   - {name}")
+        if not silent:
+            print(f"❌ 找不到匹配 {app_aliases} 的窗口")
+            print("📋 当前屏幕可见进程：")
+            for name in sorted(list(all_owners))[:15]:
+                print(f"   - {name}")
         return None
 
     # 按面积排序，取最大的（通常是主窗口）
@@ -81,22 +83,24 @@ def find_window(app_aliases: list[str], _retry_count: int = 0) -> dict | None:
 
 def activate_app(app_name: str) -> bool:
     """
-    通过 AppleScript 激活（前置）指定应用，并尝试重新打开主窗口。
+    激活（前置）指定应用，并强制弹出主窗口。
 
     参数:
         app_name: 应用名称，如 "WeChat" 或 "微信"
 
     返回:
-        是否成功（基于退出码）
+        是否成功
     """
-    script = f'''
-    tell application "{app_name}"
-        activate
-        reopen
-    end tell
-    '''
-    ret = os.system(f"osascript -e '{script}' 2>/dev/null")
-    if ret == 0:
+    import subprocess
+
+    # open -a：等同于双击 Dock 图标，是最可靠的弹出主窗口方式
+    # 对于微信这类关闭台前调度后无响应 reopen 的 App 尤为有效
+    ret_open = subprocess.run(["open", "-a", app_name], capture_output=True).returncode
+
+    # osascript activate：切到前台（open -a 有时不会自动前置）
+    os.system(f'osascript -e \'tell application "{app_name}" to activate\' 2>/dev/null')
+
+    if ret_open == 0:
         print(f"✅ 已激活应用：{app_name}")
         time.sleep(config.APP_SWITCH_DELAY)
         return True

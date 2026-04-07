@@ -187,7 +187,7 @@ class Planner:
         # 步骤 3：执行
         print(f"\n🚀 开始执行：{skill.app_name}.{intent_name}...")
         t0 = _time.time()
-        result = skill.execute(intent_name, slots)
+        result = skill.execute(intent_name, slots, cancel_check=cancel_check)
         print(f"⏱️ [Skill 执行总计] 耗时：{_time.time() - t0:.1f}s")
 
         # 打印结果

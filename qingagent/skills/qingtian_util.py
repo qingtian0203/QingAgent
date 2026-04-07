@@ -183,11 +183,15 @@ class QingTianUtilSkill(BaseSkill):
             return {"success": False, "message": "找不到添加按钮", "data": None}
         _time.sleep(1)
 
-        # 弹窗出现后，需要重新截图（弹窗是独立窗口，可能在最前面）
+        # 🔀 弹窗出现后，切换到弹窗窗口（420x570的独立对话框）
+        # 这样 AI 只看弹窗区域，定位更精准
+        self.switch_to_popup()
+        _time.sleep(0.3)
+
         # 步骤 3：点击"任务内容"下方的白色文本输入区域
         self.check_cancel()
         content_ok = self.find_and_click(
-            "弹窗中'任务内容'标签下方的白色文本输入框区域（大的空白方框）"
+            "'任务内容'标签下方的白色文本输入框区域（大的空白方框）"
         )
         if content_ok:
             _time.sleep(0.3)
@@ -203,7 +207,7 @@ class QingTianUtilSkill(BaseSkill):
             }
             type_text = type_map.get(task_type, task_type)
             self.find_and_click(
-                f"弹窗中'任务类型'行的'{type_text}'按钮"
+                f"'任务类型'行中的'{type_text}'按钮"
             )
             _time.sleep(0.3)
 
@@ -211,7 +215,7 @@ class QingTianUtilSkill(BaseSkill):
         if project:
             self.check_cancel()
             self.find_and_click(
-                f"弹窗中'所属项目'行的'{project}'按钮"
+                f"'所属项目'行中的'{project}'按钮"
             )
             _time.sleep(0.3)
 
@@ -221,7 +225,7 @@ class QingTianUtilSkill(BaseSkill):
         if date_raw in quick_dates:
             # 快捷日期：直接点快捷按钮
             self.find_and_click(
-                f"弹窗中日期区域下方的'{date_raw}'快捷按钮"
+                f"'日期'区域下方一排快捷按钮中的'{date_raw}'按钮"
             )
             _time.sleep(0.3)
         elif date_raw:
@@ -246,7 +250,7 @@ class QingTianUtilSkill(BaseSkill):
                 # 选择月份：点击"月"右边的下拉箭头，再从列表中点月数字
                 self.check_cancel()
                 self.find_and_click(
-                    "弹窗日期行中'月'字右边的下拉选择器按钮（显示当前月份数字的灰色下拉框）"
+                    "'日期'行中'月'字右边的下拉选择器（显示月份数字的灰色框和下拉箭头）"
                 )
                 _time.sleep(0.5)
                 self.find_and_click(
@@ -257,7 +261,7 @@ class QingTianUtilSkill(BaseSkill):
                 # 选择日：点击"日"右边的下拉箭头，再从列表中点日数字
                 self.check_cancel()
                 self.find_and_click(
-                    "弹窗日期行中'日'字右边的下拉选择器按钮（显示当前日期数字的灰色下拉框）"
+                    "'日期'行中'日'字右边的下拉选择器（显示日期数字的灰色框和下拉箭头）"
                 )
                 _time.sleep(0.5)
                 self.find_and_click(
@@ -269,8 +273,11 @@ class QingTianUtilSkill(BaseSkill):
         self.check_cancel()
         _time.sleep(0.5)
         save_ok = self.find_and_click(
-            "弹窗底部右侧的绿色'确认添加'按钮"
+            "底部右侧的绿色'✓ 确认添加'按钮"
         )
+
+        # 🔀 恢复到主窗口
+        self.switch_to_main()
 
         return {
             "success": save_ok,

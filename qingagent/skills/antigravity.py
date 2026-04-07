@@ -20,6 +20,7 @@ class AntigravitySkill(BaseSkill):
     app_name = "Antigravity"
     app_aliases = ["Antigravity", "AG", "ag", "编辑器", "Cursor"]
     app_context = "IDE 代码编辑器截图"
+    cold_start_wait = 5.0   # AG 冷启动需要更长时间加载 Agent 面板
 
     def register_intents(self):
         self.add_intent(Intent(

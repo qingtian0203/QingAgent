@@ -1,0 +1,30 @@
+{
+  "user_profile": {
+    "name": "晴天",
+    "role": "Android/HarmonyOS Developer",
+    "location": "Beijing"
+  },
+  "shortcuts": {
+    "messaging": {
+      "丸子": {
+        "app": "WeChat",
+        "target": "丸子",
+        "description": "默认通过微信联系死党丸子"
+      },
+      "群里": {
+        "app": "WeChat",
+        "target": "刘嘉林",
+        "description": "默认发送到微信的刘嘉林"
+      },
+      "我妈": {
+        "app": "WeChat",
+        "target": "佟玉华",
+        "description": "自动映射到母亲大人的微信备注名"
+      }
+    }
+  },
+  "default_preferences": {
+    "ide": "Antigravity",
+    "browser": "Chrome"
+  }
+}

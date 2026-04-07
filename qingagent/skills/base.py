@@ -162,6 +162,67 @@ class BaseSkill:
             return None
         return vision.capture_screenshot(self._window_rect, save_path)
 
+    def switch_to_popup(self) -> bool:
+        """
+        切换截图区域到弹窗窗口（同进程的较小窗口）。
+        用于操作 CTkToplevel 等弹出对话框时提高 AI 视觉定位精度。
+        调用前需先 activate() 主窗口，调用后截图和点击都以弹窗为基准。
+        """
+        from Quartz import (
+            CGWindowListCopyWindowInfo,
+            kCGWindowListOptionOnScreenOnly,
+            kCGNullWindowID,
+        )
+
+        # 保存主窗口 rect（用于之后恢复）
+        if not hasattr(self, '_main_window_rect') or self._main_window_rect is None:
+            self._main_window_rect = self._window_rect
+
+        window_list = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly, kCGNullWindowID
+        )
+
+        # 找同进程的所有窗口
+        candidates = []
+        for w in window_list:
+            owner = w.get("kCGWindowOwnerName", "")
+            if any(alias.lower() in owner.lower() for alias in self.app_aliases):
+                bounds = w.get("kCGWindowBounds", {})
+                width = bounds.get("Width", 0)
+                height = bounds.get("Height", 0)
+                if 100 < width < 800 and 100 < height < 800:
+                    # 弹窗通常比主窗口小，过滤出合理尺寸的窗口
+                    candidates.append({
+                        "rect": (int(bounds["X"]), int(bounds["Y"]), int(width), int(height)),
+                        "size": width * height,
+                        "owner": owner,
+                    })
+
+        if not candidates:
+            print("⚠️ 未找到弹窗窗口，继续使用主窗口")
+            return False
+
+        # 取最大的候选弹窗（通常就是对话框）
+        candidates.sort(key=lambda x: x["size"], reverse=True)
+        popup = candidates[0]
+        self._window_rect = popup["rect"]
+        # 切换后重建 verifier
+        self._verifier = verify.StepVerifier(
+            self._window_rect, context=self.app_context
+        )
+        print(f"🔀 已切换到弹窗窗口：{popup['rect']}")
+        return True
+
+    def switch_to_main(self):
+        """恢复截图区域到主窗口（与 switch_to_popup 配对使用）"""
+        if hasattr(self, '_main_window_rect') and self._main_window_rect:
+            self._window_rect = self._main_window_rect
+            self._verifier = verify.StepVerifier(
+                self._window_rect, context=self.app_context
+            )
+            self._main_window_rect = None
+            print("🔀 已恢复到主窗口")
+
     def find_and_click(self, element_desc: str, verify_desc: str = None) -> bool:
         """
         在当前窗口中查找元素并点击 — 最常用的组合操作。

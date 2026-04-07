@@ -215,13 +215,55 @@ class QingTianUtilSkill(BaseSkill):
             )
             _time.sleep(0.3)
 
-        # 步骤 6：选择日期 — 优先用快捷按钮（今天/明天/后天/下周）
-        if date_raw in ["今天", "明天", "后天", "下周"]:
-            self.check_cancel()
+        # 步骤 6：选择日期
+        self.check_cancel()
+        quick_dates = ["今天", "明天", "后天", "下周"]
+        if date_raw in quick_dates:
+            # 快捷日期：直接点快捷按钮
             self.find_and_click(
                 f"弹窗中日期区域下方的'{date_raw}'快捷按钮"
             )
             _time.sleep(0.3)
+        elif date_raw:
+            # 具体日期：解析后通过下拉菜单选择
+            from datetime import datetime
+            year, month, day = None, None, None
+            try:
+                # 尝试 YYYY-MM-DD 格式
+                parsed = datetime.strptime(date_raw, "%Y-%m-%d")
+                year, month, day = parsed.year, parsed.month, parsed.day
+            except ValueError:
+                try:
+                    # 尝试 M月D日 格式
+                    now = datetime.now()
+                    parsed = datetime.strptime(f"{now.year}年{date_raw}", "%Y年%m月%d日")
+                    year, month, day = parsed.year, parsed.month, parsed.day
+                except ValueError:
+                    # 让 AI 自己理解日期文字的含义
+                    pass
+
+            if year and month and day:
+                # 选择月份：点击"月"右边的下拉箭头，再从列表中点月数字
+                self.check_cancel()
+                self.find_and_click(
+                    "弹窗日期行中'月'字右边的下拉选择器按钮（显示当前月份数字的灰色下拉框）"
+                )
+                _time.sleep(0.5)
+                self.find_and_click(
+                    f"弹出的下拉列表中数字'{month}'选项"
+                )
+                _time.sleep(0.3)
+
+                # 选择日：点击"日"右边的下拉箭头，再从列表中点日数字
+                self.check_cancel()
+                self.find_and_click(
+                    "弹窗日期行中'日'字右边的下拉选择器按钮（显示当前日期数字的灰色下拉框）"
+                )
+                _time.sleep(0.5)
+                self.find_and_click(
+                    f"弹出的下拉列表中数字'{day}'选项"
+                )
+                _time.sleep(0.3)
 
         # 步骤 7：点击绿色的"✓ 确认添加"按钮
         self.check_cancel()

@@ -57,12 +57,17 @@ def _call_llm(prompt: str, img_b64: str | None = None) -> str | None:
         }
 
         try:
-            res = requests.post(url, json=payload, timeout=timeout)
+            headers = {"Content-Type": "application/json"}
+            api_key = getattr(config, "API_KEY", "")
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            res = requests.post(url, json=payload, headers=headers, timeout=timeout)
             res.raise_for_status()
             return res.json()["choices"][0]["message"]["content"].strip()
         except Exception as e:
             print(f"❌ OpenAI API 调用失败：{e}")
             return None
+
 
     else:
         # ── Ollama 原生格式（默认）─────────────────────────────────

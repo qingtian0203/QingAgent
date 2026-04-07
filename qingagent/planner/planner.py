@@ -89,12 +89,33 @@ class Planner:
             "stream": False,
         }
 
+        # 根据当前 API_MODE 自动选择请求格式
+        mode = getattr(config, "API_MODE", "ollama").lower()
+        api_key = getattr(config, "API_KEY", "")
+        url = config.PLANNER_URL
+
         try:
-            res = requests.post(
-                config.PLANNER_URL, json=payload, timeout=30
-            )
-            res.raise_for_status()
-            text = res.json().get("response", "")
+            if mode == "openai":
+                # OpenAI 兼容格式（oMLX / vLLM 等）
+                if not url.endswith("/chat/completions"):
+                    url = url.rstrip("/") + "/chat/completions"
+                headers = {"Content-Type": "application/json"}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                oai_payload = {
+                    "model": config.PLANNER_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "max_tokens": 300,
+                }
+                res = requests.post(url, json=oai_payload, headers=headers, timeout=30)
+                res.raise_for_status()
+                text = res.json()["choices"][0]["message"]["content"].strip()
+            else:
+                # Ollama 原生格式（默认）
+                res = requests.post(url, json=payload, timeout=30)
+                res.raise_for_status()
+                text = res.json().get("response", "")
 
             # 提取 JSON
             clean = text.replace("```json", "").replace("```", "").strip()

@@ -7,7 +7,8 @@ import os
 #  AI 视觉引擎配置
 # ============================================================
 # 本地 AI 模型（用于截图识别 + 意图理解）
-VISION_MODEL = os.getenv("QA_VISION_MODEL", "gemma4:26b")
+VISION_MODEL = os.getenv("QA_VISION_MODEL", "gemma-4-26b-a4b-it-4bit")
+
 
 # ── API 后端模式 ──────────────────────────────────────────────
 # "ollama"  : Ollama 原生 /api/generate 格式（默认）
@@ -17,14 +18,19 @@ VISION_MODEL = os.getenv("QA_VISION_MODEL", "gemma4:26b")
 #   1. 把 API_MODE 改为 "openai"
 #   2. 把 OLLAMA_URL 改为 "http://localhost:8000/v1"
 #      (oMLX 默认端口 8000，会自动补全 /chat/completions)
-API_MODE  = os.getenv("QA_API_MODE",   "ollama")
-OLLAMA_URL = os.getenv("QA_OLLAMA_URL", "http://localhost:11434/api/generate")
+API_MODE  = os.getenv("QA_API_MODE",   "openai")            # 已切换到 oMLX
+OLLAMA_URL = os.getenv("QA_OLLAMA_URL", "http://localhost:8000/v1")  # oMLX 地址
+# oMLX / OpenAI 兼容后端的 API Key（Ollama 模式下留空即可）
+API_KEY   = os.getenv("QA_API_KEY",    "68686688v")
+
+
 VISION_TIMEOUT = 60  # 视觉识别超时（秒）
 VISION_MAX_RETRIES = 3  # 识别失败最大重试次数
 
 # Planner 用的模型（用于意图理解，可以和视觉模型不同）
-PLANNER_MODEL = os.getenv("QA_PLANNER_MODEL", "gemma4:26b")
-PLANNER_URL = os.getenv("QA_PLANNER_URL", "http://localhost:11434/api/generate")
+PLANNER_MODEL = os.getenv("QA_PLANNER_MODEL", "gemma-4-26b-a4b-it-4bit")  # oMLX 模型 ID
+PLANNER_URL = os.getenv("QA_PLANNER_URL", "http://localhost:8000/v1")      # oMLX 地址
+
 
 
 # ============================================================

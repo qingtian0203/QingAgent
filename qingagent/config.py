@@ -6,8 +6,18 @@ import os
 # ============================================================
 #  AI 视觉引擎配置
 # ============================================================
-# 本地 Ollama 多模态模型（用于截图识别）
+# 本地 AI 模型（用于截图识别 + 意图理解）
 VISION_MODEL = os.getenv("QA_VISION_MODEL", "gemma4:26b")
+
+# ── API 后端模式 ──────────────────────────────────────────────
+# "ollama"  : Ollama 原生 /api/generate 格式（默认）
+# "openai"  : OpenAI 兼容格式（oMLX / LM Studio / vLLM 等）
+#
+# 切换到 oMLX 只需两步：
+#   1. 把 API_MODE 改为 "openai"
+#   2. 把 OLLAMA_URL 改为 "http://localhost:8000/v1"
+#      (oMLX 默认端口 8000，会自动补全 /chat/completions)
+API_MODE  = os.getenv("QA_API_MODE",   "ollama")
 OLLAMA_URL = os.getenv("QA_OLLAMA_URL", "http://localhost:11434/api/generate")
 VISION_TIMEOUT = 60  # 视觉识别超时（秒）
 VISION_MAX_RETRIES = 3  # 识别失败最大重试次数
@@ -15,6 +25,7 @@ VISION_MAX_RETRIES = 3  # 识别失败最大重试次数
 # Planner 用的模型（用于意图理解，可以和视觉模型不同）
 PLANNER_MODEL = os.getenv("QA_PLANNER_MODEL", "gemma4:26b")
 PLANNER_URL = os.getenv("QA_PLANNER_URL", "http://localhost:11434/api/generate")
+
 
 # ============================================================
 #  操作节奏配置

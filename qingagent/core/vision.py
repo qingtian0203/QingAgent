@@ -5,6 +5,10 @@ from __future__ import annotations
 
 负责对指定窗口区域截图，然后调用多模态大模型
 在截图中定位目标元素，返回归一化坐标。
+
+支持两种 API 后端（通过 config.API_MODE 切换）：
+  - "ollama"   : Ollama 原生 /api/generate 格式（默认）
+  - "openai"   : OpenAI 兼容格式（oMLX / LM Studio / vLLM 等）
 """
 import io
 import json
@@ -13,6 +17,71 @@ import time
 import pyautogui
 import requests
 from .. import config
+
+
+def _call_llm(prompt: str, img_b64: str | None = None) -> str | None:
+    """
+    统一的 LLM 调用入口，自动适配 Ollama / OpenAI 两种 API 格式。
+
+    参数:
+        prompt: 文字提示
+        img_b64: 可选，base64 编码的图片（视觉任务）
+
+    返回:
+        模型返回的文字内容，失败返回 None
+    """
+    mode = getattr(config, "API_MODE", "ollama").lower()
+    model = config.VISION_MODEL
+    url   = config.OLLAMA_URL
+    timeout = config.VISION_TIMEOUT
+
+    if mode == "openai":
+        # ── OpenAI 兼容格式（oMLX / LM Studio / vLLM）──────────────
+        # URL 示例：http://localhost:8000/v1/chat/completions
+        if not url.endswith("/chat/completions"):
+            # 自动补全路径（用户只配置 base url 时）
+            url = url.rstrip("/") + "/chat/completions"
+
+        content: list = [{"type": "text", "text": prompt}]
+        if img_b64:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+            })
+
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "stream": False,
+            "max_tokens": 512,
+        }
+
+        try:
+            res = requests.post(url, json=payload, timeout=timeout)
+            res.raise_for_status()
+            return res.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"❌ OpenAI API 调用失败：{e}")
+            return None
+
+    else:
+        # ── Ollama 原生格式（默认）─────────────────────────────────
+        payload: dict = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+        }
+        if img_b64:
+            payload["images"] = [img_b64]
+
+        try:
+            res = requests.post(url, json=payload, timeout=timeout)
+            res.raise_for_status()
+            return res.json().get("response", "").strip()
+        except Exception as e:
+            print(f"❌ Ollama API 调用失败：{e}")
+            return None
+
 
 
 def capture_screenshot(rect: tuple, save_path: str = None) -> str | None:
@@ -63,20 +132,11 @@ def find_element(
         f"不要返回任何其他文字。"
     )
 
-    payload = {
-        "model": config.VISION_MODEL,
-        "prompt": prompt,
-        "images": [img_b64],
-        "stream": False,
-    }
+    text = _call_llm(prompt, img_b64)
+    if text is None:
+        return None
 
     try:
-        res = requests.post(
-            config.OLLAMA_URL, json=payload, timeout=config.VISION_TIMEOUT
-        )
-        res.raise_for_status()
-        text = res.json().get("response", "")
-
         # 提取 JSON
         clean = text.replace("```json", "").replace("```", "").strip()
         start = clean.find("{")
@@ -94,9 +154,6 @@ def find_element(
             return None
 
         return coords
-    except requests.exceptions.Timeout:
-        print(f"❌ AI 识别超时（{config.VISION_TIMEOUT}s）")
-        return None
     except Exception as e:
         print(f"❌ AI 识别失败：{e}")
         return None
@@ -170,20 +227,11 @@ def find_elements_batch(
         f"不要返回任何其他文字。"
     )
 
-    payload = {
-        "model": config.VISION_MODEL,
-        "prompt": prompt,
-        "images": [img_b64],
-        "stream": False,
-    }
+    text = _call_llm(prompt, img_b64)
+    if text is None:
+        return None
 
     try:
-        res = requests.post(
-            config.OLLAMA_URL, json=payload, timeout=config.VISION_TIMEOUT
-        )
-        res.raise_for_status()
-        text = res.json().get("response", "")
-
         # 提取 JSON
         clean = text.replace("```json", "").replace("```", "").strip()
         start = clean.find("{")
@@ -207,9 +255,6 @@ def find_elements_batch(
 
         return result if result else None
 
-    except requests.exceptions.Timeout:
-        print(f"❌ 批量定位 AI 超时（{config.VISION_TIMEOUT}s）")
-        return None
     except Exception as e:
         print(f"❌ 批量定位 AI 失败：{e}")
         return None
@@ -232,20 +277,4 @@ def read_screen_content(
         AI 的文字回答，失败返回 None
     """
     prompt = f"这是一张{context}。{question}\n请用中文回答，简洁明了。"
-
-    payload = {
-        "model": config.VISION_MODEL,
-        "prompt": prompt,
-        "images": [img_b64],
-        "stream": False,
-    }
-
-    try:
-        res = requests.post(
-            config.OLLAMA_URL, json=payload, timeout=config.VISION_TIMEOUT
-        )
-        res.raise_for_status()
-        return res.json().get("response", "").strip()
-    except Exception as e:
-        print(f"❌ AI 阅读截图失败：{e}")
-        return None
+    return _call_llm(prompt, img_b64)

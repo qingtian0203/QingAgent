@@ -193,6 +193,11 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
         """静默普通访问日志"""
         pass
 
+from http.server import HTTPServer
+from socketserver import ThreadingMixIn
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    allow_reuse_address = True
 
 def start_server(host: str = None, port: int = None):
     """启动 Web 服务"""
@@ -206,7 +211,7 @@ def start_server(host: str = None, port: int = None):
     p = port or config.SERVER_PORT
     local_ip = _get_local_ip()
 
-    server = HTTPServer((h, p), QingAgentHandler)
+    server = ThreadedHTTPServer((h, p), QingAgentHandler)
     print(f"\n{'='*50}")
     print(f"🚀 QingAgent Web 服务已启动")
     print(f"🌐 本机访问: http://localhost:{p}")

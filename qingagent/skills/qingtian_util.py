@@ -165,8 +165,8 @@ class QingTianUtilSkill(BaseSkill):
         批量获取输入框+日期按钮+确认按钮坐标，减少2/3的AI推理次数。
         """
         import time as _time
-        from .. import actions
-        from ..core import vision
+        from qingagent.core import actions
+        from qingagent.core import vision
 
         title = slots["title"]
         date_raw = slots.get("date", "今天")

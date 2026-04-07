@@ -493,11 +493,10 @@ def _get_ui_html() -> str:
 
         .input-area input::placeholder { color: #555; }
 
-        .send-btn {
+        .send-btn, .mic-btn {
             width: 44px; height: 44px;
             border-radius: 50%;
             border: none;
-            background: linear-gradient(135deg, var(--accent-start), var(--accent-end));
             color: white;
             font-size: 18px;
             cursor: pointer;
@@ -507,7 +506,38 @@ def _get_ui_html() -> str:
             -webkit-tap-highlight-color: transparent;
         }
 
-        .send-btn:active { transform: scale(0.9); }
+        .send-btn {
+            background: linear-gradient(135deg, var(--accent-start), var(--accent-end));
+        }
+
+        .mic-btn {
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.15);
+            font-size: 20px;
+            margin-right: 8px;
+        }
+
+        .mic-btn:hover {
+            background: rgba(255,255,255,0.15);
+        }
+
+        .mic-btn.recording {
+            background: rgba(239,68,68,0.25);
+            border-color: #ef4444;
+            animation: micPulse 1s ease-in-out infinite;
+        }
+
+        @keyframes micPulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.4); }
+            50% { box-shadow: 0 0 0 10px rgba(239,68,68,0); }
+        }
+
+        .mic-btn.unsupported {
+            opacity: 0.2;
+            cursor: not-allowed;
+        }
+
+        .send-btn:active, .mic-btn:active { transform: scale(0.9); }
         .send-btn:disabled { opacity: 0.3; }
     </style>
 </head>
@@ -543,6 +573,7 @@ def _get_ui_html() -> str:
         <input type="text" id="cmdInput" placeholder="输入指令..."
                enterkeyhint="send"
                onkeydown="if(event.key==='Enter'){event.preventDefault();sendCmd();}">
+        <button class="mic-btn" id="micBtn" title="语音输入">🎤</button>
         <button class="send-btn" id="sendBtn" onclick="sendCmd()">➤</button>
     </div>
 </div>
@@ -552,8 +583,97 @@ def _get_ui_html() -> str:
     const cmdInput = document.getElementById('cmdInput');
     const sendBtn = document.getElementById('sendBtn');
     const statusDot = document.getElementById('statusDot');
+    const micBtn = document.getElementById('micBtn');
 
     let isProcessing = false; // 全局防抖锁
+
+    // ============================================================
+    //  语音识别模块（Web Speech API）
+    // ============================================================
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let _recognition = null;
+    let _isListening = false;
+
+    if (SpeechRecognition) {
+        _recognition = new SpeechRecognition();
+        _recognition.lang = 'zh-CN';       // 中文识别
+        _recognition.continuous = false;     // 单次识别模式
+        _recognition.interimResults = true;  // 实时显示中间结果
+
+        _recognition.onstart = () => {
+            _isListening = true;
+            micBtn.classList.add('recording');
+            micBtn.textContent = '⏺';
+            cmdInput.placeholder = '🎙 正在聆听...';
+        };
+
+        _recognition.onresult = (event) => {
+            let finalText = '';
+            let interimText = '';
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                const transcript = event.results[i][0].transcript;
+                if (event.results[i].isFinal) {
+                    finalText += transcript;
+                } else {
+                    interimText += transcript;
+                }
+            }
+            // 实时预览：中间结果灰色显示在 placeholder
+            if (interimText) {
+                cmdInput.placeholder = '🎙 ' + interimText;
+            }
+            // 最终结果追加到输入框
+            if (finalText) {
+                cmdInput.value += finalText;
+            }
+        };
+
+        _recognition.onerror = (event) => {
+            console.warn('语音识别错误:', event.error);
+            if (event.error === 'not-allowed') {
+                addMsg('⚠️ 麦克风权限被拒绝。请在浏览器设置中允许麦克风访问。', 'agent', 'error');
+            } else if (event.error === 'no-speech') {
+                // 没有检测到语音，静默处理
+            } else {
+                addMsg('⚠️ 语音识别失败: ' + event.error, 'agent', 'error');
+            }
+            stopListening();
+        };
+
+        _recognition.onend = () => {
+            stopListening();
+        };
+
+        micBtn.onclick = () => {
+            if (isProcessing) return;
+            if (_isListening) {
+                _recognition.stop();
+            } else {
+                try {
+                    _recognition.start();
+                } catch (e) {
+                    // 可能是已经在运行
+                    _recognition.stop();
+                    setTimeout(() => _recognition.start(), 200);
+                }
+            }
+        };
+    } else {
+        // 浏览器不支持
+        micBtn.classList.add('unsupported');
+        micBtn.title = '当前浏览器不支持语音识别';
+        micBtn.onclick = () => {
+            addMsg('⚠️ 当前浏览器不支持语音识别 (Web Speech API)。请使用 Chrome 浏览器。', 'agent', 'error');
+        };
+    }
+
+    function stopListening() {
+        _isListening = false;
+        micBtn.classList.remove('recording');
+        micBtn.textContent = '🎤';
+        cmdInput.placeholder = '输入指令...';
+        cmdInput.focus();
+    }
 
     function now() {
         return new Date().toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'});

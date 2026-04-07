@@ -99,6 +99,11 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
 
             except json.JSONDecodeError:
                 self._json_response({"success": False, "message": "请求格式错误"})
+        elif parsed.path.startswith("/api/cancel/"):
+            task_id = parsed.path.split("/")[-1]
+            if task_id in _tasks:
+                _tasks[task_id]["status"] = "cancelled"
+            self._json_response({"success": True})
         else:
             self.send_error(404)
 
@@ -131,6 +136,9 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
 
         if task["status"] == "running":
             self._json_response({"status": "running", "task_id": task_id})
+        elif task["status"] == "cancelled":
+            self._json_response({"status": "cancelled", "task_id": task_id})
+            _tasks.pop(task_id, None)
         else:
             self._json_response({
                 "status": "done",
@@ -171,6 +179,9 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
         html = _get_ui_html()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(html.encode("utf-8"))
 
@@ -415,6 +426,23 @@ def _get_ui_html() -> str:
             margin-top: 6px;
         }
 
+        .cancel-btn {
+            margin-left: 12px;
+            padding: 2px 10px;
+            border-radius: 12px;
+            background: rgba(248,113,113,0.1);
+            color: var(--error);
+            border: 1px solid rgba(248,113,113,0.3);
+            font-size: 11px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .cancel-btn:active {
+            transform: scale(0.95);
+            background: rgba(248,113,113,0.2);
+        }
+
         /* 数据展示 */
         .msg-data {
             margin-top: 10px;
@@ -560,7 +588,11 @@ def _get_ui_html() -> str:
 
         // 加载动画 + 计时器
         const loadingRow = addMsg(
-            '正在执行操控...<div class="loading-dots"><span></span><span></span><span></span></div><div class="timer" id="execTimer">⏱ 0s</div>',
+            `正在执行操控...<div class="loading-dots"><span></span><span></span><span></span></div>
+             <div style="display:flex; align-items:center; margin-top:4px;">
+                 <div class="timer" id="execTimer">⏱ 0s</div>
+                 <button class="cancel-btn" id="cancelBtn" style="display:none;">✖ 终止</button>
+             </div>`,
             'agent'
         );
 
@@ -599,7 +631,17 @@ def _get_ui_html() -> str:
                         clearInterval(timerInterval);
                         loadingRow.remove();
                         showResult(data.result);
+                    } else if (data.status === 'cancelled') {
+                        clearInterval(timerInterval);
+                        loadingRow.remove();
+                        addMsg('🛑 操作已被终止', 'agent', 'error');
+                        finish();
                     } else {
+                        const cb = document.getElementById('cancelBtn');
+                        if (cb) {
+                            cb.style.display = 'inline-block';
+                            cb.onclick = () => cancelTask(taskId, timerInterval, loadingRow);
+                        }
                         setTimeout(pollResult, 1000);
                     }
                 } catch (e) {
@@ -634,6 +676,16 @@ def _get_ui_html() -> str:
         sendBtn.disabled = false;
         statusDot.style.background = '#4ade80'; // 绿色=空闲
         cmdInput.focus();
+    }
+
+    async function cancelTask(taskId, timerInterval, loadingRow) {
+        clearInterval(timerInterval);
+        loadingRow.remove();
+        addMsg('🛑 强制中断任务中...', 'agent', 'error');
+        finish();
+        try {
+            await fetch(`/api/cancel/${taskId}`, { method: 'POST' });
+        } catch (e) {}
     }
 </script>
 </body>

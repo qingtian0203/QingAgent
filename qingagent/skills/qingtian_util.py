@@ -160,13 +160,20 @@ class QingTianUtilSkill(BaseSkill):
         4. "所属项目"四个按钮：OA | C端 | B端 | 其他
         5. "日期"年/月/日下拉 + 快捷按钮：今天 | 明天 | 后天 | 下周
         6. 底部：取消 | ✓ 确认添加（绿色按钮）
+
+        优化：快捷日期场景（今天/明天/后天/下周）只截一次图，
+        批量获取输入框+日期按钮+确认按钮坐标，减少2/3的AI推理次数。
         """
         import time as _time
+        from .. import actions
+        from ..core import vision
 
         title = slots["title"]
         date_raw = slots.get("date", "今天")
         task_type = slots.get("type", "")
         project = slots.get("project", "")
+        quick_dates = ["今天", "明天", "后天", "下周"]
+        is_quick_date = date_raw in quick_dates
 
         if not self.activate():
             return {"success": False, "message": "无法打开晴天Util", "data": None}
@@ -176,105 +183,143 @@ class QingTianUtilSkill(BaseSkill):
         self.find_and_click("顶部标签栏中'工作日历'文字")
         _time.sleep(1)
 
-        # 步骤 2：点击 "+ 添加" 按钮（绿色小按钮，在右侧任务面板的右上角）
+        # 步骤 2：点击 "+ 添加" 按钮
         self.check_cancel()
         add_ok = self.find_and_click("右侧任务面板右上角的绿色'+ 添加'按钮")
         if not add_ok:
             return {"success": False, "message": "找不到添加按钮", "data": None}
         _time.sleep(1)
 
-        # 🔀 弹窗出现后，切换到弹窗窗口（420x570的独立对话框）
-        # 这样 AI 只看弹窗区域，定位更精准
+        # 🔀 切换到弹窗截图区域
         self.switch_to_popup()
         _time.sleep(0.3)
 
-        # 步骤 3：点击"任务内容"下方的白色文本输入区域
-        self.check_cancel()
-        content_ok = self.find_and_click(
-            "'任务内容'标签下方的白色文本输入框区域（大的空白方框）"
-        )
-        if content_ok:
-            _time.sleep(0.3)
-            actions.type_text(title)
-            _time.sleep(0.3)
-
-        # 步骤 4：选择任务类型（如果指定）
-        if task_type:
+        # ─────────────────────────────────────────────────────────────
+        # 快捷日期场景：一次截图批量定位输入框 + 日期按钮 + 确认按钮
+        # ─────────────────────────────────────────────────────────────
+        if is_quick_date:
             self.check_cancel()
-            type_map = {
-                "临时": "⚡临时任务", "接口": "🔗接口",
-                "提测": "🧪提测", "上线": "🚀上线",
+            type_map = {"临时": "⚡临时任务", "接口": "🔗接口", "提测": "🧪提测", "上线": "🚀上线"}
+            type_text = type_map.get(task_type, task_type) if task_type else ""
+
+            elements = {
+                "input":    "'任务内容'标签下方的白色大输入框区域",
+                "date_btn": f"日期区域下方快捷按钮中的'{date_raw}'按钮",
+                "confirm":  "底部右侧的绿色'✓ 确认添加'按钮",
             }
-            type_text = type_map.get(task_type, task_type)
-            self.find_and_click(
-                f"'任务类型'行中的'{type_text}'按钮"
-            )
-            _time.sleep(0.3)
+            if task_type and type_text:
+                elements["type_btn"] = f"'任务类型'行中的'{type_text}'按钮"
+            if project:
+                elements["project_btn"] = f"'所属项目'行中的'{project}'按钮"
 
-        # 步骤 5：选择项目（如果指定）
-        if project:
-            self.check_cancel()
-            self.find_and_click(
-                f"'所属项目'行中的'{project}'按钮"
-            )
-            _time.sleep(0.3)
+            print(f"📸 批量定位弹窗元素（共 {len(elements)} 个）...")
+            img = self.screenshot()
+            coords = vision.find_elements_batch(img, elements, context="晴天Util新建任务弹窗") if img else None
 
-        # 步骤 6：选择日期
-        self.check_cancel()
-        quick_dates = ["今天", "明天", "后天", "下周"]
-        if date_raw in quick_dates:
-            # 快捷日期：直接点快捷按钮
-            self.find_and_click(
-                f"'日期'区域下方一排快捷按钮中的'{date_raw}'按钮"
-            )
-            _time.sleep(0.3)
-        elif date_raw:
-            # 具体日期：解析后通过下拉菜单选择
+            def _fallback():
+                """批量定位失败时的逐步回退操作"""
+                self.find_and_click("'任务内容'标签下方的白色文本输入框区域（大的空白方框）")
+                _time.sleep(0.3)
+                actions.type_text(title)
+                _time.sleep(0.2)
+                if task_type and type_text:
+                    self.find_and_click(f"'任务类型'行中的'{type_text}'按钮")
+                    _time.sleep(0.2)
+                if project:
+                    self.find_and_click(f"'所属项目'行中的'{project}'按钮")
+                    _time.sleep(0.2)
+                self.find_and_click(f"'日期'区域下方的'{date_raw}'按钮")
+                _time.sleep(0.2)
+                return self.find_and_click("底部右侧的绿色'✓ 确认添加'按钮")
+
+            if not coords:
+                print("⚠️ 批量定位失败，回退到逐步定位")
+                save_ok = _fallback()
+            else:
+                def _click_key(key):
+                    c = coords.get(key)
+                    if not c:
+                        return False
+                    return self._click_on_rect(c["rx"], c["ry"])
+
+                # ① 输入框 → 输入文字
+                _click_key("input")
+                _time.sleep(0.3)
+                actions.type_text(title)
+                _time.sleep(0.2)
+                # ② 可选：任务类型
+                if task_type and "type_btn" in coords:
+                    _click_key("type_btn")
+                    _time.sleep(0.2)
+                # ③ 可选：所属项目
+                if project and "project_btn" in coords:
+                    _click_key("project_btn")
+                    _time.sleep(0.2)
+                # ④ 快捷日期
+                _click_key("date_btn")
+                _time.sleep(0.2)
+                # ⑤ 确认添加
+                save_ok = _click_key("confirm")
+
+        else:
+            # ─────────────────────────────────────────────────────────────
+            # 具体日期场景：分步操作（下拉框改变界面，必须逐步截图）
+            # ─────────────────────────────────────────────────────────────
             from datetime import datetime
+
+            # 输入任务内容
+            self.check_cancel()
+            content_ok = self.find_and_click("'任务内容'标签下方的白色文本输入框区域（大的空白方框）")
+            if content_ok:
+                _time.sleep(0.3)
+                actions.type_text(title)
+                _time.sleep(0.2)
+
+            # 可选：任务类型
+            if task_type:
+                self.check_cancel()
+                type_map = {"临时": "⚡临时任务", "接口": "🔗接口", "提测": "🧪提测", "上线": "🚀上线"}
+                type_text = type_map.get(task_type, task_type)
+                self.find_and_click(f"'任务类型'行中的'{type_text}'按钮")
+                _time.sleep(0.2)
+
+            # 可选：所属项目
+            if project:
+                self.check_cancel()
+                self.find_and_click(f"'所属项目'行中的'{project}'按钮")
+                _time.sleep(0.2)
+
+            # 解析具体日期
             year, month, day = None, None, None
             try:
-                # 尝试 YYYY-MM-DD 格式
                 parsed = datetime.strptime(date_raw, "%Y-%m-%d")
                 year, month, day = parsed.year, parsed.month, parsed.day
             except ValueError:
                 try:
-                    # 尝试 M月D日 格式
                     now = datetime.now()
                     parsed = datetime.strptime(f"{now.year}年{date_raw}", "%Y年%m月%d日")
                     year, month, day = parsed.year, parsed.month, parsed.day
                 except ValueError:
-                    # 让 AI 自己理解日期文字的含义
                     pass
 
             if year and month and day:
-                # 选择月份：点击"月"右边的下拉箭头，再从列表中点月数字
+                # 选月份
                 self.check_cancel()
-                self.find_and_click(
-                    "'日期'行中'月'字右边的下拉选择器（显示月份数字的灰色框和下拉箭头）"
-                )
+                self.find_and_click("'日期'行中'月'字右边的下拉选择器（显示月份数字的灰色框）")
                 _time.sleep(0.5)
-                self.find_and_click(
-                    f"弹出的下拉列表中数字'{month}'选项"
-                )
+                self.find_and_click(f"弹出的下拉列表中数字'{month}'选项")
+                _time.sleep(0.3)
+                # 选日期
+                self.check_cancel()
+                self.find_and_click("'日期'行中'日'字右边的下拉选择器（显示日期数字的灰色框）")
+                _time.sleep(0.5)
+                self.find_and_click(f"弹出的下拉列表中数字'{day}'选项")
                 _time.sleep(0.3)
 
-                # 选择日：点击"日"右边的下拉箭头，再从列表中点日数字
-                self.check_cancel()
-                self.find_and_click(
-                    "'日期'行中'日'字右边的下拉选择器（显示日期数字的灰色框和下拉箭头）"
-                )
-                _time.sleep(0.5)
-                self.find_and_click(
-                    f"弹出的下拉列表中数字'{day}'选项"
-                )
-                _time.sleep(0.3)
-
-        # 步骤 7：点击绿色的"✓ 确认添加"按钮
-        self.check_cancel()
-        _time.sleep(0.5)
-        save_ok = self.find_and_click(
-            "底部右侧的绿色'✓ 确认添加'按钮"
-        )
+            # 确认添加
+            self.check_cancel()
+            _time.sleep(0.3)
+            save_ok = self.find_and_click("底部右侧的绿色'✓ 确认添加'按钮")
 
         # 🔀 恢复到主窗口
         self.switch_to_main()
@@ -284,8 +329,6 @@ class QingTianUtilSkill(BaseSkill):
             "message": f"{'已添加' if save_ok else '添加失败'}日程：{title}",
             "data": {"title": title, "date": date_raw, "type": task_type},
         }
-
-
 
 
     def execute_pull_and_restart(self, slots: dict) -> dict:

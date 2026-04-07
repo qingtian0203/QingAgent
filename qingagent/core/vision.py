@@ -135,6 +135,86 @@ def find_element_with_retry(
     return None
 
 
+def find_elements_batch(
+    img_b64: str,
+    elements: dict[str, str],
+    context: str = "软件截图",
+) -> dict[str, dict] | None:
+    """
+    批量定位多个元素 — 一次截图一次 AI 调用，返回所有元素坐标。
+
+    参数:
+        img_b64: 截图 base64
+        elements: {element_key: description}，如 {
+            "input": "任务内容输入框",
+            "today": "今天按钮",
+            "confirm": "确认添加按钮",
+        }
+        context: 截图上下文描述
+
+    返回:
+        {element_key: {"rx": 0-1000, "ry": 0-1000}} 或 None
+    """
+    # 构建枚举描述
+    element_list = "\n".join(
+        f"- \"{k}\": {desc}" for k, desc in elements.items()
+    )
+    keys = list(elements.keys())
+    empty_json = "{" + ", ".join(f'"{k}": {{"rx": ?, "ry": ?}}' for k in keys) + "}"
+
+    prompt = (
+        f"这是一张{context}。请同时找到以下所有元素的精确中心位置：\n"
+        f"{element_list}\n\n"
+        f"只返回 JSON 格式（所有 rx/ry 均为 0-1000 的千分比坐标）:\n"
+        f"{empty_json}\n"
+        f"不要返回任何其他文字。"
+    )
+
+    payload = {
+        "model": config.VISION_MODEL,
+        "prompt": prompt,
+        "images": [img_b64],
+        "stream": False,
+    }
+
+    try:
+        res = requests.post(
+            config.OLLAMA_URL, json=payload, timeout=config.VISION_TIMEOUT
+        )
+        res.raise_for_status()
+        text = res.json().get("response", "")
+
+        # 提取 JSON
+        clean = text.replace("```json", "").replace("```", "").strip()
+        start = clean.find("{")
+        end = clean.rfind("}") + 1
+        if start == -1 or end == 0:
+            print(f"⚠️ 批量定位 AI 返回无法解析：{text[:200]}")
+            return None
+
+        coords_map = json.loads(clean[start:end])
+
+        # 校验每个坐标
+        result = {}
+        for k, v in coords_map.items():
+            if not isinstance(v, dict):
+                continue
+            rx, ry = v.get("rx", -1), v.get("ry", -1)
+            if 0 <= rx <= 1000 and 0 <= ry <= 1000:
+                result[k] = {"rx": rx, "ry": ry}
+            else:
+                print(f"⚠️ 批量定位「{k}」坐标越界：rx={rx}, ry={ry}")
+
+        return result if result else None
+
+    except requests.exceptions.Timeout:
+        print(f"❌ 批量定位 AI 超时（{config.VISION_TIMEOUT}s）")
+        return None
+    except Exception as e:
+        print(f"❌ 批量定位 AI 失败：{e}")
+        return None
+
+
 def read_screen_content(
     img_b64: str,
     question: str,
@@ -142,8 +222,6 @@ def read_screen_content(
 ) -> str | None:
     """
     用 AI 阅读截图内容 — 不是定位元素，而是提取信息。
-
-    用途：读取聊天消息、获取页面文字内容等
 
     参数:
         img_b64: 截图 base64

@@ -577,12 +577,16 @@ def _get_ui_html() -> str:
         sendCmd();
     }
 
+    let _pollCancelled = false;  // 轮询中断标志
+    let _cancelBtnCounter = 0;   // 按钮唯一 ID 计数器
+
     async function sendCmd() {
         if (isProcessing) return; // 拦截并发发送
         const cmd = cmdInput.value.trim();
         if (!cmd) return;
 
         isProcessing = true;
+        _pollCancelled = false;
         cmdInput.disabled = true;
         sendBtn.disabled = true;
         statusDot.style.background = '#facc15'; // 黄色=忙碌
@@ -590,18 +594,23 @@ def _get_ui_html() -> str:
         addMsg(cmd, 'user');
         cmdInput.value = '';
 
+        // 用唯一 ID 防止多次发送造成 DOM id 冲突
+        _cancelBtnCounter++;
+        const cancelBtnId = 'cancelBtn_' + _cancelBtnCounter;
+        const timerId = 'execTimer_' + _cancelBtnCounter;
+
         // 加载动画 + 计时器
         const loadingRow = addMsg(
             `正在执行操控...<div class="loading-dots"><span></span><span></span><span></span></div>
              <div style="display:flex; align-items:center; margin-top:4px;">
-                 <div class="timer" id="execTimer">⏱ 0s</div>
-                 <button class="cancel-btn" id="cancelBtn" style="display:none;">✖ 终止</button>
+                 <div class="timer" id="${timerId}">⏱ 0s</div>
+                 <button class="cancel-btn" id="${cancelBtnId}" style="display:none;">✖ 终止</button>
              </div>`,
             'agent'
         );
 
         const startTime = Date.now();
-        const timerEl = document.getElementById('execTimer');
+        const timerEl = document.getElementById(timerId);
         const timerInterval = setInterval(() => {
             const elapsed = Math.floor((Date.now() - startTime) / 1000);
             if (timerEl) timerEl.textContent = `⏱ ${elapsed}s`;
@@ -617,7 +626,6 @@ def _get_ui_html() -> str:
             const submitData = await submitRes.json();
 
             if (!submitData.task_id) {
-                // 同步返回了结果（兼容）
                 clearInterval(timerInterval);
                 loadingRow.remove();
                 showResult(submitData);
@@ -627,9 +635,14 @@ def _get_ui_html() -> str:
             // 轮询任务状态
             const taskId = submitData.task_id;
             const pollResult = async () => {
+                // 核心：如果已被取消，彻底停止轮询递归
+                if (_pollCancelled) return;
+
                 try {
                     const res = await fetch(`/api/task/${taskId}`);
                     const data = await res.json();
+
+                    if (_pollCancelled) return; // 二次防护
 
                     if (data.status === 'done') {
                         clearInterval(timerInterval);
@@ -641,7 +654,8 @@ def _get_ui_html() -> str:
                         addMsg('🛑 操作已被终止', 'agent', 'error');
                         finish();
                     } else {
-                        const cb = document.getElementById('cancelBtn');
+                        // 显示取消按钮
+                        const cb = document.getElementById(cancelBtnId);
                         if (cb) {
                             cb.style.display = 'inline-block';
                             cb.onclick = () => cancelTask(taskId, timerInterval, loadingRow);
@@ -649,6 +663,7 @@ def _get_ui_html() -> str:
                         setTimeout(pollResult, 1000);
                     }
                 } catch (e) {
+                    if (_pollCancelled) return;
                     clearInterval(timerInterval);
                     loadingRow.remove();
                     addMsg('❌ 查询状态失败：' + e.message, 'agent', 'error');
@@ -683,13 +698,18 @@ def _get_ui_html() -> str:
     }
 
     async function cancelTask(taskId, timerInterval, loadingRow) {
+        // 1. 先发取消请求到后端（时序最优先！）
+        _pollCancelled = true;  // 立刻停止轮询递归
         clearInterval(timerInterval);
-        loadingRow.remove();
-        addMsg('🛑 强制中断任务中...', 'agent', 'error');
-        finish();
+
         try {
             await fetch(`/api/cancel/${taskId}`, { method: 'POST' });
         } catch (e) {}
+
+        // 2. 请求发完再更新 UI
+        loadingRow.remove();
+        addMsg('🛑 已发送终止信号，后台正在中断操作...', 'agent', 'error');
+        finish();
     }
 </script>
 </body>

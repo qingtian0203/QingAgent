@@ -52,6 +52,16 @@ class QingTianUtilSkill(BaseSkill):
             ],
         ))
 
+        self.add_intent(Intent(
+            name="pull_and_restart",
+            description="拉取最新代码并重启QingAgent服务",
+            examples=[
+                "拉取更新并重启",
+                "更新QingAgent",
+                "打开晴天Util拉取更新并重启",
+            ],
+        ))
+
     # --- 具体执行流程 ---
 
     def execute_click_feature(self, slots: dict) -> dict:
@@ -125,4 +135,38 @@ class QingTianUtilSkill(BaseSkill):
             "success": True,
             "message": f"{date}的日程",
             "data": content,
+        }
+
+    def execute_pull_and_restart(self, slots: dict) -> dict:
+        """
+        拉取更新并重启流程：
+        1. 激活晴天Util
+        2. 点击 AI Agent 标签
+        3. 点击 拉取更新并重启 按钮
+        """
+        import time as _time
+
+        if not self.activate():
+            return {"success": False, "message": "无法打开晴天Util", "data": None}
+
+        # 步骤 1：点击"AI Agent"标签页
+        self.check_cancel()
+        step1 = self.find_and_click(
+            "顶部导航栏中标题为'AI Agent'的标签按钮",
+        )
+        if not step1:
+            return {"success": False, "message": "找不到 AI Agent 标签", "data": None}
+
+        _time.sleep(1.0)
+
+        # 步骤 2：点击"拉取更新并重启"按钮
+        self.check_cancel()
+        step2 = self.find_and_click(
+            "蓝色的'拉取更新并重启'按钮（或包含'拉取更新'字样的按钮）",
+        )
+
+        return {
+            "success": step2,
+            "message": "已点击拉取更新并重启" if step2 else "找不到拉取更新按钮",
+            "data": None,
         }

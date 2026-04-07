@@ -556,7 +556,7 @@ def _get_ui_html() -> str:
         <div class="quick-chip" onclick="quickSend('给AI发条微信说测试消息')">📱 微信发消息</div>
         <div class="quick-chip" onclick="quickSend('看看工作群有没有新消息')">💬 查消息</div>
         <div class="quick-chip" onclick="quickSend('看看今天有什么任务')">📅 查日历</div>
-        <div class="quick-chip" onclick="quickSend('打开晴天的API调试器')">🔧 API调试</div>
+        <div class="quick-chip" onclick="quickSend('打开晴天Util拉取更新并重启')">🔄 拉取更新</div>
         <div class="quick-chip" onclick="quickSend('打开百度')">🌐 浏览器</div>
     </div>
 

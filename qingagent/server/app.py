@@ -521,6 +521,8 @@ def _get_ui_html() -> str:
     const sendBtn = document.getElementById('sendBtn');
     const statusDot = document.getElementById('statusDot');
 
+    let isProcessing = false; // 全局防抖锁
+
     function now() {
         return new Date().toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'});
     }
@@ -538,18 +540,23 @@ def _get_ui_html() -> str:
     }
 
     function quickSend(text) {
+        if (isProcessing) return; // 拦截快捷指令
         cmdInput.value = text;
         sendCmd();
     }
 
     async function sendCmd() {
+        if (isProcessing) return; // 拦截并发发送
         const cmd = cmdInput.value.trim();
         if (!cmd) return;
 
-        addMsg(cmd, 'user');
-        cmdInput.value = '';
+        isProcessing = true;
+        cmdInput.disabled = true;
         sendBtn.disabled = true;
         statusDot.style.background = '#facc15'; // 黄色=忙碌
+
+        addMsg(cmd, 'user');
+        cmdInput.value = '';
 
         // 加载动画 + 计时器
         const loadingRow = addMsg(
@@ -622,6 +629,8 @@ def _get_ui_html() -> str:
     }
 
     function finish() {
+        isProcessing = false;
+        cmdInput.disabled = false;
         sendBtn.disabled = false;
         statusDot.style.background = '#4ade80'; // 绿色=空闲
         cmdInput.focus();

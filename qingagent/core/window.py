@@ -127,31 +127,6 @@ def activate_app(app_name: str, resolved: bool = False) -> bool:
         return True
     else:
         print(f"⚠️ 激活 {real_app_name} 失败，尝试继续...")
-        return False(app_name: str) -> bool:
-    """
-    激活（前置）指定应用，并强制弹出主窗口。
-
-    参数:
-        app_name: 应用名称，如 "WeChat" 或 "微信"
-
-    返回:
-        是否成功
-    """
-    import subprocess
-
-    # open -a：等同于双击 Dock 图标，是最可靠的弹出主窗口方式
-    # 对于微信这类关闭台前调度后无响应 reopen 的 App 尤为有效
-    ret_open = subprocess.run(["open", "-a", app_name], capture_output=True).returncode
-
-    # osascript activate：切到前台（open -a 有时不会自动前置）
-    os.system(f'osascript -e \'tell application "{app_name}" to activate\' 2>/dev/null')
-
-    if ret_open == 0:
-        print(f"✅ 已激活应用：{app_name}")
-        time.sleep(config.APP_SWITCH_DELAY)
-        return True
-    else:
-        print(f"⚠️ 激活 {app_name} 失败（可能名称不对），尝试继续...")
         return False
 
 

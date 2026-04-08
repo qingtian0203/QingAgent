@@ -61,7 +61,7 @@ class MinesweeperSkill(BaseSkill):
                 "data": None
             }
 
-        x, y = target_pt
+        x, y = target_pt["rx"], target_pt["ry"]
         print(f"🎯 锁定绝对安全起手点！坐标：({x}, {y})")
 
         # 4. 执行物理级破阵打击

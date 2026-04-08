@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 """
-AI Planner — 意图识别 + 槽位提取
+AI Planner — 意图识别 + 多步骤任务链执行器
 
-接收用户的自然语言指令，识别出：
+接收用户的自然语言指令，规划为一到多个步骤：
 1. 目标应用（微信/浏览器/Antigravity/晴天Util）
 2. 要执行的操作（发消息/查消息/打开网页...）
-3. 关键参数（联系人、消息内容、URL...）
+3. 关键参数，支持 ${stepN.key} 占位符引用前一步输出
 
-然后交给对应的 Skill 执行。
+然后按顺序执行每一步，任意步骤失败则立即停止。
 """
+import re
 import json
 import requests
 from .. import config
@@ -19,13 +20,13 @@ from ..memory import MemoryManager
 
 class Planner:
     """
-    AI 调度器 — 把自然语言变成 Skill 调用。
+    AI 调度器 — 把自然语言变成一条或多条 Skill 调用链。
 
     工作原理:
     1. 把所有 Skill 的意图描述拼成一个"能力说明书"
     2. 把用户指令 + 能力说明书一起发给 LLM
-    3. LLM 返回 JSON：{app, intent, slots}
-    4. 根据返回调用对应 Skill 的 execute()
+    3. LLM 返回 JSON 步骤数组：[{step, app, intent, slots, description}, ...]
+    4. 按顺序执行每一步，前一步的输出通过 ${stepN.key} 传递到后续步骤
     """
 
     def __init__(self, registry: SkillRegistry):
@@ -33,27 +34,45 @@ class Planner:
         self._capability_doc = registry.get_full_capability_description()
         # 初始化记忆管理器（加载 memory.json + 维护历史滑动窗口）
         self.memory = MemoryManager()
+        # 进度回调，由外层（server）注入，用于向 Web UI 推送步骤进度
+        self._progress_callback = None
 
-    def parse_intent(self, user_input: str) -> dict | None:
+    # ──────────────────────────────────────────────────────────────
+    #  核心方法 1：AI 解析任务链
+    # ──────────────────────────────────────────────────────────────
+
+    def parse_task_chain(self, user_input: str) -> dict | None:
         """
-        用 AI 解析用户的自然语言指令。
+        用 AI 把用户的自然语言指令分解为任务链（一到多个步骤）。
 
-        参数:
-            user_input: 用户输入的自然语言，如 "给晴天发条微信说下午开会"
-
-        返回:
+        返回：
             {
-                "app": "微信",
-                "intent": "send_message",
-                "slots": {"contact_name": "晴天", "message": "下午开会"},
-                "confidence": "high"
+                "steps": [
+                    {
+                        "step": 1,
+                        "app": "OS控制",
+                        "intent": "custom_screenshot",
+                        "slots": {"target": "整个屏幕"},
+                        "description": "截取当前屏幕"
+                    },
+                    {
+                        "step": 2,
+                        "app": "微信",
+                        "intent": "send_message",
+                        "slots": {
+                            "contact_name": "丸子",
+                            "message": "[粘贴]",
+                            "image_path": "${step1.screenshot_path}"
+                        },
+                        "description": "把截图通过微信发给丸子"
+                    }
+                ]
             }
             解析失败返回 None
         """
-        # 构建记忆上下文（用户信息 + 联系人 + 最近历史）
         memory_context = self.memory.build_context_prompt()
 
-        prompt = f"""你是一个指令解析器。根据用户的自然语言指令，识别出要操作的应用、具体操作和参数。
+        prompt = f"""你是一个任务规划器。把用户的自然语言指令分解为一到多个操作步骤。
 
 {memory_context}
 
@@ -61,26 +80,37 @@ class Planner:
 {self._capability_doc}
 
 重要规则：
+- 如果只有一个操作，steps 数组只有 1 个元素
+- 多个步骤必须按执行顺序排列
+- 步骤之间有数据依赖时，用 ${{stepN.key}} 引用前面步骤的 data 输出
+  - 截图步骤的输出字段：screenshot_path（图片文件路径）
+  - 其他步骤的通用输出字段：value
 - 用户指令中明确提到了某个应用名或别名时，必须使用该应用，不要默认去微信
-- "给AG发消息说xxx" → app=Antigravity，不是微信！AG是Antigravity的简写
-- "给xx发微信" 才是微信，"给AG/Antigravity/编辑器/Cursor发消息" 是Antigravity
+  - "给AG发消息" → app=Antigravity，不是微信
+  - "给AG/Antigravity/编辑器/Cursor发消息" 是 Antigravity
+  - "给xx发微信" 才是微信
 - message/prompt 参数是最终要发给对方的内容，不要包含"问一下""告诉他""说一下"等指令描述词
-- 注意人称转换：用户说"问她干嘛呢"，实际发给对方应该是"你干嘛呢"
-- 示例："给丸子发微信问一下她干嘛呢" → app=微信, contact_name="丸子", message="你干嘛呢"
-- 示例："给AG发消息说 测试一下" → app=Antigravity, intent=send_prompt, prompt="测试一下"
+- 人称转换：用户说"问她干嘛呢"，实际发给对方应该是"你干嘛呢"
+- 示例1："给丸子发条微信说下午开会" → 1步，微信 send_message
+- 示例2："截图然后微信发给丸子" → 2步，先截图，再微信发送（image_path="${{step1.screenshot_path}}"）
 
 用户指令："{user_input}"
 
-请返回 JSON 格式（不要返回其他任何内容）：
+请返回 JSON 格式（不要包含其他任何内容）：
 {{
-    "app": "应用名称",
-    "intent": "意图名称",
-    "slots": {{参数名: 参数值}},
-    "confidence": "high/medium/low"
+    "steps": [
+        {{
+            "step": 1,
+            "app": "应用名称",
+            "intent": "意图名称",
+            "slots": {{参数名: 参数值}},
+            "description": "步骤简短描述（10字以内）"
+        }}
+    ]
 }}
 
-如果无法识别用户意图，返回：
-{{"app": null, "intent": null, "slots": {{}}, "confidence": "none"}}
+如果完全无法理解用户意图，返回：
+{{"steps": [], "error": "无法理解的指令"}}
 """
 
         payload = {
@@ -89,14 +119,12 @@ class Planner:
             "stream": False,
         }
 
-        # 根据当前 API_MODE 自动选择请求格式
         mode = getattr(config, "API_MODE", "ollama").lower()
         api_key = getattr(config, "API_KEY", "")
         url = config.PLANNER_URL
 
         try:
             if mode == "openai":
-                # OpenAI 兼容格式（oMLX / vLLM 等）
                 if not url.endswith("/chat/completions"):
                     url = url.rstrip("/") + "/chat/completions"
                 headers = {"Content-Type": "application/json"}
@@ -106,13 +134,12 @@ class Planner:
                     "model": config.PLANNER_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "stream": False,
-                    "max_tokens": 300,
+                    "max_tokens": 600,
                 }
                 res = requests.post(url, json=oai_payload, headers=headers, timeout=30)
                 res.raise_for_status()
                 text = res.json()["choices"][0]["message"]["content"].strip()
             else:
-                # Ollama 原生格式（默认）
                 res = requests.post(url, json=payload, timeout=30)
                 res.raise_for_status()
                 text = res.json().get("response", "")
@@ -127,8 +154,9 @@ class Planner:
 
             result = json.loads(clean[start:end])
 
-            if result.get("confidence") == "none" or result.get("app") is None:
-                print(f"⚠️ Planner 无法理解指令：{user_input}")
+            steps = result.get("steps", [])
+            if not steps or result.get("error"):
+                print(f"⚠️ Planner 无法理解指令：{user_input}，错误：{result.get('error', '步骤为空')}")
                 return None
 
             return result
@@ -142,13 +170,59 @@ class Planner:
             print(f"❌ Planner 解析失败：{e}")
             return None
 
+    # ──────────────────────────────────────────────────────────────
+    #  核心方法 2：占位符替换（步骤间上下文传递）
+    # ──────────────────────────────────────────────────────────────
+
+    def _resolve_placeholders(self, slots: dict, context: dict) -> dict:
+        """
+        替换 slots 中所有 ${stepN.key} 占位符为前面步骤的实际输出值。
+
+        示例：
+            slots = {"image_path": "${step1.screenshot_path}"}
+            context = {"step1": {"screenshot_path": "/tmp/abc.png"}}
+            → {"image_path": "/tmp/abc.png"}
+
+        参数:
+            slots: 当前步骤的参数字典
+            context: 已完成步骤的输出集合 {"step1": {...}, "step2": {...}}
+
+        返回:
+            替换后的 slots 字典
+        """
+        resolved = {}
+        pattern = re.compile(r'\$\{(step\d+)\.(\w+)\}')
+
+        for key, value in slots.items():
+            if isinstance(value, str):
+                def replacer(m):
+                    step_key = m.group(1)   # e.g. "step1"
+                    field = m.group(2)       # e.g. "screenshot_path"
+                    step_data = context.get(step_key, {})
+                    if isinstance(step_data, dict):
+                        actual = step_data.get(field)
+                        if actual is not None:
+                            print(f"  🔗 占位符替换：${{{step_key}.{field}}} → {actual}")
+                            return str(actual)
+                    print(f"  ⚠️ 占位符 ${{{step_key}.{field}}} 找不到对应值，保留原文")
+                    return m.group(0)
+                resolved[key] = pattern.sub(replacer, value)
+            else:
+                resolved[key] = value
+
+        return resolved
+
+    # ──────────────────────────────────────────────────────────────
+    #  核心方法 3：任务链执行器
+    # ──────────────────────────────────────────────────────────────
+
     def execute(self, user_input: str, cancel_check=None) -> dict:
         """
-        完整执行流程：解析 → 查找 Skill → 执行。
+        完整执行流程：解析任务链 → 逐步执行 → 上下文传递。
 
         参数:
             user_input: 用户自然语言指令
-            cancel_check: 可选的回调函数，返回 boolean 代表是否在执行中途被用户主动取消
+            cancel_check: 可选的回调函数，返回 True 表示用户已取消
 
         返回:
             {"success": bool, "message": str, "data": any}
@@ -163,67 +237,131 @@ class Planner:
         if cancel_check and cancel_check():
             return {"success": False, "message": "指令已取消", "data": None}
 
-        # 步骤 1：AI 解析意图
-        print("\n🧠 正在理解指令...")
+        # ── 步骤 1：AI 解析任务链 ──────────────────────────────────
+        print("\n🧠 正在规划任务...")
         t0 = _time.time()
-        parsed = self.parse_intent(user_input)
-        print(f"⏱️ [Planner 意图解析] 耗时：{_time.time() - t0:.1f}s")
+        task_chain = self.parse_task_chain(user_input)
+        print(f"⏱️ [Planner 规划] 耗时：{_time.time() - t0:.1f}s")
 
-        if not parsed:
+        if not task_chain:
             return {
                 "success": False,
                 "message": "抱歉，我没理解你的指令。试试说得更具体？",
                 "data": None,
             }
 
-        app_name = parsed["app"]
-        intent_name = parsed["intent"]
-        slots = parsed.get("slots", {})
-        confidence = parsed.get("confidence", "unknown")
+        steps = task_chain["steps"]
+        total_steps = len(steps)
 
-        print(f"📋 解析结果：应用={app_name}, 操作={intent_name}, "
-              f"参数={slots}, 置信度={confidence}")
+        # 打印任务计划
+        print(f"\n📋 计划执行 {total_steps} 个步骤：")
+        for s in steps:
+            print(f"  步骤 {s['step']}: [{s['app']}] {s['intent']} — {s.get('description', '')}")
+            if s.get("slots"):
+                print(f"    参数：{s['slots']}")
 
-        # 置信度太低时请求确认
-        if confidence == "low":
-            print(f"⚠️ 置信度较低，建议确认：你是想用 {app_name} 执行 {intent_name} 吗？")
+        # ── 步骤 2：逐步执行，并做上下文传递 ──────────────────────
+        context = {}   # 存储各步骤输出：{"step1": {...}, "step2": {...}}
+        last_result = None
 
-        # 步骤 2：查找对应 Skill
-        skill = self.registry.get_skill_by_name(app_name)
-        if not skill:
-            result = self.registry.find_skill_for_intent(intent_name)
-            if result:
-                skill, intent_name = result
+        for i, step in enumerate(steps):
+            step_num = i + 1
+            app_name = step.get("app", "")
+            intent_name = step.get("intent", "")
+            slots = step.get("slots", {})
+            description = step.get("description", f"{app_name}.{intent_name}")
+
+            print(f"\n{'─'*40}")
+            print(f"🔢 步骤 {step_num}/{total_steps}：{description}")
+
+            # 通知外层（server）当前进度，用于推送给 Web UI
+            if self._progress_callback:
+                try:
+                    self._progress_callback(step_num, total_steps, description)
+                except Exception:
+                    pass
+
+            # 占位符替换（把前面步骤的输出注入当前步骤的参数）
+            if context:
+                slots = self._resolve_placeholders(slots, context)
+                print(f"  解析后参数：{slots}")
+
+            # 中断检查（执行前）
+            if cancel_check and cancel_check():
+                msg = f"步骤 {step_num}/{total_steps} 前被用户取消"
+                print(f"🛑 {msg}")
+                self.memory.append_history(user_input, f"🛑 {msg}")
+                return {"success": False, "message": msg, "data": None}
+
+            # 查找对应 Skill
+            skill = self.registry.get_skill_by_name(app_name)
+            if not skill:
+                result_tuple = self.registry.find_skill_for_intent(intent_name)
+                if result_tuple:
+                    skill, intent_name = result_tuple
+                else:
+                    msg = f"步骤 {step_num}/{total_steps} 失败：找不到应用「{app_name}」的操作能力"
+                    self.memory.append_history(user_input, f"❌ {msg}")
+                    print(f"\n⏱️ ===== 总耗时：{_time.time() - total_start:.1f}s =====")
+                    return {"success": False, "message": msg, "data": None}
+
+            # 执行前最后一次中断检查（高危操作保护）
+            if cancel_check and cancel_check():
+                msg = f"步骤 {step_num}/{total_steps} 已在「{skill.app_name}」执行前被拦截"
+                print(f"🛑 [拦截] {msg}")
+                self.memory.append_history(user_input, f"🛑 {msg}")
+                return {"success": False, "message": msg, "data": None}
+
+            # ── 执行 ──
+            print(f"🚀 执行：{skill.app_name}.{intent_name}")
+            t0 = _time.time()
+            try:
+                result = skill.execute(intent_name, slots, cancel_check=cancel_check)
+            except Exception as e:
+                import pyautogui
+                if isinstance(e, pyautogui.FailSafeException):
+                    print("🚨 [FAILSAFE 触发] 执行层 — 物理急停")
+                    raise
+                result = {"success": False, "message": f"步骤 {step_num} 执行异常：{e}", "data": None}
+
+            print(f"⏱️ [步骤 {step_num} 耗时] {_time.time() - t0:.1f}s")
+
+            status_icon = "✅" if result["success"] else "❌"
+            print(f"{status_icon} 步骤 {step_num} 结果：{result['message']}")
+            if result.get("data"):
+                print(f"  📦 步骤输出：{result['data']}")
+
+            # 把步骤输出存入上下文供后续引用
+            step_data = result.get("data")
+            if isinstance(step_data, dict):
+                context[f"step{step_num}"] = step_data
+            elif step_data is not None:
+                context[f"step{step_num}"] = {"value": step_data}
             else:
-                return {
-                    "success": False,
-                    "message": f"找不到应用 {app_name} 的操作能力",
-                    "data": None,
-                }
+                context[f"step{step_num}"] = {}
 
-        # 在高危的系统自动化操作前，做最后一次强校验
-        if cancel_check and cancel_check():
-            print(f"🛑 [中断拦截] 拦截了即将在 {skill.app_name} 执行的 {intent_name} 操作")
-            return {
-                "success": False,
-                "message": "已成功拦截阻断该操作！",
-                "data": None,
-            }
+            last_result = result
 
-        # 步骤 3：执行
-        print(f"\n🚀 开始执行：{skill.app_name}.{intent_name}...")
-        t0 = _time.time()
-        result = skill.execute(intent_name, slots, cancel_check=cancel_check)
-        print(f"⏱️ [Skill 执行总计] 耗时：{_time.time() - t0:.1f}s")
+            # 失败则停止整个任务链
+            if not result["success"]:
+                if total_steps == 1:
+                    msg = result["message"]
+                else:
+                    msg = f"[步骤 {step_num}/{total_steps}：{description}] {result['message']}"
+                self.memory.append_history(user_input, f"❌ {msg}")
+                print(f"\n⏱️ ===== 总耗时：{_time.time() - total_start:.1f}s =====")
+                return {"success": False, "message": msg, "data": None}
 
-        # 打印结果
-        status = "✅" if result["success"] else "❌"
-        print(f"\n{status} {result['message']}")
-        if result.get("data"):
-            print(f"📄 返回数据：\n{result['data']}")
+        # ── 全部步骤完成 ──────────────────────────────────────────
+        if total_steps == 1:
+            final_msg = last_result["message"]
+        else:
+            final_msg = f"✅ 全部 {total_steps} 步已完成"
 
-        # 记录到历史滑动窗口
-        self.memory.append_history(user_input, f"{status} {result['message']}")
-
+        self.memory.append_history(user_input, f"✅ {final_msg}")
         print(f"\n⏱️ ===== 总耗时：{_time.time() - total_start:.1f}s =====")
-        return result
+        return {
+            "success": True,
+            "message": final_msg,
+            "data": last_result.get("data") if last_result else None,
+        }

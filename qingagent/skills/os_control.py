@@ -98,7 +98,19 @@ class OSControlSkill(BaseSkill):
         actions.double_click_at_normalized(target_rect, center_pt)
         time.sleep(0.5)
         # QQ 截屏在没开特定设置时，也能用回车收尾
-        return {"success": True, "message": "截图成功（已双击/回车双重确认）", "data": target}
+        actions.press_key("enter")
+        time.sleep(0.5)
+
+        # 把剪贴板图片保存到磁盘，供后续步骤 ${stepN.screenshot_path} 引用
+        screenshot_path = self._save_clipboard_image()
+        return {
+            "success": True,
+            "message": "截图成功（已双击/回车双重确认）",
+            "data": {
+                "target": target,
+                "screenshot_path": screenshot_path,
+            }
+        }
 
     def execute_app_screenshot(self, slots: dict) -> dict:
         """
@@ -177,5 +189,60 @@ class OSControlSkill(BaseSkill):
         actions.double_click_at_normalized(target_rect, center_pt)
         time.sleep(0.3)
         actions.press_key("enter")
-        
-        return {"success": True, "message": f"行云流水！已对 {app_name} 触发独立窗口吸附截取", "data": app_name}
+        time.sleep(0.5)
+
+        # 把剪贴板图片保存到磁盘，供后续步骤 ${stepN.screenshot_path} 引用
+        screenshot_path = self._save_clipboard_image()
+        return {
+            "success": True,
+            "message": f"行云流水！已对 {app_name} 触发独立窗口吸附截取",
+            "data": {
+                "app_name": app_name,
+                "screenshot_path": screenshot_path,
+            }
+        }
+
+    def _save_clipboard_image(self) -> str | None:
+        """
+        把当前系统剪贴板里的图片保存到磁盘文件。
+        截图工具（QQ截图/Mac原生截图）完成后会把图片放入剪贴板。
+
+        返回：
+            保存成功 → 图片路径（如 /tmp/qingagent_screenshot_20240101_120000.png）
+            剪贴板无图片 → None
+        """
+        import subprocess
+        import os
+        from datetime import datetime
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_path = f"/tmp/qingagent_screenshot_{timestamp}.png"
+
+        try:
+            # 方案 A：用 AppleScript 把剪贴板 PNG 数据写入文件
+            script = f"""
+set theFile to POSIX file "{save_path}"
+set fileRef to open for access theFile with write permission
+write (the clipboard as «class PNGf») to fileRef
+close access fileRef
+"""
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and os.path.exists(save_path) and os.path.getsize(save_path) > 0:
+                print(f"💾 截图已保存：{save_path}")
+                return save_path
+
+            # 方案 B：用 pngpaste（需要 brew install pngpaste）
+            alt = subprocess.run(["pngpaste", save_path], capture_output=True, timeout=5)
+            if alt.returncode == 0 and os.path.exists(save_path):
+                print(f"💾 截图已保存（pngpaste）：{save_path}")
+                return save_path
+
+            print("⚠️ 剪贴板无图片数据，截图可能仍在剪贴板中（可用 [粘贴] 直接发送）")
+            return None
+
+        except Exception as e:
+            print(f"⚠️ 保存剪贴板图片出错：{e}")
+            return None

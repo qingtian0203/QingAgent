@@ -147,6 +147,17 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
         """在后台线程中执行任务"""
         try:
             cancel_check = lambda: _tasks.get(task_id, {}).get("status") == "cancelled"
+
+            # 进度回调：执行多步骤任务链时，把每步进度写入任务状态供前端轮询
+            def progress_callback(current_step: int, total_steps: int, description: str):
+                if task_id in _tasks and _tasks[task_id].get("status") == "running":
+                    _tasks[task_id]["progress"] = {
+                        "current_step": current_step,
+                        "total_steps": total_steps,
+                        "description": description,
+                    }
+
+            _planner._progress_callback = progress_callback
             result = _planner.execute(command, cancel_check=cancel_check)
             # 如果在执行完毕后发现用户中途点了取消，就不要强行标记为 done（防止诈尸）
             if not cancel_check():
@@ -179,7 +190,11 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             return
 
         if task["status"] == "running":
-            self._json_response({"status": "running", "task_id": task_id})
+            response = {"status": "running", "task_id": task_id}
+            # 如果有步骤进度，一起返回给前端
+            if task.get("progress"):
+                response["progress"] = task["progress"]
+            self._json_response(response)
         elif task["status"] == "cancelled":
             self._json_response({"status": "cancelled", "task_id": task_id})
             _tasks.pop(task_id, None)
@@ -784,10 +799,12 @@ def _get_ui_html() -> str:
         _cancelBtnCounter++;
         const cancelBtnId = 'cancelBtn_' + _cancelBtnCounter;
         const timerId = 'execTimer_' + _cancelBtnCounter;
+        const progressId = 'stepProgress_' + _cancelBtnCounter;
 
-        // 加载动画 + 计时器
+        // 加载动画 + 计时器 + 步骤进度
         const loadingRow = addMsg(
             `正在执行操控...<div class="loading-dots"><span></span><span></span><span></span></div>
+             <div id="${progressId}" style="font-size:11px; color:rgba(255,255,255,0.6); margin-top:2px; min-height:14px;"></div>
              <div style="display:flex; align-items:center; margin-top:4px;">
                  <div class="timer" id="${timerId}">⏱ 0s</div>
                  <button class="cancel-btn" id="${cancelBtnId}" style="display:none;">✖ 终止</button>
@@ -845,6 +862,14 @@ def _get_ui_html() -> str:
                         if (cb) {
                             cb.style.display = 'inline-block';
                             cb.onclick = () => cancelTask(taskId, timerInterval, loadingRow);
+                        }
+                        // 多步骤：更新步骤进度提示
+                        if (data.progress) {
+                            const p = data.progress;
+                            const stepEl = document.getElementById(progressId);
+                            if (stepEl) {
+                                stepEl.textContent = `步骤 ${p.current_step}/${p.total_steps}：${p.description}`;
+                            }
                         }
                         setTimeout(pollResult, 1000);
                     }

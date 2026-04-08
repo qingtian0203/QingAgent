@@ -38,8 +38,9 @@ class WeChatSkill(BaseSkill):
     def register_intents(self):
         self.add_intent(Intent(
             name="send_message",
-            description="给指定联系人或群发送一条消息。注意：如果用户要求发送刚刚截的图或剪贴板里的图片，请把 message 参数固定填为'[粘贴]'",
+            description="给指定联系人或群发消息。如果要发图片，请将 image_path 填入参数（支持 ${stepN.screenshot_path}）；如果只提了发图片但没路径，message可以填'[粘贴]'作为后备。",
             required_slots=["contact_name", "message"],
+            optional_slots=["image_path"],
             examples=[
                 "给晴天发条微信说下午开会",
                 "把自己刚刚截的图发给老板",
@@ -181,17 +182,26 @@ class WeChatSkill(BaseSkill):
         # 步骤 4：输入并发送
         self.check_cancel()
         
-        # 智能剪贴板保护：判断是否是需要发送刚截取的图片或原系统剪贴板指令
-        if message == "[粘贴]" or "{{clipboard" in message or "剪贴板" in message.lower():
-            print("📋 由于联系人搜索占用了系统剪贴板，使用高阶工具 Paste 找回前置底片...")
+        image_path = slots.get("image_path")
+
+        # 判断是否需要发图
+        if image_path:
+            print(f"🖼️ 准备发送物理图片，先将其灌入剪贴板顶层: {image_path}")
+            if actions.copy_image_to_clipboard(image_path):
+                _time.sleep(0.2)
+                actions.hotkey("command", "v")
+                _time.sleep(0.5)
+            else:
+                print("❌ 图片灌入失败，中止发送")
+                return {"success": False, "message": "读取本地图片失败", "data": None}
+                
+        elif message == "[粘贴]" or "{{clipboard" in message or "剪贴板" in message.lower():
+            # 传统方案兜底（如果没有经过前置的按文件路径传递截图）
+            print("📋 未收到强力绝对路径，使用兜底机制调起剪贴板管理器...")
             actions.hotkey("shift", "command", "space")
-            _time.sleep(0.6) # 等待 Paste 底部拦弹出及渲染
-            
-            # 因为搜索联系人刚刚 copy 了一次，所以我们的截图绝对在第 2 位，按下右方向键！
+            _time.sleep(0.6)
             actions.press_key("right")
             _time.sleep(0.2)
-            
-            # 回车即可让 Paste 把该区块重新挤入剪贴板并粘贴到当前输入框！
             actions.press_key("enter")
             _time.sleep(0.5)
         else:

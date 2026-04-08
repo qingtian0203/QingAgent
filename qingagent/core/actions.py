@@ -197,3 +197,32 @@ def emergency_stop():
         pass
 
     print("🚨 [紧急终止] 已触发 FAILSAFE，所有 pyautogui 操作已中断")
+
+
+def copy_image_to_clipboard(image_path: str) -> bool:
+    """
+    将本地图片文件强制写入 macOS 系统剪贴板（清空之前的文本保留）。
+    用于精确发送刚截取的图片，防止剪贴板在其间被中途搜索文本污染。
+    """
+    import subprocess
+    import os
+    if not os.path.exists(image_path):
+        print(f"❌ 找不到图片文件：{image_path}")
+        return False
+        
+    try:
+        # 使用 macOS 内置的 osascript 将本地文件加载至剪贴板
+        script = f'''
+        set theFile to POSIX file "{image_path}"
+        set the clipboard to (read theFile as «class PNGf»)
+        '''
+        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        if res.returncode == 0:
+            print(f"📋 图片已硬塞入剪贴板：{image_path}")
+            return True
+        else:
+            print(f"⚠️ AppleScript 写入剪贴板失败: {res.stderr}")
+            return False
+    except Exception as e:
+        print(f"⚠️ 无法将图片写入剪贴板: {e}")
+        return False

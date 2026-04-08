@@ -85,7 +85,9 @@ class MinesweeperSkill(BaseSkill):
             "data": {"status": "AI_started"}
         }
 
-    def screenshot(self) -> bytes | None:
-        """从底座获取全屏截图（复用能力）"""
-        from qingagent.core.actions import get_screenshot
-        return get_screenshot()
+    def screenshot(self) -> str | None:
+        """从底座获取全屏截图"""
+        import pyautogui
+        from qingagent.core import vision
+        screen_w, screen_h = pyautogui.size()
+        return vision.capture_screenshot((0, 0, screen_w, screen_h))

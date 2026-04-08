@@ -744,7 +744,7 @@ def _get_ui_html() -> str:
         micBtn.classList.add('unsupported');
         micBtn.title = '当前浏览器不支持语音识别';
         micBtn.onclick = () => {
-            addMsg('⚠️ 当前浏览器不支持语音识别 (Web Speech API)。请使用 Chrome 浏览器。', 'agent', 'error');
+            addMsg(`⚠️ 语音功能受限！手机浏览器在 HTTP 连接下（非 HTTPS）为了保护隐私，默认禁用了麦克风 API。\n\n【解决办法】：在手机的 Chrome 地址栏输入 chrome://flags/#unsafely-treat-insecure-origin-as-secure，将目前的局域网 IP（比如 http://192.168.1.17:8002）填入白名单并开启，即可强制启用语音！`, 'agent', 'error');
         };
     }
 

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QingAgent - 扫雷特训空间</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="glass-panel">
+        <div class="header">
+            <h1>Agent Minesweeper 🤖</h1>
+            <div class="stats">
+                <div class="stat-box">💣 <span id="mines-count">10</span></div>
+                <div class="stat-box">⏱️ <span id="timer">000</span></div>
+            </div>
+            <button id="reset-btn" class="glass-btn">重新生成</button>
+        </div>
+        <div id="board" class="board"></div>
+        <div class="ai-hint">
+            <span class="pulse-dot"></span> 等待 QingAgent 注入高维起手式...
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>

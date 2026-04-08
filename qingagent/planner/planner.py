@@ -134,6 +134,11 @@ class Planner:
             return result
 
         except Exception as e:
+            # 🚨 FailSafeException 必须穿透，不能被 Planner 吞掉
+            import pyautogui
+            if isinstance(e, pyautogui.FailSafeException):
+                print("🚨 [FAILSAFE 触发] Planner 层 — 物理急停信号穿透")
+                raise
             print(f"❌ Planner 解析失败：{e}")
             return None
 

@@ -152,11 +152,24 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             if not cancel_check():
                 _tasks[task_id] = {"status": "done", "result": result}
         except Exception as e:
-            if _tasks.get(task_id, {}).get("status") != "cancelled":
+            import pyautogui
+            if isinstance(e, pyautogui.FailSafeException):
+                # 物理 FAILSAFE 触发 → 把任务标记为 cancelled，UI 显示急停信息
+                _tasks[task_id] = {
+                    "status": "cancelled",
+                    "result": {
+                        "success": False,
+                        "message": "🚨 任务被物理急停（鼠标到达屏幕左上角），已安全中断",
+                        "data": None,
+                    },
+                }
+                print("🚨 [FAILSAFE] 任务线程已终止，UI 状态已同步为 cancelled")
+            elif _tasks.get(task_id, {}).get("status") != "cancelled":
                 _tasks[task_id] = {
                     "status": "done",
                     "result": {"success": False, "message": f"执行出错：{e}", "data": None},
                 }
+
 
     def _api_task_status(self, task_id: str):
         """查询任务执行状态"""

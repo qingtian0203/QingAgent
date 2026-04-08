@@ -327,6 +327,11 @@ class BaseSkill:
                 "data": None,
             }
         except Exception as e:
+            # 🚨 FailSafeException 必须穿透所有 except，不能被吞掉
+            import pyautogui
+            if isinstance(e, pyautogui.FailSafeException):
+                print("🚨 [FAILSAFE 触发] 物理紧急中断 — 鼠标到达左上角，任务强制终止")
+                raise  # 让它继续往上传播，彻底中止整个任务链
             return {
                 "success": False,
                 "message": f"执行 {intent_name} 时出错：{e}",

@@ -36,6 +36,8 @@ class Planner:
         self.memory = MemoryManager()
         # 进度回调，由外层（server）注入，用于向 Web UI 推送步骤进度
         self._progress_callback = None
+        # 全局跨轮次上下文：保留上一次对话最后一个步骤的输出，作为下一次的 step0
+        self.global_context = {}
 
     # ──────────────────────────────────────────────────────────────
     #  核心方法 1：AI 解析任务链
@@ -261,7 +263,8 @@ class Planner:
                 print(f"    参数：{s['slots']}")
 
         # ── 步骤 2：逐步执行，并做上下文传递 ──────────────────────
-        context = {}   # 存储各步骤输出：{"step1": {...}, "step2": {...}}
+        # 把上一次执行的最终结果继承为 step0，这样 LLM 在下一轮说“发刚才的图”时注入 ${step0.xxx} 就能平滑过渡
+        context = {"step0": self.global_context} if self.global_context else {}
         last_result = None
 
         for i, step in enumerate(steps):
@@ -341,6 +344,8 @@ class Planner:
                 context[f"step{step_num}"] = {}
 
             last_result = result
+            # 把当前最高执行进度的上下文刷新到全局，留给新对话当 step0 用
+            self.global_context = context[f"step{step_num}"]
 
             # 失败则停止整个任务链
             if not result["success"]:

@@ -12,24 +12,24 @@ class OSControlSkill(BaseSkill):
     def register_intents(self):
         self.add_intent(Intent(
             name="custom_screenshot",
-            description="使用自带的第三方截图工具（如QQ截图）截取屏幕上大块的指定部分区域",
+            description="截取【当前已在屏幕上可见的】某个具体元素、图表或局部区域。注意：如果用户要求给某个特定的【应用程序/软件】截图，请绝对不要用这个意图，而应该用 app_screenshot",
             required_slots=["target"],
             examples=[
-                "使用QQ截图把界面上的服务日志截存下来",
-                "QQ截图目标区域",
                 "帮我截取屏幕左侧的导航栏",
-                "把下面那个表格用截图工具保存"
+                "把下面那个表格用截图工具保存",
+                "截取右边的那张海报图片"
             ],
         ))
         
         self.add_intent(Intent(
             name="app_screenshot",
-            description="为某个具体的应用程序（如微信、日历、计算器等）开启全局自动吸附截图",
+            description="给某个指定的【应用程序/软件】截图（例如备忘录、微信、日历、系统设置等）。当你识别到目标是一个软件应用时，必须强制使用本意图，因为它负责把被后台遮挡的软件拉到最前面再进行截图。",
             required_slots=["app_name"],
             examples=[
                 "给微信截图",
-                "帮我把日历应用截图发一下",
-                "截取一下整个浏览器窗口"
+                "帮我把备忘录内容截图发一下",
+                "截取系统设置界面",
+                "用截图软件将日历保存"
             ],
         ))
 

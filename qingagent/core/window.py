@@ -93,17 +93,26 @@ def resolve_app_real_name(app_name: str) -> str:
 
     # 严谨的查询语法：必须是 Application，且 DisplayName 包含 app_name（不区分大小写 c）
     # head -n 1 取出匹配度最高的
-    # 优先尝试完全精准匹配（解决"备忘录"被"语音备忘录"抢行的问题）
+    # 1. 优先尝试完全精准匹配（解决"备忘录"被"语音备忘录"抢行的问题）
     cmd_exact = f'mdfind "kMDItemContentType == \'com.apple.application-bundle\' && kMDItemDisplayName == \'{app_name}.app\'c" | head -n 1'
+    # 2. 否则进行模糊匹配
     cmd_fuzzy = f'mdfind "kMDItemContentType == \'com.apple.application-bundle\' && kMDItemDisplayName == \'*{app_name}*\'c" | head -n 1'
     
-    cmd = f"{cmd_exact} \n if [ -z \"$(eval {cmd_exact})\" ]; then {cmd_fuzzy}; fi" 
     try:
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=2).stdout.strip()
+        # 执行精确查询
+        res = subprocess.run(cmd_exact, shell=True, capture_output=True, text=True, timeout=2).stdout.strip()
+        
+        # 精确查询没找到，执行模糊查询
+        if not res or not res.endswith(".app"):
+            res = subprocess.run(cmd_fuzzy, shell=True, capture_output=True, text=True, timeout=2).stdout.strip()
+            # 由于模糊查询可能由多行组成，防止意外情况取最后一行
+            if res:
+                res = [line for line in res.split('\n') if line.endswith('.app')]
+                res = res[0] if res else ""
+
         if res and res.endswith(".app"):
             # 拿到 /System/Applications/Notes.app -> 抽取 Notes
             real_name = os.path.basename(res)[:-4]
-            # print(f"🔍 [智能解析] '{app_name}' 真实对应的包名为: '{real_name}'")
             return real_name
     except Exception as e:
         print(f"⚠️ mdfind 解析异常: {e}")

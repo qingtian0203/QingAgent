@@ -156,11 +156,24 @@ class BaseSkill:
             return False
 
     def screenshot(self, save_path: str = None) -> str | None:
-        """截取当前应用窗口"""
+        """截取当前应用窗口（向四周外扩 200px 以捕获溢出的弹窗和菜单）"""
         if not self._window_rect:
             print("❌ 尚未定位窗口，请先调用 activate()")
             return None
-        return vision.capture_screenshot(self._window_rect, save_path)
+            
+        import pyautogui
+        screen_w, screen_h = pyautogui.size()
+        x, y, w, h = self._window_rect
+        PAD = 200
+        
+        nx = max(0, x - PAD)
+        ny = max(0, y - PAD)
+        # 确保整体宽度和高度不越过屏幕边界
+        nw = min(screen_w - nx, w + (x - nx) + PAD)
+        nh = min(screen_h - ny, h + (y - ny) + PAD)
+        
+        self._last_screenshot_rect = (int(nx), int(ny), int(nw), int(nh))
+        return vision.capture_screenshot(self._last_screenshot_rect, save_path)
 
     def switch_to_popup(self) -> bool:
         """
@@ -253,9 +266,10 @@ class BaseSkill:
         if not coords:
             return False
 
-        # 点击
+        # 点击 (使用产生该截图的配套扩边 rect 进行精确换算)
         self.check_cancel()
-        actions.click_at_normalized(self._window_rect, coords)
+        target_rect = getattr(self, '_last_screenshot_rect', self._window_rect)
+        actions.click_at_normalized(target_rect, coords)
 
         # 验证（如果需要）
         if verify_desc and self._verifier:

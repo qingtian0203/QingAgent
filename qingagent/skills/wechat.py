@@ -38,12 +38,12 @@ class WeChatSkill(BaseSkill):
     def register_intents(self):
         self.add_intent(Intent(
             name="send_message",
-            description="给指定联系人或群发送一条消息",
+            description="给指定联系人或群发送一条消息。注意：如果用户要求发送刚刚截的图或剪贴板里的图片，请把 message 参数固定填为'[粘贴]'",
             required_slots=["contact_name", "message"],
             examples=[
                 "给晴天发条微信说下午开会",
-                "在工作群发一下会议纪要",
-                "微信告诉老板已经完成了",
+                "把自己刚刚截的图发给老板",
+                "把剪贴板的内容粘贴给丸子",
             ],
         ))
 
@@ -180,7 +180,23 @@ class WeChatSkill(BaseSkill):
 
         # 步骤 4：输入并发送
         self.check_cancel()
-        actions.type_text(message)
+        
+        # 智能剪贴板保护：判断是否是需要发送刚截取的图片或原系统剪贴板指令
+        if message == "[粘贴]" or "{{clipboard" in message or "剪贴板" in message.lower():
+            print("📋 由于联系人搜索占用了系统剪贴板，使用高阶工具 Paste 找回前置底片...")
+            actions.hotkey("shift", "command", "space")
+            _time.sleep(0.6) # 等待 Paste 底部拦弹出及渲染
+            
+            # 因为搜索联系人刚刚 copy 了一次，所以我们的截图绝对在第 2 位，按下右方向键！
+            actions.press_key("right")
+            _time.sleep(0.2)
+            
+            # 回车即可让 Paste 把该区块重新挤入剪贴板并粘贴到当前输入框！
+            actions.press_key("enter")
+            _time.sleep(0.5)
+        else:
+            actions.type_text(message)
+            
         actions.press_key("enter")
 
         return {

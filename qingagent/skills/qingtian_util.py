@@ -240,7 +240,10 @@ class QingTianUtilSkill(BaseSkill):
                     c = coords.get(key)
                     if not c:
                         return False
-                    return self._click_on_rect(c["rx"], c["ry"])
+                    # 获取最新的一张截图由于弹窗扩屏产生的真实矩形框范围！
+                    target_rect = getattr(self, '_last_screenshot_rect', self._window_rect)
+                    actions.click_at_normalized(target_rect, c)
+                    return True
 
                 # ① 输入框 → 输入文字
                 _click_key("input")

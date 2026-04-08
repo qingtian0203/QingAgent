@@ -122,6 +122,28 @@ def move_to(rect: tuple, coords: dict, duration: float = 0.5):
     pyautogui.moveTo(px, py, duration=duration)
 
 
+def drag_normalized(rect: tuple, start_coords: dict, end_coords: dict, duration: float = 1.0):
+    """
+    按住鼠标左键，从起点拖拽到终点后松开（可用于画框、长按划动等）。
+
+    参数:
+        rect: 窗口 (x, y, w, h)
+        start_coords: 起点归一化坐标 {"rx": ..., "ry": ...}
+        end_coords: 终点归一化坐标 {"rx": ..., "ry": ...}
+        duration: 滑动/拖拽的动画耗时（秒），越长动作越慢越能给系统反应时间
+    """
+    sx, sy = normalized_to_physical(rect, start_coords["rx"], start_coords["ry"])
+    ex, ey = normalized_to_physical(rect, end_coords["rx"], end_coords["ry"])
+    
+    print(f"🖱️ 拖拽滑动 → 从 ({sx:.0f}, {sy:.0f}) 到 ({ex:.0f}, {ey:.0f})，耗时 {duration}s")
+    
+    # 瞬间移动到起点
+    pyautogui.moveTo(sx, sy)
+    # 按住左键平滑拖到终点并松开
+    pyautogui.dragTo(ex, ey, duration=duration, button='left')
+    time.sleep(config.ACTION_DELAY)
+
+
 def scroll(clicks: int, rect: tuple = None, coords: dict = None):
     """
     滚动操作。

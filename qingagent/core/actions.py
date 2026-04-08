@@ -11,6 +11,15 @@ import pyautogui
 import pyperclip
 from .. import config
 
+# ============================================================
+#  物理紧急安全锁
+# ============================================================
+# FAILSAFE = True：把鼠标移到屏幕左上角(0,0)会立刻抛出
+# pyautogui.FailSafeException，中断所有 pyautogui 操作。
+# 这是对抗"任务陷入死循环"的最后物理手段。
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.05   # 每次 pyautogui 操作间最短间隔（防止操作过快系统跟不上）
+
 
 def normalized_to_physical(rect: tuple, nx: int, ny: int) -> tuple[float, float]:
     """
@@ -158,3 +167,33 @@ def scroll(clicks: int, rect: tuple = None, coords: dict = None):
         pyautogui.moveTo(px, py, duration=0.2)
     pyautogui.scroll(clicks)
     time.sleep(config.ACTION_DELAY)
+
+
+def emergency_stop():
+    """
+    全局紧急终止 — 立刻中断正在进行的所有 pyautogui 操作。
+
+    触发机制：
+    1. 先发 Escape 键，关闭正在弹出的截图工具遮罩、弹框等
+    2. 把鼠标移到屏幕左上角(0,0)，触发 pyautogui.FAILSAFE 机制
+       → 所有 pyautogui 操作立即抛出 FailSafeException 并中断
+
+    ⚠️ 不要在正常业务流程中调用，仅用于紧急情况。
+    """
+    try:
+        # 先尝试按 Escape 关闭截图工具等弹出遮罩
+        pyautogui.press("escape")
+        time.sleep(0.2)
+        pyautogui.press("escape")
+        time.sleep(0.1)
+    except Exception:
+        pass
+
+    try:
+        # 把鼠标甩到左上角，触发 FAILSAFE 抛出异常
+        # 这会中断同一线程内所有后续的 pyautogui 操作
+        pyautogui.moveTo(0, 0, duration=0.1)
+    except Exception:
+        pass
+
+    print("🚨 [紧急终止] 已触发 FAILSAFE，所有 pyautogui 操作已中断")

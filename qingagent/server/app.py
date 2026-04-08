@@ -101,9 +101,36 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                 self._json_response({"success": False, "message": "请求格式错误"})
         elif parsed.path.startswith("/api/cancel/"):
             task_id = parsed.path.split("/")[-1]
-            if task_id in _tasks:
+            if task_id == "all":
+                # 一次性取消所有正在运行的任务
+                cancelled_count = 0
+                for tid in list(_tasks.keys()):
+                    if _tasks[tid].get("status") == "running":
+                        _tasks[tid]["status"] = "cancelled"
+                        cancelled_count += 1
+                self._json_response({"success": True, "cancelled": cancelled_count})
+            elif task_id in _tasks:
                 _tasks[task_id]["status"] = "cancelled"
-            self._json_response({"success": True})
+                self._json_response({"success": True})
+            else:
+                self._json_response({"success": False, "message": "任务不存在"})
+        elif parsed.path == "/api/emergency_stop":
+            # 🚨 最高级别紧急终止：取消所有任务 + 触发 FAILSAFE
+            for tid in list(_tasks.keys()):
+                if _tasks[tid].get("status") == "running":
+                    _tasks[tid]["status"] = "cancelled"
+
+            def _do_emergency_stop():
+                import time as _t
+                _t.sleep(0.1)  # 等取消信号传递到执行线程
+                try:
+                    from ..core.actions import emergency_stop
+                    emergency_stop()
+                except Exception as e:
+                    print(f"⚠️ 紧急终止执行失败：{e}")
+
+            threading.Thread(target=_do_emergency_stop, daemon=True).start()
+            self._json_response({"success": True, "message": "🚨 紧急终止指令已发出"})
         else:
             self.send_error(404)
 
@@ -544,6 +571,26 @@ def _get_ui_html() -> str:
 
         .send-btn:active, .mic-btn:active { transform: scale(0.9); }
         .send-btn:disabled { opacity: 0.3; }
+
+        /* 紧急停止按钮 */
+        .emergency-btn {
+            padding: 6px 12px;
+            border-radius: 16px;
+            border: 1.5px solid rgba(239,68,68,0.5);
+            background: rgba(239,68,68,0.1);
+            color: #f87171;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            -webkit-tap-highlight-color: transparent;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .emergency-btn:active {
+            background: rgba(239,68,68,0.3);
+            transform: scale(0.95);
+        }
     </style>
 </head>
 <body>
@@ -555,6 +602,7 @@ def _get_ui_html() -> str:
             <p>晴帅的私人 AI 桌面助手</p>
         </div>
         <div class="status-dot" id="statusDot" title="在线"></div>
+        <button class="emergency-btn" onclick="emergencyStop()" title="立即终止所有正在执行的任务">🚨 急停</button>
     </div>
 
     <div class="quick-bar">
@@ -834,6 +882,24 @@ def _get_ui_html() -> str:
         // 2. 请求发完再更新 UI
         loadingRow.remove();
         addMsg('🛑 已发送终止信号，后台正在中断操作...', 'agent', 'error');
+        finish();
+    }
+
+    async function emergencyStop() {
+        // 🚨 最高级别紧急终止
+        // 1. 标记所有轮询停止
+        _pollCancelled = true;
+
+        // 2. 调用最高权限的停止接口（取消所有任务 + FAILSAFE）
+        try {
+            const res = await fetch('/api/emergency_stop', { method: 'POST' });
+            const data = await res.json();
+            addMsg(`🚨 紧急停止：${data.message || '已执行'}`, 'agent', 'error');
+        } catch(e) {
+            addMsg('⚠️ 紧急停止请求失败（服务离线？）。<br>物理急救：把鼠标快速移到屏幕左上角(0,0)！', 'agent', 'error');
+        }
+
+        // 3. 恢复 UI 状态
         finish();
     }
 </script>

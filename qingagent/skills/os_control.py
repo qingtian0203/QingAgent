@@ -126,31 +126,16 @@ class OSControlSkill(BaseSkill):
             
         print(f"🚀 准备为应用 [{app_name}] 执行全窗口截图...")
         
-        # 1. 解决致命的 macOS 中英文名称映射墙问题
-        # AppleScript 唤醒程序对中文名不太感冒，做一层高频本地化映射
-        app_mapping = {
-            "微信": "WeChat",
-            "日历": "Calendar",
-            "计算器": "Calculator",
-            "备忘录": "Notes",
-            "系统设置": "System Settings",
-            "设置": "System Settings",
-            "照片": "Photos",
-            "音乐": "Music",
-            "地图": "Maps",
-            "信息": "Messages",
-            "邮件": "Mail",
-            "浏览器": "Safari",
-            "safari": "Safari",
-            "访达": "Finder"
-        }
-        # 如果能在字典中找到就用纯英文真名，否则退化为直接尝试原始名称
-        actual_mac_app_name = app_mapping.get(app_name.lower(), app_name)
+        from qingagent.core.window import resolve_app_real_name
         
-        # 1. 直接越过系统权限，强行把后台乃至关闭窗口的 APP 弹跳唤醒到最上层！
+        # 1. 动态智能解析，彻底丢弃死板的中英文映射表！
+        # 输入 "备忘录" -> 秒级返回 "Notes"
+        actual_mac_app_name = resolve_app_real_name(app_name)
+        
+        # 2. 直接越过系统权限，强行把后台乃至关闭窗口的 APP 弹跳唤醒到最上层！
         from qingagent.core import window
         print(f"🪄 使用 QingAgent 统一的 window.activate_app 召唤 {actual_mac_app_name} 到台前...")
-        window.activate_app(actual_mac_app_name)
+        window.activate_app(actual_mac_app_name, resolved=True)
         
         # 等待系统的动画展开：如果本身就是没开着的，多给点时间
         time.sleep(1.5)

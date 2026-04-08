@@ -81,7 +81,53 @@ def find_window(app_aliases: list[str], _retry_count: int = 0, silent: bool = Fa
     return {"rect": best["rect"], "owner": best["owner"]}
 
 
-def activate_app(app_name: str) -> bool:
+
+def resolve_app_real_name(app_name: str) -> str:
+    """
+    动态破解 macOS 的本地化屏障：
+    根据输入的任意别名/中文名，利用 Spotlight 底层引擎精准查出 app 真实的包名（如 备忘录 -> Notes）
+    """
+    import subprocess
+    if not app_name:
+        return app_name
+
+    # 严谨的查询语法：必须是 Application，且 DisplayName 包含 app_name（不区分大小写 c）
+    # head -n 1 取出匹配度最高的
+    cmd = f'mdfind "kMDItemKind == \'Application\' && kMDItemDisplayName == \'*{app_name}*\'c" | head -n 1'
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=2).stdout.strip()
+        if res and res.endswith(".app"):
+            # 拿到 /System/Applications/Notes.app -> 抽取 Notes
+            real_name = os.path.basename(res)[:-4]
+            # print(f"🔍 [智能解析] '{app_name}' 真实对应的包名为: '{real_name}'")
+            return real_name
+    except Exception as e:
+        print(f"⚠️ mdfind 解析异常: {e}")
+        
+    return app_name  # 如果查不到，原样返回兜底
+
+def activate_app(app_name: str, resolved: bool = False) -> bool:
+    """
+    激活（前置）指定应用，并强制弹出主窗口。
+    """
+    import subprocess
+
+    # 先做一层智能解析，获得真实的系统进程包名
+    real_app_name = resolve_app_real_name(app_name) if not resolved else app_name
+
+    # open -a：等同于双击 Dock 图标，是最可靠的弹出主窗口方式
+    ret_open = subprocess.run(["open", "-a", real_app_name], capture_output=True).returncode
+
+    # osascript activate：切到前台（有时候 open -a 只是启动，但不置最上层）
+    os.system(f'osascript -e \'tell application "{real_app_name}" to activate\' 2>/dev/null')
+
+    if ret_open == 0:
+        print(f"✅ 已激活应用：{real_app_name}" + (f" (原名:{app_name})" if real_app_name != app_name else ""))
+        time.sleep(config.APP_SWITCH_DELAY)
+        return True
+    else:
+        print(f"⚠️ 激活 {real_app_name} 失败，尝试继续...")
+        return False(app_name: str) -> bool:
     """
     激活（前置）指定应用，并强制弹出主窗口。
 

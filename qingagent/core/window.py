@@ -93,7 +93,11 @@ def resolve_app_real_name(app_name: str) -> str:
 
     # 严谨的查询语法：必须是 Application，且 DisplayName 包含 app_name（不区分大小写 c）
     # head -n 1 取出匹配度最高的
-    cmd = f'mdfind "kMDItemKind == \'Application\' && kMDItemDisplayName == \'*{app_name}*\'c" | head -n 1'
+    # 优先尝试完全精准匹配（解决"备忘录"被"语音备忘录"抢行的问题）
+    cmd_exact = f'mdfind "kMDItemContentType == \'com.apple.application-bundle\' && kMDItemDisplayName == \'{app_name}.app\'c" | head -n 1'
+    cmd_fuzzy = f'mdfind "kMDItemContentType == \'com.apple.application-bundle\' && kMDItemDisplayName == \'*{app_name}*\'c" | head -n 1'
+    
+    cmd = f"{cmd_exact} \n if [ -z \"$(eval {cmd_exact})\" ]; then {cmd_fuzzy}; fi" 
     try:
         res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=2).stdout.strip()
         if res and res.endswith(".app"):

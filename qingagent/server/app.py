@@ -20,10 +20,14 @@ from ..planner.planner import Planner
 # 全局实例
 _planner: Planner = None
 
-# 任务队列：异步执行，避免 HTTP 超时
-_tasks: dict = {}  # task_id -> {"status": "running"/"done", "result": {...}}
+# ── 任务队列（串行执行，防止多设备同时操控鼠标造成物理冲突）────────────────
+# 所有任务放入 _task_queue，由唯一的 worker 线程逐一取出执行，确保同一时刻
+# 最多只有 1 个任务在控制鼠标/键盘，彻底杜绝物理操作竞态
+import queue as _queue_module
+_tasks: dict = {}  # task_id -> {"status": "queued"/"running"/"done", "result": {...}}
 _task_counter = 0
 _task_lock = threading.Lock()
+_task_queue: _queue_module.Queue = _queue_module.Queue()  # 串行消费队列
 
 
 def _get_local_ip() -> str:
@@ -83,19 +87,22 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                     self._json_response({"success": False, "message": "指令不能为空"})
                     return
 
-                # 异步执行：立即返回 task_id，前端轮询结果
+                # 放入串行队列：立即返回 task_id，worker 线程顺序执行
                 global _task_counter
                 with _task_lock:
                     _task_counter += 1
                     task_id = str(_task_counter)
-                    _tasks[task_id] = {"status": "running", "result": None, "command": command}
+                    # 计算当前排队位置（队列长度 = 前方等待的任务数）
+                    queue_pos = _task_queue.qsize()
+                    _tasks[task_id] = {
+                        "status": "queued",
+                        "result": None,
+                        "command": command,
+                        "queue_pos": queue_pos,  # 前方有多少个任务在等
+                    }
 
-                thread = threading.Thread(
-                    target=self._run_task, args=(task_id, command), daemon=True
-                )
-                thread.start()
-
-                self._json_response({"task_id": task_id, "status": "running"})
+                _task_queue.put(task_id)
+                self._json_response({"task_id": task_id, "status": "queued", "queue_pos": queue_pos})
 
             except json.JSONDecodeError:
                 self._json_response({"success": False, "message": "请求格式错误"})
@@ -144,7 +151,11 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
 
     @staticmethod
     def _run_task(task_id: str, command: str):
-        """在后台线程中执行任务"""
+        """执行单个任务（由 worker 线程调用，同一时刻只会有 1 个任务在这里跑）"""
+        # 标记为 running，清空排队位置信息
+        _tasks[task_id]["status"] = "running"
+        _tasks[task_id].pop("queue_pos", None)
+
         try:
             cancel_check = lambda: _tasks.get(task_id, {}).get("status") == "cancelled"
 
@@ -189,7 +200,14 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             self._json_response({"error": "任务不存在"}, 404)
             return
 
-        if task["status"] == "running":
+        if task["status"] == "queued":
+            # 正在排队等待：返回当前在队列中的实时位置（队列里比我早的任务数）
+            ahead = sum(
+                1 for t in _tasks.values()
+                if t.get("status") in ("queued", "running") and t is not task
+            )
+            self._json_response({"status": "queued", "task_id": task_id, "ahead": ahead})
+        elif task["status"] == "running":
             response = {"status": "running", "task_id": task_id}
             # 如果有步骤进度，一起返回给前端
             if task.get("progress"):
@@ -265,6 +283,28 @@ def start_server(host: str = None, port: int = None):
     h = host or config.SERVER_HOST
     p = port or config.SERVER_PORT
     local_ip = _get_local_ip()
+
+    # ── 启动串行任务 worker 线程（唯一消费者）────────────────────────
+    # 所有来自不同设备的请求都放入 _task_queue，此线程按顺序逐一取出执行
+    # 保证同一时刻只有 1 个任务在操控鼠标/键盘，彻底消除物理操作竞态
+    def _task_worker():
+        while True:
+            task_id = _task_queue.get()  # 阻塞等待，有任务才继续
+            try:
+                task = _tasks.get(task_id)
+                if not task or task.get("status") == "cancelled":
+                    # 任务已在排队期间被取消，直接跳过
+                    continue
+                command = task["command"]
+                QingAgentHandler._run_task(task_id, command)
+            except Exception as e:
+                print(f"⚠️ Worker 异常：{e}")
+            finally:
+                _task_queue.task_done()
+
+    worker = threading.Thread(target=_task_worker, daemon=True, name="task-worker")
+    worker.start()
+    print("✅ 任务队列 Worker 已启动（串行执行，防止物理操作并发冲突）")
 
     server = ThreadedHTTPServer((h, p), QingAgentHandler)
     print(f"\n{'='*50}")
@@ -856,8 +896,18 @@ def _get_ui_html() -> str:
                         loadingRow.remove();
                         addMsg('🛑 操作已被终止', 'agent', 'error');
                         finish();
+                    } else if (data.status === 'queued') {
+                        // 排队中：实时显示前方任务数
+                        const stepEl = document.getElementById(progressId);
+                        if (stepEl) {
+                            const ahead = data.ahead || 0;
+                            stepEl.textContent = ahead > 0
+                                ? `⏳ 排队中，前方还有 ${ahead} 个任务…`
+                                : '⏳ 即将开始执行…';
+                        }
+                        setTimeout(pollResult, 1000);
                     } else {
-                        // 显示取消按钮
+                        // running 状态：显示取消按钮和步骤进度
                         const cb = document.getElementById(cancelBtnId);
                         if (cb) {
                             cb.style.display = 'inline-block';

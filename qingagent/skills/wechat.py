@@ -21,10 +21,8 @@ from qingagent.core import vision, actions
 #  微信界面固定坐标（归一化 0-1000）
 #  基于实际测试数据，微信窗口布局稳定
 # ============================================================
-# 搜索框位置（左上角 "🔍 搜索"）
+# 搜索框位置（左上角 "🔍 搜索"）—— 已由 Cmd+F 替代，保留备用
 SEARCH_BOX = {"rx": 140, "ry": 45}
-# 搜索结果第一条（搜索框正下方）
-SEARCH_FIRST_RESULT = {"rx": 140, "ry": 160}
 # 聊天输入框（右侧底部）
 CHAT_INPUT_BOX = {"rx": 650, "ry": 850}
 
@@ -127,9 +125,10 @@ class WeChatSkill(BaseSkill):
         self.check_cancel()
         _time.sleep(1.2)
 
-        # 4. 点击第一个搜索结果（还是用归一化坐标，结果列表位置相对稳定）
+        # 4. 用 ↓+Enter 选中第一条搜索结果（不依赖坐标，永远准确）
         self.check_cancel()
-        actions.click_at_normalized(rect, SEARCH_FIRST_RESULT, delay=0.8)
+        actions.press_key("down", delay=0.3)
+        actions.press_key("return", delay=0.8)
 
         # 5. 按 Esc 退出搜索状态（回到正常聊天界面）
         actions.press_key("escape", delay=0.3)

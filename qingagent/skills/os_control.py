@@ -33,6 +33,34 @@ class OSControlSkill(BaseSkill):
             ],
         ))
 
+        self.add_intent(Intent(
+            name="open_app",
+            description="打开、启动或切换到某个指定的应用程序/软件。用户说'打开xx'、'启动xx'、'切换到xx'、'进入xx'时使用，xx 就是应用名称。",
+            required_slots=["app_name"],
+            examples=[
+                "打开微信",
+                "帮我打开备忘录",
+                "启动 Safari",
+                "打开系统设置",
+                "打开晴天Util",
+                "切换到日历",
+                "进入 Xcode",
+                "帮我打开终端",
+            ],
+        ))
+
+        self.add_intent(Intent(
+            name="prepare_file",
+            description="搜寻并准备要发送/上传的文件。如果用户提供的是带有前缀 '/' 的极其明确的长串绝对路径，将直接把该文件压入剪贴板。如果是普通的模糊名字（如'年度报表'），将使用系统底层引擎全文检索。如果未查找到或者查找到多个，任务将触发界面交互。",
+            required_slots=["filename"],
+            optional_slots=["search_dir"],
+            examples=[
+                "帮我把桌面的 某某测试文档 找出来",
+                "发这个绝对路径的文件: /Users/konglingjia/Desktop/A.pdf",
+                "找到下载里的压缩包",
+            ]
+        ))
+
     def activate(self) -> bool:
         """重写激活逻辑，由于是 OS 全局控制，操作平面设定为整块物理主屏幕"""
         import pyautogui
@@ -40,6 +68,35 @@ class OSControlSkill(BaseSkill):
         # 将整个屏幕作为一个巨大的"虚拟窗口"框定
         self._window_rect = (0, 0, screen_w, screen_h)
         return True
+
+    def execute_open_app(self, slots: dict) -> dict:
+        """打开/激活指定应用程序"""
+        app_name = slots.get("app_name", "").strip()
+        if not app_name:
+            return {"success": False, "message": "请告诉我要打开哪个应用", "data": None}
+
+        print(f"🚀 [打开应用] 目标：{app_name}")
+
+        from qingagent.core.window import resolve_app_real_name, activate_app
+
+        # 智能解析应用名（支持中文alias，如"备忘录"→"Notes"、"微信"→"WeChat"）
+        actual_name = resolve_app_real_name(app_name)
+        print(f"  → 解析为系统应用名：{actual_name}")
+
+        try:
+            activate_app(actual_name, resolved=True)
+            time.sleep(1.2)  # 等待系统动画完成
+            return {
+                "success": True,
+                "message": f"✅ 已打开 {app_name}",
+                "data": {"app_name": app_name, "resolved_name": actual_name},
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"打开 {app_name} 失败：{e}",
+                "data": None,
+            }
 
     def execute_custom_screenshot(self, slots: dict) -> dict:
         """执行自定义抠图截屏（长按并拖拽划虚线框）"""
@@ -231,3 +288,84 @@ close access fileRef
         except Exception as e:
             print(f"⚠️ 保存剪贴板图片出错：{e}")
             return None
+
+    def execute_prepare_file(self, slots: dict) -> dict:
+        import subprocess
+        import os
+        
+        filename = slots.get("filename", "")
+        # 支持绝对路径直通！
+        if filename.startswith("/"):
+            if os.path.exists(filename):
+                return self._copy_file_to_clipboard(filename)
+            else:
+                return {"success": False, "message": f"哎呀，这个绝对路径不存在了：{filename}"}
+
+        search_dir = slots.get("search_dir", "")
+        
+        # 语义换算
+        dir_mapping = {
+            "桌面": os.path.expanduser("~/Desktop"),
+            "下载": os.path.expanduser("~/Downloads"),
+            "文档": os.path.expanduser("~/Documents"),
+            "文稿": os.path.expanduser("~/Documents"),
+        }
+        
+        target_dir = ""
+        for key, path in dir_mapping.items():
+            if search_dir and key in search_dir:
+                target_dir = path
+                break
+                
+        cmd = ["mdfind"]
+        if target_dir:
+            cmd.extend(["-onlyin", target_dir])
+        cmd.extend(["-name", filename])
+        
+        print(f"🕵️ 正在用 Spotlight 引擎海底搜罗：{' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        except Exception as e:
+            return {"success": False, "message": f"搜索系统出错：{e}"}
+            
+        lines = [line.strip() for line in result.stdout.split("\n") if line.strip()]
+        
+        # 过滤
+        lines = [lf for lf in lines if "/Library/" not in lf and "/.Trash/" not in lf and "/System/" not in lf and ".app/" not in lf]
+        
+        if len(lines) == 0:
+            return {"success": False, "message": f"未能在全系统扫描范围内找到包含【{filename}】的文件。"}
+        
+        if len(lines) == 1:
+            print(f"🎯 唯一精确命中：{lines[0]}")
+            return self._copy_file_to_clipboard(lines[0])
+            
+        # 批量冲突
+        top_k = lines[:10]
+        items = [{ "name": os.path.basename(p), "path": p } for p in top_k]
+            
+        print(f"⚖️ 命中 {len(lines)} 个相关文件，将触发前端阻击确认名单！")
+        return {
+            "success": False,
+            "message": f"为了防止弄错，我帮您检索到了多个相似的文件，请在下方列表点击选择：",
+            "data": {
+                "type": "file_choice",
+                "items": items
+            }
+        }
+
+    def _copy_file_to_clipboard(self, filepath: str) -> dict:
+        import subprocess
+        script = f'set the clipboard to POSIX file "{filepath}"'
+        try:
+            subprocess.run(["osascript", "-e", script])
+            print(f"📋 幽灵载入：文件 {filepath} 已灌入物理剪贴板！")
+            return {
+                "success": True,
+                "message": f"文件锁具确认，已装填入剪贴板发射舱准备接续动作：{filepath}",
+                "data": {
+                    "file_path": filepath
+                }
+            }
+        except Exception as e:
+            return {"success": False, "message": f"尝试装填到剪贴板失败：{e}"}

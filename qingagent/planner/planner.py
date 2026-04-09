@@ -108,6 +108,14 @@ class Planner:
 - 示例3："截下微信的图，把这个截图发给晴天小米" → 2步：先截图System.custom_screenshot(target=微信)，再微信发图(image_path="${{step1.screenshot_path}}", contact_name=晴天小米)
 - 示例4："截个图然后通过微信告诉她" → 2步：先截图，再 send_message(image_path="${{step1.screenshot_path}}")
 - 【关键判断】：只要指令同时含截图 + 发送两个动作，必须拆分为 2 步；不能把两步合并成 1 步
+- 【Web交互拦截】：如果用户说"发给我"、"让我看看"、"发到这个聊天"、"在这看"、"发给QingAI"，表示只需在当前 Web 界面上查看。**绝对不要去调用微信发送**！只需执行那个获取动作的 1 步即可（例如 1步：用 System 截图），获取完成后会自动显示展示在这里。
+- 示例5："截图微信发给我" / "截图微信让我看看" → 1步，app=System，intent=app_screenshot，slots={{"app_name": "微信"}} （不需要拆分两步！）
+- 示例6："打开微信" → 1步，app=System，intent=open_app，slots={{"app_name": "微信"}}
+- 示例7："帮我启动Safari" → 1步，app=System，intent=open_app，slots={{"app_name": "Safari"}}
+- 示例8："切换到日历" → 1步，app=System，intent=open_app，slots={{"app_name": "日历"}}
+- 【打开应用规则】：用户说"打开xx""启动xx""切换到xx""进入xx"时，必须用 System.open_app，xx 直接作为 app_name 填入
+- 【找文件规则】：如果用户说"发送："或"这是一个绝对路径"并给出了带 '/' 的物理路径，注意！这说明上一步模糊查找结束了，请你**必须回头看上一文的初衷（比如想把文件发给谁）！** 在本次规划中，你**不仅**要安排 `System.prepare_file(filename="该绝对路径")` 步骤，还**必须**紧随其后立刻增加一个步骤 `WeChat.send_message(contact_name="历史中提到的人", message="[粘贴]")` 将文件发出去！绝不能只执行查找而忘了发送！
+- 【审核阻断后继续规则】：如果用户只说了一句短促的 "确认已无误，微信发送"，这说明前面动作已经就绪，绝对不容许重新切应用选人，必须直接调用 `WeChat.confirm_send_action`！
 用户指令："{user_input}"
 
 请返回 JSON 格式（不要包含其他任何内容）：
@@ -369,8 +377,8 @@ class Planner:
                 else:
                     msg = f"[步骤 {step_num}/{total_steps}：{description}] {result['message']}"
                 self.memory.append_history(user_input, f"❌ {msg}")
-                print(f"\n⏱️ ===== 总耗时：{_time.time() - total_start:.1f}s =====")
-                return {"success": False, "message": msg, "data": None}
+                print(f"\\n⏱️ ===== 总耗时：{_time.time() - total_start:.1f}s =====")
+                return {"success": False, "message": msg, "data": result.get("data")}
 
         # ── 全部步骤完成 ──────────────────────────────────────────
         if total_steps == 1:

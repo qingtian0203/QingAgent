@@ -46,6 +46,12 @@ class WeChatSkill(BaseSkill):
             ],
         ))
 
+        
+        self.add_intent(Intent(
+            name="confirm_send_action",
+            description="当需要向微信补充按下回车键以确认发送前文处于待发送状态的消息/文件时使用。当用户说'确认发送'、'发送微信'时使用。",
+            examples=["微信确认发送"]
+        ))
         self.add_intent(Intent(
             name="check_messages",
             description="查看某个联系人或群的最新消息",
@@ -194,7 +200,7 @@ class WeChatSkill(BaseSkill):
                 return {"success": False, "message": "读取本地图片失败", "data": None}
                 
         elif message == "[粘贴]" or "{{clipboard" in message or "剪贴板" in message.lower():
-            # 传统方案兜底（如果没有经过前置的按文件路径传递截图）
+            # 传统方案兜底
             print("📋 未收到强力绝对路径，使用兜底机制调起剪贴板管理器...")
             actions.hotkey("shift", "command", "space")
             _time.sleep(0.6)
@@ -205,12 +211,29 @@ class WeChatSkill(BaseSkill):
         else:
             actions.type_text(message)
             
-        actions.press_key("enter")
+        # [强制拦截机制] 将包含文字、图片或文件的所有发送任务挂起，等待用户点按最终按键
+        print("🛡️ 人工审核挂机：检测到发送操作，已进入阻断安全环...")
+        _time.sleep(0.5)
+        
+        # 存当前全屏底图
+        img_b64 = self.screenshot()
+        
+        confirm_path = None
+        if img_b64:
+            import base64
+            from datetime import datetime
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            confirm_path = f"/tmp/qingagent_confirm_{ts}.png"
+            with open(confirm_path, "wb") as fh:
+                fh.write(base64.b64decode(img_b64))
 
         return {
-            "success": True,
-            "message": f"已给 {contact} 发送消息：{message}",
-            "data": None,
+            "success": False,
+            "message": f"即将发送给 {contact}，请确认无误后点击下方按钮发送：",
+            "data": {
+                "type": "confirm_send",
+                "screenshot_path": confirm_path
+            }
         }
 
     def execute_check_messages(self, slots: dict) -> dict:
@@ -267,3 +290,18 @@ class WeChatSkill(BaseSkill):
             "data": content,
         }
 
+
+    def execute_confirm_send_action(self, slots: dict) -> dict:
+        import time
+        if not self.activate():
+            return {"success": False, "message": "无法打开微信", "data": None}
+        time.sleep(0.5)
+        
+        # 只敲下最后的审判回车
+        from qingagent.core import actions
+        actions.press_key("enter")
+        return {
+            "success": True,
+            "message": "已成功确认并触发发送动作！🎯",
+            "data": None
+        }

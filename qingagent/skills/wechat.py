@@ -105,10 +105,10 @@ class WeChatSkill(BaseSkill):
 
     def _find_contact_by_search(self, contact: str) -> bool:
         """
-        通过搜索框定位联系人（无 AI 调用，纯坐标操作）。
+        通过搜索框定位联系人（无 AI 调用，使用 Cmd+F 快捷键激活搜索）。
 
         流程：
-        1. 点击搜索框
+        1. Cmd+F 激活搜索框（比坐标点击更可靠，不受窗口尺寸影响）
         2. 输入联系人名字
         3. 等待搜索结果
         4. 点击第一个结果
@@ -116,8 +116,8 @@ class WeChatSkill(BaseSkill):
         """
         rect = self._window_rect
 
-        # 1. 点击搜索框
-        actions.click_at_normalized(rect, SEARCH_BOX, delay=0.5)
+        # 1. 用 Cmd+F 激活搜索框（不依赖坐标，窗口任意大小都准）
+        actions.hotkey("command", "f", delay=0.5)
 
         # 2. 先清空搜索框已有内容，再输入联系人名
         actions.hotkey("command", "a", delay=0.1)
@@ -127,7 +127,7 @@ class WeChatSkill(BaseSkill):
         self.check_cancel()
         _time.sleep(1.2)
 
-        # 4. 点击第一个搜索结果
+        # 4. 点击第一个搜索结果（还是用归一化坐标，结果列表位置相对稳定）
         self.check_cancel()
         actions.click_at_normalized(rect, SEARCH_FIRST_RESULT, delay=0.8)
 

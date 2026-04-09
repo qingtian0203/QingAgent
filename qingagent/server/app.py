@@ -894,7 +894,19 @@ def _get_ui_html() -> str:
     function showResult(data) {
         let content = data.message || '执行完成';
         if (data.data) {
-            content += `<div class="msg-data">${data.data}</div>`;
+            // data.data 可能是对象（来自 Python dict），直接插入会显示 [object Object]
+            // 如果有 screenshot_path 就优先用截图路径展示，否则格式化为 JSON
+            const d = data.data;
+            if (typeof d === 'object' && d !== null) {
+                if (d.screenshot_path) {
+                    content += `<div class="msg-data">📁 截图路径：${d.screenshot_path}</div>`;
+                } else {
+                    const pretty = JSON.stringify(d, null, 2);
+                    content += `<div class="msg-data"><pre style="margin:0;font-size:11px;opacity:0.7">${pretty}</pre></div>`;
+                }
+            } else {
+                content += `<div class="msg-data">${d}</div>`;
+            }
         }
         addMsg(content, 'agent', data.success ? 'success' : 'error');
         finish();

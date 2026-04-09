@@ -125,9 +125,8 @@ class WeChatSkill(BaseSkill):
         self.check_cancel()
         _time.sleep(1.2)
 
-        # 4. 用 ↓+Enter 选中第一条搜索结果（不依赖坐标，永远准确）
+        # 4. 直接回车进入第一条搜索结果（微信默认选中第一条）
         self.check_cancel()
-        actions.press_key("down", delay=0.3)
         actions.press_key("return", delay=0.8)
 
         # 5. 按 Esc 退出搜索状态（回到正常聊天界面）

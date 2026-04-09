@@ -58,3 +58,9 @@ DEBUG_SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "..", "debug_scre
 # ============================================================
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 8077
+
+# ============================================================
+#  路径配置
+# ============================================================
+# 项目根目录（config.py 在 qingagent/ 下，根目录要向上一层）
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

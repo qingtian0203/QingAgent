@@ -27,3 +27,13 @@ debug_*.png
 
 # 环境变量
 .env
+
+# 测试脚本（开发调试用，不提交）
+test_*.py
+vision_*.py
+mlx_*.py
+vision_test_results/
+test_ui.html
+
+# 运行时截图（/tmp 下已有，根目录偶发的调试图也忽略）
+*.png

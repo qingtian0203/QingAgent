@@ -3,8 +3,10 @@ from __future__ import annotations
 import time
 import subprocess
 import os
+import pyautogui
 from .base import BaseSkill, Intent
-from qingagent.core import actions, vision, window
+from qingagent.core import vision, window
+from qingagent import config
 
 class MinesweeperSkill(BaseSkill):
     app_name = "Minesweeper"
@@ -27,10 +29,8 @@ class MinesweeperSkill(BaseSkill):
     def execute_play_minesweeper(self, slots: dict) -> dict:
         print("🎮 收到指示，Agent 正在为你部署游戏战场...")
         
-        # 1. 计算游戏页面的绝对路径
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(os.path.dirname(current_dir))
-        game_html_path = os.path.join(project_root, "web", "agent-minesweeper", "index.html")
+        # 1. 计算游戏页面的绝对路径（统一使用 config.PROJECT_ROOT，目录层级变动不受影响）
+        game_html_path = os.path.join(config.PROJECT_ROOT, "web", "agent-minesweeper", "index.html")
         
         if not os.path.exists(game_html_path):
             return {"success": False, "message": f"游戏组件缺失，未找到: {game_html_path}", "data": None}
@@ -65,8 +65,6 @@ class MinesweeperSkill(BaseSkill):
         print(f"🎯 锁定绝对安全起手点！坐标：({x}, {y})")
 
         # 4. 执行物理级破阵打击
-        import pyautogui
-        
         # 模拟真实人类的平滑移位，展现优雅的压迫感
         pyautogui.moveTo(x, y, duration=0.8, tween=pyautogui.easeInOutQuad)
         print("💥 引爆破阵！")
@@ -75,19 +73,17 @@ class MinesweeperSkill(BaseSkill):
         # 为了炫酷，鼠标点完迅速撤走
         pyautogui.moveRel(0, 100, duration=0.2)
         
-        # 截个最终战果图返回给用户（可选，让日志更酷）
+        # 截最终战果图，打印路径到日志（作为 data 可供后续步骤引用）
         time.sleep(0.5)
-        self.screenshot()
+        result_img = self.screenshot()
 
         return {
             "success": True,
             "message": "已为你启动扫雷并精准点亮第一发安全起手靶心！局面目前极度舒适，请享受清台！",
-            "data": {"status": "AI_started"}
+            "data": {"status": "AI_started", "screenshot_path": result_img or ""}
         }
 
     def screenshot(self) -> str | None:
         """从底座获取全屏截图"""
-        import pyautogui
-        from qingagent.core import vision
         screen_w, screen_h = pyautogui.size()
         return vision.capture_screenshot((0, 0, screen_w, screen_h))

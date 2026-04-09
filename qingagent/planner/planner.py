@@ -12,6 +12,7 @@ AI Planner — 意图识别 + 多步骤任务链执行器
 """
 import re
 import json
+import threading
 import requests
 from .. import config
 from ..skills import SkillRegistry
@@ -36,8 +37,17 @@ class Planner:
         self.memory = MemoryManager()
         # 进度回调，由外层（server）注入，用于向 Web UI 推送步骤进度
         self._progress_callback = None
-        # 全局跨轮次上下文：保留上一次对话最后一个步骤的输出，作为下一次的 step0
-        self.global_context = {}
+        # 跨轮次上下文：用 threading.local() 实现线程隔离，防止多用户并发时 step0 数据相互覆盖
+        # 每个执行线程独立持有自己上一次任务的输出，不会被其他线程的并发写入污染
+        self._thread_local = threading.local()
+
+    def _get_global_context(self) -> dict:
+        """获取当前线程的跨轮次上下文（线程安全）"""
+        return getattr(self._thread_local, "global_context", {})
+
+    def _set_global_context(self, ctx: dict):
+        """设置当前线程的跨轮次上下文（线程安全）"""
+        self._thread_local.global_context = ctx
 
     # ──────────────────────────────────────────────────────────────
     #  核心方法 1：AI 解析任务链
@@ -263,8 +273,10 @@ class Planner:
                 print(f"    参数：{s['slots']}")
 
         # ── 步骤 2：逐步执行，并做上下文传递 ──────────────────────
-        # 把上一次执行的最终结果继承为 step0，这样 LLM 在下一轮说“发刚才的图”时注入 ${step0.xxx} 就能平滑过渡
-        context = {"step0": self.global_context} if self.global_context else {}
+        # 继承本线程上一次执行的最终结果为 step0，支持“发刚才的图”等跨轮次指令
+        # _get_global_context() 线程安全，不会读到其他用户的执行结果
+        prev_ctx = self._get_global_context()
+        context = {"step0": prev_ctx} if prev_ctx else {}
         last_result = None
 
         for i, step in enumerate(steps):
@@ -345,7 +357,8 @@ class Planner:
 
             last_result = result
             # 把当前最高执行进度的上下文刷新到全局，留给新对话当 step0 用
-            self.global_context = context[f"step{step_num}"]
+            # 刷新本线程的跨轮次上下文（线程安全，不影响其他并发任务）
+            self._set_global_context(context[f"step{step_num}"])
 
             # 失败则停止整个任务链
             if not result["success"]:

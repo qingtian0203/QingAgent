@@ -75,6 +75,20 @@ class BrowserSkill(BaseSkill):
             ],
         ))
 
+        self.add_intent(Intent(
+            name="capture_full_page",
+            description="对当前浏览器打开的网页进行全页截图（使用 GoFullPage 插件），截图完成后自动下载到本地并关闭截图标签页",
+            required_slots=[],
+            optional_slots=[],
+            examples=[
+                "帮我截取这个网页",
+                "把当前页面截图保存",
+                "全页截图一下",
+                "截图这个网页并下载",
+                "用 GoFullPage 截个图",
+            ],
+        ))
+
     # --- 具体执行流程 ---
 
     def execute_open_url(self, slots: dict) -> dict:
@@ -256,3 +270,51 @@ class BrowserSkill(BaseSkill):
             "message": f"24点游戏完成！共 {rounds} 轮",
             "data": summary,
         }
+
+    def execute_capture_full_page(self, slots: dict) -> dict:
+        """
+        使用 GoFullPage 插件对当前网页进行全页截图。
+
+        流程：
+        1. 激活 Chrome（保持当前 Tab 不变）
+        2. 触发 GoFullPage 快捷键 ⌥⇧P
+        3. 等待截图完成（GoFullPage 自动跳到截图预览 Tab）
+        4. Cmd+S 下载截图到本地
+        5. 等待下载对话框/完成
+        6. Cmd+W 关闭截图 Tab，回到原页面
+        """
+        import time
+
+        # 1. 激活浏览器
+        if not self.activate():
+            return {"success": False, "message": "浏览器未响应，请确保 Chrome 已打开", "data": None}
+
+        time.sleep(0.5)
+
+        # 2. 触发 GoFullPage（默认快捷键：Option+Shift+P）
+        print("📸 触发 GoFullPage 全页截图（⌥⇧P）...")
+        actions.hotkey("option", "shift", "p")
+
+        # 3. 等待 GoFullPage 截图完成并跳到截图预览 Tab
+        #    GoFullPage 截图时间取决于页面长度，等 3s 通常足够
+        self.check_cancel()
+        print("⏳ 等待截图完成...")
+        time.sleep(3.5)
+
+        # 4. Cmd+S 下载截图
+        print("💾 下载截图（Cmd+S）...")
+        actions.hotkey("command", "s")
+        time.sleep(1.5)  # 等待系统保存对话框消失（Chrome 无弹窗直接存 Downloads）
+
+        # 5. Cmd+W 关闭截图 Tab，回到原页面
+        self.check_cancel()
+        print("✅ 关闭截图 Tab...")
+        actions.hotkey("command", "w")
+        time.sleep(0.5)
+
+        return {
+            "success": True,
+            "message": "✅ 全页截图已下载并关闭截图标签页，文件保存在 Downloads 文件夹",
+            "data": None,
+        }
+

@@ -363,13 +363,14 @@ class Planner:
         context = {"step0": prev_ctx} if prev_ctx else {}
         last_result = None
 
-        # 用 while 循环支持 confirm_send 审核通过后动态追加后续步骤
+        # 用 while 循环代替 for，支持 confirm_send 审核通过后动态追加后续步骤
         step_index = 0
         while step_index < len(steps):
             step = steps[step_index]
             step_index += 1
-            step_num = step_index            # 1-based 序号
-            total_steps = len(steps)        # 动态更新（resume 后步骤数会增加）
+            # 优先使用原计划指定的 step 序号作为上下文 key。防止审核 resume 之后从 1 重新计数破坏 ${stepN} 的对应关系
+            step_num = step.get("step", step_index)
+            total_steps = len(steps)      # 动态更新（resume 后步骤数会增加）
             app_name = step.get("app", "")
             intent_name = step.get("intent", "")
             slots = step.get("slots", {})

@@ -52,6 +52,34 @@ class Planner:
         self._thread_local.global_context = ctx
 
     # ──────────────────────────────────────────────────────────────
+    #  工具方法：LLM JSON 自动修复
+    # ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _repair_json(raw: str) -> str:
+        """修复 LLM 输出的常见 JSON 格式错误。"""
+        import re as _re
+        text = raw.replace("```json", "").replace("```", "").strip()
+        start = text.find("{")
+        if start == -1:
+            return text
+        text = text[start:]
+        last_close = text.rfind("}")
+        if last_close == -1:
+            return ""
+        chunk = text[: last_close + 1]
+        # 修复尾部多余的逗号
+        chunk = _re.sub(r",\s*([}\]])", r"\1", chunk)
+        # 补全可能缺失的括号
+        open_s = chunk.count("[") - chunk.count("]")
+        open_b = chunk.count("{") - chunk.count("}")
+        chunk += "]" * max(open_s, 0) + "}" * max(open_b, 0)
+        # 清理控制字符
+        chunk = _re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", chunk)
+        return chunk
+
+
+    # ──────────────────────────────────────────────────────────────
     #  核心方法 1：AI 解析任务链
     # ──────────────────────────────────────────────────────────────
 
@@ -168,15 +196,59 @@ class Planner:
                 res.raise_for_status()
                 text = res.json().get("response", "")
 
-            # 提取 JSON
-            clean = text.replace("```json", "").replace("```", "").strip()
-            start = clean.find("{")
-            end = clean.rfind("}") + 1
-            if start == -1 or end == 0:
-                print(f"⚠️ Planner 返回无法解析：{text[:200]}")
-                return None
+            # ── JSON 修复 + 解析（带一次自动重试）──
+            def _try_parse(raw_text):
+                repaired = self._repair_json(raw_text)
+                if not repaired or "{" not in repaired:
+                    return None
+                try:
+                    return json.loads(repaired)
+                except json.JSONDecodeError as je:
+                    print(f"  ⚠️ JSON 修复后仍解析失败：{je}")
+                    trunc = repaired[: je.pos]
+                    last_close = trunc.rfind("}")
+                    if last_close > 0:
+                        import re as _re2
+                        partial = trunc[:last_close + 1]
+                        open_b = partial.count("{") - partial.count("}")
+                        open_s = partial.count("[") - partial.count("]")
+                        partial = _re2.sub(r",\s*$", "", partial.strip())
+                        partial += "]" * open_s + "}" * open_b
+                        try:
+                            return json.loads(partial)
+                        except Exception:
+                            pass
+                    return None
 
-            result = json.loads(clean[start:end])
+            result = _try_parse(text)
+
+            if result is None:
+                print("🔄 JSON 解析失败，正在自动重试...")
+                fix_prompt = (
+                    f"上一次你的输出不是合法 JSON，请重新只输出合法的 JSON，不要任何解释。\\n"
+                    f"用户指令：\\\"{user_input}\\\"\\n"
+                    '严格按照此格式：{"steps":[{"step":1,"app":"应用","intent":"意图","slots":{},"description":"描述"}]}'
+                )
+                try:
+                    if mode == "openai":
+                        fix_payload = {"model": config.PLANNER_MODEL, "messages": [{"role": "user", "content": fix_prompt}], "stream": False, "max_tokens": 800}
+                        fix_res = requests.post(url, json=fix_payload, headers=headers, timeout=30)
+                        fix_res.raise_for_status()
+                        fix_text = fix_res.json()["choices"][0]["message"]["content"].strip()
+                    else:
+                        fix_payload = {"model": config.PLANNER_MODEL, "prompt": fix_prompt, "stream": False}
+                        fix_res = requests.post(url, json=fix_payload, timeout=30)
+                        fix_res.raise_for_status()
+                        fix_text = fix_res.json().get("response", "")
+                    result = _try_parse(fix_text)
+                    if result:
+                        print("✅ 重试成功，JSON 已修复")
+                except Exception as retry_err:
+                    print(f"❌ 重试请求失败：{retry_err}")
+
+            if result is None:
+                print(f"⚠️ Planner 返回无法解析（已尝试修复+重试）：{text[:300]}")
+                return None
 
             steps = result.get("steps", [])
             if not steps or result.get("error"):

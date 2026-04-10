@@ -51,13 +51,14 @@ class OSControlSkill(BaseSkill):
 
         self.add_intent(Intent(
             name="prepare_file",
-            description="搜寻并准备要发送/上传的文件。如果用户提供的是带有前缀 '/' 的极其明确的长串绝对路径，将直接把该文件压入剪贴板。如果是普通的模糊名字（如'年度报表'），将使用系统底层引擎全文检索。如果未查找到或者查找到多个，任务将触发界面交互。",
+            description="搜寻并准备要发送/上传的文件。如果用户明确指出了文件的所在位置（如 桌面的/下载里的/文稿里的），**必须**将其提取到 search_dir 参数中。如果用户提供的是带有前缀 '/' 的长绝对路径，直接将其作为 filename。如果是普通的模糊名字（如'年度报表'），将使用系统底层引擎全文检索。",
             required_slots=["filename"],
             optional_slots=["search_dir"],
             examples=[
                 "帮我把桌面的 某某测试文档 找出来",
+                "找到下载中的作业",
                 "发这个绝对路径的文件: /Users/konglingjia/Desktop/A.pdf",
-                "找到下载里的压缩包",
+                "搜一下年度报表",
             ]
         ))
 

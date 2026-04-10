@@ -61,6 +61,19 @@ class OSControlSkill(BaseSkill):
             ]
         ))
 
+        # 网页全页截图兜底路由：小模型可能误路由到 System，这里委托给浏览器处理
+        self.add_intent(Intent(
+            name="capture_full_page",
+            description="使用 GoFullPage 对当前浏览器页面进行全页截图并下载，截图后返回文件路径",
+            required_slots=[],
+            optional_slots=[],
+            examples=[
+                "截图当前网页",
+                "全页截图",
+                "把网页截图下载",
+            ],
+        ))
+
     def activate(self) -> bool:
         """重写激活逻辑，由于是 OS 全局控制，操作平面设定为整块物理主屏幕"""
         import pyautogui
@@ -369,3 +382,9 @@ close access fileRef
             }
         except Exception as e:
             return {"success": False, "message": f"尝试装填到剪贴板失败：{e}"}
+
+    def execute_capture_full_page(self, slots: dict) -> dict:
+        """委托给 BrowserSkill 执行网页全页截图（小模型误路由到 System 时的兜底）"""
+        from .browser import BrowserSkill
+        print("🔀 System.capture_full_page → 委托给 BrowserSkill.capture_full_page")
+        return BrowserSkill().execute_capture_full_page(slots)

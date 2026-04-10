@@ -133,7 +133,7 @@ class WeChatSkill(BaseSkill):
 
         # 4. 直接回车进入第一条搜索结果（微信默认选中第一条）
         self.check_cancel()
-        actions.press_key("return", delay=0.8)
+        actions.press_key("return", delay=0.4)  # 等搜索结果选中，0.4s 足够
 
         # 5. 按 Esc 退出搜索状态（回到正常聊天界面）
         actions.press_key("escape", delay=0.3)
@@ -175,7 +175,7 @@ class WeChatSkill(BaseSkill):
 
         # 等聊天窗口完全打开
         self.check_cancel()
-        _time.sleep(0.8)
+        _time.sleep(0.5)  # 等聊天窗口切换动画完成
 
         # 步骤 3：点击输入框（位置固定）
         self.check_cancel()
@@ -194,7 +194,7 @@ class WeChatSkill(BaseSkill):
             if actions.copy_image_to_clipboard(image_path):
                 _time.sleep(0.2)
                 actions.hotkey("command", "v")
-                _time.sleep(0.5)
+                _time.sleep(0.3)  # 粘贴后等图片预览渲染
             else:
                 print("❌ 图片灌入失败，中止发送")
                 return {"success": False, "message": "读取本地图片失败", "data": None}
@@ -295,7 +295,7 @@ class WeChatSkill(BaseSkill):
         import time
         if not self.activate():
             return {"success": False, "message": "无法打开微信", "data": None}
-        time.sleep(0.5)
+        time.sleep(0.3)  # 确认发送前等微信窗口激活稳定
         
         # 只敲下最后的审判回车
         from qingagent.core import actions

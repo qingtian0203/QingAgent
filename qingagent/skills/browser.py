@@ -92,16 +92,55 @@ class BrowserSkill(BaseSkill):
     # --- 具体执行流程 ---
 
     def execute_open_url(self, slots: dict) -> dict:
-        """通过 AppleScript 或 shell 打开 URL"""
+        """通过 shell open 打开 URL，并等待页面加载完成再返回"""
+        import time
+        import subprocess
+
         url = slots["url"]
         # 确保有协议前缀
         if not url.startswith(("http://", "https://")):
             url = f"https://{url}"
 
-        os.system(f'open "{url}"')
+        os.system(f'open -a "Google Chrome" "{url}"')
 
-        import time
-        time.sleep(2)
+        # 轮询等待 Chrome 当前 Tab 加载完成（loading = false）
+        # 比固定 sleep 更准确：快速页面不用等，慢速页面足够等
+        print(f"🌐 打开中：{url}")
+        wait_script = '''
+        tell application "Google Chrome"
+            if (count of windows) > 0 then
+                if loading of active tab of front window then
+                    return "loading"
+                else
+                    return "done"
+                end if
+            end if
+        end tell
+        return "no_window"
+        '''
+        poll_interval = 0.5
+        max_wait = 30  # 最多等 30s
+
+        # 先等 1s 让 Chrome 有时间开始加载 URL（避免检测到上一个页面的状态）
+        time.sleep(1.0)
+
+        for _ in range(int(max_wait / poll_interval)):
+            try:
+                result = subprocess.run(
+                    ["osascript", "-e", wait_script],
+                    capture_output=True, text=True, timeout=3,
+                )
+                status = result.stdout.strip()
+                if status == "done":
+                    print("✅ 页面加载完成")
+                    break
+                elif status == "no_window":
+                    print("⚠️ Chrome 窗口未找到，继续等待...")
+            except subprocess.TimeoutExpired:
+                pass
+            time.sleep(poll_interval)
+        else:
+            print("⚠️ 等待超时（30s），页面可能未完全加载")
 
         if not self.activate():
             return {"success": False, "message": "浏览器未响应", "data": None}
@@ -278,12 +317,12 @@ class BrowserSkill(BaseSkill):
         流程：
         1. 激活 Chrome（保持当前 Tab 不变）
         2. 触发 GoFullPage 快捷键 ⌥⇧P
-        3. 等待截图完成（GoFullPage 自动跳到截图预览 Tab）
-        4. Cmd+S 下载截图到本地
-        5. 等待下载对话框/完成
-        6. Cmd+W 关闭截图 Tab，回到原页面
+        3. AppleScript 轮询等待截图 Tab 出现（比固定 sleep 更快更可靠）
+        4. Cmd+S 下载截图到本地（Chrome 直接存 Downloads，无弹窗）
+        5. Cmd+W 关闭截图 Tab，回到原页面
         """
         import time
+        import subprocess
 
         # 1. 激活浏览器
         if not self.activate():
@@ -295,26 +334,97 @@ class BrowserSkill(BaseSkill):
         print("📸 触发 GoFullPage 全页截图（⌥⇧P）...")
         actions.hotkey("option", "shift", "p")
 
-        # 3. 等待 GoFullPage 截图完成并跳到截图预览 Tab
-        #    GoFullPage 截图时间取决于页面长度，等 3s 通常足够
+        # 3. 轮询等待截图 Tab 出现
+        #    GoFullPage 截图完成后会自动打开新 Tab，URL 包含扩展 ID
         self.check_cancel()
-        print("⏳ 等待截图完成...")
-        time.sleep(3.5)
+        print("⏳ 等待 GoFullPage 截图完成...")
 
-        # 4. Cmd+S 下载截图
-        print("💾 下载截图（Cmd+S）...")
-        actions.hotkey("command", "s")
-        time.sleep(1.5)  # 等待系统保存对话框消失（Chrome 无弹窗直接存 Downloads）
+        gofullpage_tab_found = False
+        poll_interval = 0.5    # 每 0.5s 检测一次
+        max_wait = 20          # 最多等 20s
 
-        # 5. Cmd+W 关闭截图 Tab，回到原页面
+        detect_script = '''
+        tell application "Google Chrome"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    set u to URL of t
+                    if u contains "GoFullPage" or u contains "fdpohaocaechifi" then
+                        return "found"
+                    end if
+                end repeat
+            end repeat
+        end tell
+        return "not_found"
+        '''
+
+        for _ in range(int(max_wait / poll_interval)):
+            self.check_cancel()
+            try:
+                result = subprocess.run(
+                    ["osascript", "-e", detect_script],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if "found" in result.stdout.lower():
+                    gofullpage_tab_found = True
+                    print("✅ 截图 Tab 已出现")
+                    break
+            except subprocess.TimeoutExpired:
+                pass
+            time.sleep(poll_interval)
+
+        if not gofullpage_tab_found:
+            return {
+                "success": False,
+                "message": "⚠️ 等待超时（20s），GoFullPage 截图 Tab 未出现。请检查快捷键 ⌥⇧P 是否已正确设置",
+                "data": None,
+            }
+
+        # 稍等 0.3s 让截图 Tab 完全加载好再操作
+        time.sleep(0.3)
+
+        # 4. Cmd+S 下载截图 — 先记录 Downloads 快照，下载完后对比找新文件
+        import glob
+        import os as _os
+
+        downloads_dir = _os.path.expanduser("~/Downloads")
+        # 快照：下载前所有 PNG/JPG 文件的路径集合
+        def _snap():
+            return set(
+                glob.glob(_os.path.join(downloads_dir, "*.png")) +
+                glob.glob(_os.path.join(downloads_dir, "*.jpg")) +
+                glob.glob(_os.path.join(downloads_dir, "*.jpeg"))
+            )
+
+        before_snap = _snap()
+
+        # 5. 等新文件出现（GoFullPage 打开预览 Tab 时已自动下载，无需 Cmd+S）
+        #    Cmd+S 在 GoFullPage 页面触发的是「保存网页」对话框，不是保存图片
+        new_file = None
+        for _ in range(30):          # 每 0.5s 检测一次，共 15s
+            time.sleep(0.5)
+            after_snap = _snap()
+            diff = after_snap - before_snap
+            if diff:
+                new_file = max(diff, key=_os.path.getctime)
+                print(f"📁 找到新截图文件：{new_file}")
+                break
+
+        if not new_file:
+            print("⚠️ 未找到新下载文件，使用 Downloads 最新 PNG 兜底")
+            all_pngs = glob.glob(_os.path.join(downloads_dir, "*.png"))
+            if all_pngs:
+                new_file = max(all_pngs, key=_os.path.getctime)
+
+        # 6. Cmd+W 关闭截图 Tab，回到原页面
         self.check_cancel()
-        print("✅ 关闭截图 Tab...")
+        print("🗑️ 关闭截图 Tab...")
         actions.hotkey("command", "w")
-        time.sleep(0.5)
+        time.sleep(0.4)
 
+        msg = f"✅ 全页截图已下载：{new_file}" if new_file else "✅ 截图已下载（文件路径未知）"
         return {
             "success": True,
-            "message": "✅ 全页截图已下载并关闭截图标签页，文件保存在 Downloads 文件夹",
-            "data": None,
+            "message": msg,
+            "data": {"screenshot_path": new_file} if new_file else None,
         }
 

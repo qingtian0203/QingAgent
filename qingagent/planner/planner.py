@@ -52,30 +52,6 @@ class Planner:
         self._thread_local.global_context = ctx
 
     # ──────────────────────────────────────────────────────────────
-    #  工具方法：LLM JSON 自动修复
-    # ──────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _repair_json(raw: str) -> str:
-        """修复 LLM 输出的常见 JSON 格式错误。"""
-        import re as _re
-        text = raw.replace("```json", "").replace("```", "").strip()
-        start = text.find("{")
-        if start == -1:
-            return text
-        text = text[start:]
-        last_close = text.rfind("}")
-        if last_close == -1:
-            return ""
-        chunk = text[: last_close + 1]
-        chunk = _re.sub(r",\s*([}\]])", r"\1", chunk)
-        open_s = chunk.count("[") - chunk.count("]")
-        open_b = chunk.count("{") - chunk.count("}")
-        chunk += "]" * max(open_s, 0) + "}" * max(open_b, 0)
-        chunk = _re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", chunk)
-        return chunk
-
-    # ──────────────────────────────────────────────────────────────
     #  核心方法 1：AI 解析任务链
     # ──────────────────────────────────────────────────────────────
 
@@ -192,59 +168,15 @@ class Planner:
                 res.raise_for_status()
                 text = res.json().get("response", "")
 
-            # ── JSON 修复 + 解析（带一次自动重试）──
-            def _try_parse(raw_text):
-                repaired = self._repair_json(raw_text)
-                if not repaired or "{" not in repaired:
-                    return None
-                try:
-                    return json.loads(repaired)
-                except json.JSONDecodeError as je:
-                    print(f"  ⚠️ JSON 修复后仍解析失败：{je}")
-                    trunc = repaired[: je.pos]
-                    last_close = trunc.rfind("}")
-                    if last_close > 0:
-                        import re as _re2
-                        partial = trunc[:last_close + 1]
-                        open_b = partial.count("{") - partial.count("}")
-                        open_s = partial.count("[") - partial.count("]")
-                        partial = _re2.sub(r",\s*$", "", partial.strip())
-                        partial += "]" * open_s + "}" * open_b
-                        try:
-                            return json.loads(partial)
-                        except Exception:
-                            pass
-                    return None
-
-            result = _try_parse(text)
-
-            if result is None:
-                print("🔄 JSON 解析失败，正在自动重试...")
-                fix_prompt = (
-                    f"上一次你的输出不是合法 JSON，请重新只输出合法的 JSON，不要任何解释。\n"
-                    f"用户指令：\"{user_input}\"\n"
-                    '严格按照此格式：{"steps":[{"step":1,"app":"应用","intent":"意图","slots":{},"description":"描述"}]}'
-                )
-                try:
-                    if mode == "openai":
-                        fix_payload = {"model": config.PLANNER_MODEL, "messages": [{"role": "user", "content": fix_prompt}], "stream": False, "max_tokens": 800}
-                        fix_res = requests.post(url, json=fix_payload, headers=headers, timeout=30)
-                        fix_res.raise_for_status()
-                        fix_text = fix_res.json()["choices"][0]["message"]["content"].strip()
-                    else:
-                        fix_payload = {"model": config.PLANNER_MODEL, "prompt": fix_prompt, "stream": False}
-                        fix_res = requests.post(url, json=fix_payload, timeout=30)
-                        fix_res.raise_for_status()
-                        fix_text = fix_res.json().get("response", "")
-                    result = _try_parse(fix_text)
-                    if result:
-                        print("✅ 重试成功，JSON 已修复")
-                except Exception as retry_err:
-                    print(f"❌ 重试请求失败：{retry_err}")
-
-            if result is None:
-                print(f"⚠️ Planner 返回无法解析（已尝试修复+重试）：{text[:300]}")
+            # 提取 JSON
+            clean = text.replace("```json", "").replace("```", "").strip()
+            start = clean.find("{")
+            end = clean.rfind("}") + 1
+            if start == -1 or end == 0:
+                print(f"⚠️ Planner 返回无法解析：{text[:200]}")
                 return None
+
+            result = json.loads(clean[start:end])
 
             steps = result.get("steps", [])
             if not steps or result.get("error"):
@@ -364,9 +296,8 @@ class Planner:
         while step_index < len(steps):
             step = steps[step_index]
             step_index += 1
-            step_num = step_index
-            total_steps = len(steps)
-
+            step_num = step_index            # 1-based 序号
+            total_steps = len(steps)        # 动态更新（resume 后步骤数会增加）
             app_name = step.get("app", "")
             intent_name = step.get("intent", "")
             slots = step.get("slots", {})
@@ -375,22 +306,26 @@ class Planner:
             print(f"\n{'─'*40}")
             print(f"🔢 步骤 {step_num}/{total_steps}：{description}")
 
+            # 通知外层（server）当前进度，用于推送给 Web UI
             if self._progress_callback:
                 try:
                     self._progress_callback(step_num, total_steps, description)
                 except Exception:
                     pass
 
+            # 占位符替换（把前面步骤的输出注入当前步骤的参数）
             if context:
                 slots = self._resolve_placeholders(slots, context)
                 print(f"  解析后参数：{slots}")
 
+            # 中断检查（执行前）
             if cancel_check and cancel_check():
                 msg = f"步骤 {step_num}/{total_steps} 前被用户取消"
                 print(f"🛑 {msg}")
                 self.memory.append_history(user_input, f"🛑 {msg}")
                 return {"success": False, "message": msg, "data": None}
 
+            # 查找对应 Skill
             skill = self.registry.get_skill_by_name(app_name)
             if not skill:
                 result_tuple = self.registry.find_skill_for_intent(intent_name)
@@ -402,12 +337,14 @@ class Planner:
                     print(f"\n⏱️ ===== 总耗时：{_time.time() - total_start:.1f}s =====")
                     return {"success": False, "message": msg, "data": None}
 
+            # 执行前最后一次中断检查（高危操作保护）
             if cancel_check and cancel_check():
                 msg = f"步骤 {step_num}/{total_steps} 已在「{skill.app_name}」执行前被拦截"
                 print(f"🛑 [拦截] {msg}")
                 self.memory.append_history(user_input, f"🛑 {msg}")
                 return {"success": False, "message": msg, "data": None}
 
+            # ── 执行 ──
             print(f"🚀 执行：{skill.app_name}.{intent_name}")
             t0 = _time.time()
             try:
@@ -421,6 +358,7 @@ class Planner:
 
             print(f"⏱️ [步骤 {step_num} 耗时] {_time.time() - t0:.1f}s")
 
+            # 提前计算，供 status_icon 和失败处理共用
             _is_confirm = (
                 isinstance(result.get("data"), dict)
                 and result["data"].get("type") == "confirm_send"
@@ -430,6 +368,7 @@ class Planner:
             if result.get("data"):
                 print(f"  📦 步骤输出：{result['data']}")
 
+            # 把步骤输出存入上下文供后续引用
             step_data = result.get("data")
             if isinstance(step_data, dict):
                 context[f"step{step_num}"] = step_data
@@ -439,6 +378,7 @@ class Planner:
                 context[f"step{step_num}"] = {}
 
             last_result = result
+            # 刷新本线程的跨轮次上下文（线程安全，不影响其他并发任务）
             self._set_global_context(context[f"step{step_num}"])
 
             # ── 失败处理：区分「审核暂停」和「真正失败」──

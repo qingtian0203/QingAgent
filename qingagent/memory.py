@@ -17,7 +17,7 @@ MemoryManager — QingAgent 记忆管理器
 import json
 import os
 from collections import deque
-from typing import Tuple
+from typing import Tuple, Optional
 
 # memory.json 相对于本文件的路径
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -32,8 +32,9 @@ class MemoryManager:
 
     def __init__(self, max_history: int = MAX_HISTORY):
         self.max_history = max_history
-        # 滑动窗口：每条格式为 (user_input, result_message)
-        self._history: deque[Tuple[str, str]] = deque(maxlen=max_history)
+        # 滑动窗口：每条格式为 (user_input, result_message, data_dict)
+        # data_dict 保存该轮最后一步的产物（如 screenshot_path、file_path 等）
+        self._history: deque[Tuple[str, str, dict]] = deque(maxlen=max_history)
         # 静态记忆（从 memory.json 加载）
         self._static: dict = {}
         self._load_static()
@@ -62,15 +63,16 @@ class MemoryManager:
     # 对话历史管理
     # ------------------------------------------------------------------ #
 
-    def append_history(self, user_input: str, result_message: str):
+    def append_history(self, user_input: str, result_message: str, data: Optional[dict] = None):
         """
         记录一条对话到滑动窗口。
 
         参数:
             user_input: 用户原始指令
             result_message: 执行结果描述（如 "✅ 已发送消息给丸子"）
+            data: 可选，该轮最后一步的产物字典（如 {"screenshot_path": "/tmp/abc.png"}）
         """
-        self._history.append((user_input, result_message))
+        self._history.append((user_input, result_message, data or {}))
 
     def clear_history(self):
         """清空对话历史（不影响静态记忆）。"""
@@ -154,11 +156,39 @@ class MemoryManager:
             lines.append("- 重要：解析联系人时，必须将口语称呼替换为实际备注名！")
             parts.append("\n".join(lines))
 
-        # 4. 最近对话历史（滑动窗口）
+        # 4. 最近对话历史（滑动窗口，含产物路径）
         if self._history:
-            lines = [f"【最近对话记录（最近 {self.max_history} 条）】"]
-            for user_input, result in self._history:
-                lines.append(f"- 用户：{user_input}  →  {result}")
+            lines = [
+                f"【最近对话记录（最近 {self.max_history} 条，含产物路径）】",
+                "- 如果用户提到'上次的截图'/'前面的图'/'刚才的文件'，请直接使用对应历史条目的产物路径！",
+            ]
+            history_list = list(self._history)  # 转为列表以获取索引
+            for idx, entry in enumerate(history_list):
+                # 兼容旧格式（两元组）和新格式（三元组）
+                if len(entry) == 3:
+                    user_input, result, data = entry
+                else:
+                    user_input, result = entry
+                    data = {}
+
+                # 用从旧到新的编号，最新的是 history1，依此类推
+                history_label = f"history{len(history_list) - idx}"
+                line = f"- [{history_label}] 用户：{user_input}  →  {result}"
+                lines.append(line)
+
+                # 把关键产物路径单独列出，方便 Planner 识别和引用
+                if data:
+                    artifact_parts = []
+                    if data.get("screenshot_path"):
+                        artifact_parts.append(f"截图路径={data['screenshot_path']}")
+                    if data.get("file_path"):
+                        artifact_parts.append(f"文件路径={data['file_path']}")
+                    if data.get("value") and isinstance(data["value"], str) and data["value"].startswith("/"):
+                        # value 是路径时也展示
+                        artifact_parts.append(f"路径={data['value']}")
+                    if artifact_parts:
+                        lines.append(f"  └─ 产物：{', '.join(artifact_parts)}")
+
             parts.append("\n".join(lines))
 
         return "\n\n".join(parts)

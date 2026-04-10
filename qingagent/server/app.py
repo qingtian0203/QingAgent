@@ -723,6 +723,7 @@ def _get_ui_html() -> str:
         <div class="quick-chip" onclick="quickSend('看看今天有什么任务')">📅 查日历</div>
         <div class="quick-chip" onclick="quickSend('打开晴天Util拉取更新并重启')">🔄 拉取更新</div>
         <div class="quick-chip" onclick="quickSend('打开百度')">🌐 浏览器</div>
+        <div class="quick-chip" onclick="hardReload()" title="清除缓存并强制刷新页面">🔃 强刷</div>
     </div>
 
     <div class="chat-area" id="chatArea">
@@ -889,6 +890,23 @@ def _get_ui_html() -> str:
             saveHistory();
         }
         return row;
+    }
+
+    // 清缓存强制刷新——解决浏览器缓存旧版 JS/CSS 的问题
+    async function hardReload() {
+        const btn = event.currentTarget;
+        btn.style.opacity = '0.4';
+        btn.style.pointerEvents = 'none';
+        btn.textContent = '⏳ 刷新中...';
+        // 清除所有 Service Worker 缓存
+        if ('caches' in window) {
+            const keys = await caches.keys();
+            await Promise.all(keys.map(k => caches.delete(k)));
+        }
+        // 强制绕过 HTTP 缓存重新加载
+        const url = new URL(location.href);
+        url.searchParams.set('_t', Date.now());
+        location.replace(url.toString());
     }
 
     function quickSend(text) {

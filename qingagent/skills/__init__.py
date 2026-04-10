@@ -11,6 +11,7 @@ from .antigravity import AntigravitySkill
 from .qingtian_util import QingTianUtilSkill
 from .os_control import OSControlSkill
 from .minesweeper import MinesweeperSkill
+from .web_ui import WebUISkill
 from .base import BaseSkill
 
 
@@ -42,6 +43,7 @@ class SkillRegistry:
         self.register(QingTianUtilSkill())
         self.register(OSControlSkill())
         self.register(MinesweeperSkill())
+        self.register(WebUISkill())
 
     def get_all_skills(self) -> dict[str, BaseSkill]:
         return self._skills

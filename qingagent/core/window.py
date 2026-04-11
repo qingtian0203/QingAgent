@@ -138,12 +138,14 @@ def activate_app(app_name: str, resolved: bool = False) -> bool:
     # open -a：等同于双击 Dock 图标，是最可靠的弹出主窗口方式
     ret_open = subprocess.run(["open", "-a", real_app_name], capture_output=True).returncode
 
-    # osascript activate：切到前台（有时候 open -a 只是启动，但不置最上层）
-    os.system(f'osascript -e \'tell application "{real_app_name}" to activate\' 2>/dev/null')
+    # osascript activate：切到前台。加上 & 放入后台执行，绝不让缓慢的 AppleEvent 事件阻断 Python 的主线程并发帧率！
+    import os as _os
+    _os.system(f'osascript -e \'tell application "{real_app_name}" to activate\' >/dev/null 2>&1 &')
 
     if ret_open == 0:
         print(f"✅ 已激活应用：{real_app_name}" + (f" (原名:{app_name})" if real_app_name != app_name else ""))
-        time.sleep(config.APP_SWITCH_DELAY)
+        # 抛弃保守的 1.5s 全局硬中断，只给予极小时间的 CPU 缓冲
+        time.sleep(0.1)
         return True
     else:
         print(f"⚠️ 激活 {real_app_name} 失败，尝试继续...")

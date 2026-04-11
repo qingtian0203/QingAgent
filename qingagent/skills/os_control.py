@@ -238,23 +238,23 @@ class OSControlSkill(BaseSkill):
             "ry": int(norm_y * 1000)
         }
         
-        # 将光标挪过去
-        actions.move_to(target_rect, center_pt)
-        time.sleep(0.1) # 降低到 0.1s
+        # 将光标极速瞬移过去（穿透默认 duration=0.5s 的束缚）
+        actions.move_to(target_rect, center_pt, duration=0.05)
+        time.sleep(0.1) 
         
         # 触发截图结界 (Ctrl+Cmd+A)...
-        actions.hotkey("ctrl", "command", "a")
-        time.sleep(0.4) # 唤醒截图遮罩，高配 0.4s 足矣
+        actions.hotkey("ctrl", "command", "a", delay=0.1)
+        time.sleep(0.4) # 必须给系统截图遮罩一个展开变黑的时间
         
-        # 单击边缘吸附
-        actions.click_at_normalized(target_rect, center_pt)
-        time.sleep(0.15) 
+        # 单击边缘吸附（强制覆盖 actions 库中默认的 0.6s ACTION_DELAY 死亡停顿）
+        actions.click_at_normalized(target_rect, center_pt, delay=0.05)
+        time.sleep(0.05) 
         
         # 收网：双击+回车
-        actions.double_click_at_normalized(target_rect, center_pt)
-        time.sleep(0.1)
-        actions.press_key("enter")
-        time.sleep(0.15) # 回车存入剪贴板后的微弱等待
+        actions.double_click_at_normalized(target_rect, center_pt, delay=0.05)
+        time.sleep(0.05)
+        actions.press_key("enter", delay=0.05)
+        time.sleep(0.1) 
         print(f"⏱️ [探针] 键盘鼠标截屏六连击耗时: {_time.time() - t0:.2f}s")
 
         t0 = _time.time()

@@ -224,11 +224,14 @@ class OSControlSkill(BaseSkill):
         print(f"✅ 秒定重心绝对坐标：({abs_cx:.1f}, {abs_cy:.1f})")
         
         # 3. 开始表演：利用截图软件的边缘计算白嫖法！
-        # 兼容动作库的 Normalized 相对坐标系
+        # 兼容动作库的 Normalized 相对坐标系（0-1000千分比字典格式）
         target_rect = getattr(self, '_last_screenshot_rect', self._window_rect)
         norm_x = (abs_cx - target_rect[0]) / target_rect[2]
         norm_y = (abs_cy - target_rect[1]) / target_rect[3]
-        center_pt = (norm_x, norm_y)
+        center_pt = {
+            "rx": int(norm_x * 1000),
+            "ry": int(norm_y * 1000)
+        }
         
         # 先把鼠标幽灵般地挪过去，轻轻盖在目标头上
         print(f"🖱️ 将光标悬停在 {app_name} 的视窗重心...")

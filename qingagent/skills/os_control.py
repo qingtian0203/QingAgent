@@ -211,19 +211,24 @@ class OSControlSkill(BaseSkill):
         # 等待系统的动画展开：如果本身就是没开着的，多给点时间
         time.sleep(1.5)
             
-        # 2. 洗牌后的整个电脑屏幕合影，找寻主目标！
-        print(f"📷 正在启动天眼全景透视，寻找 {app_name} 落在视野内的重心...")
-        baseline_img = self.screenshot()
-        if not baseline_img: # 严格阻断
-            return {"success": False, "message": "底座截图模块崩溃，未能获取屏幕像素"}
-            
-        center_pt = vision.find_element_with_retry(baseline_img, f"最前方的主窗口、具有 {app_name} 界面特征的应用主结构")
+        # 2. 从系统底层物理接口瞬间提取窗口真实几何尺寸（抛弃缓慢耗时的全屏视觉大模型扫描！）
+        print(f"📷 正在通过本地 Quartz API 瞬发检索 {actual_mac_app_name} 窗口物理边界...")
+        win = window.find_window([actual_mac_app_name, app_name])
+        if not win:
+            return {"success": False, "message": f"系统底层未找到 {app_name} 对应的窗口句柄，可能已被隐藏或最小化", "data": app_name}
         
-        if not center_pt:
-            return {"success": False, "message": f"视觉引擎已扫描三遍，桌面似乎未被 {app_name} 占据", "data": app_name}
-            
+        # 计算该应用窗口在屏幕上的绝对中心坐标
+        win_rect = win["rect"]  # (x, y, w, h)
+        abs_cx = win_rect[0] + win_rect[2] / 2
+        abs_cy = win_rect[1] + win_rect[3] / 2
+        print(f"✅ 秒定重心绝对坐标：({abs_cx:.1f}, {abs_cy:.1f})")
+        
         # 3. 开始表演：利用截图软件的边缘计算白嫖法！
+        # 兼容动作库的 Normalized 相对坐标系
         target_rect = getattr(self, '_last_screenshot_rect', self._window_rect)
+        norm_x = (abs_cx - target_rect[0]) / target_rect[2]
+        norm_y = (abs_cy - target_rect[1]) / target_rect[3]
+        center_pt = (norm_x, norm_y)
         
         # 先把鼠标幽灵般地挪过去，轻轻盖在目标头上
         print(f"🖱️ 将光标悬停在 {app_name} 的视窗重心...")

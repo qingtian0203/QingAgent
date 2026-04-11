@@ -118,7 +118,7 @@ class BrowserSkill(BaseSkill):
         end tell
         return "no_window"
         '''
-        poll_interval = 0.5
+        poll_interval = 0.2
         max_wait = 30  # 最多等 30s
 
         # 先等 1s 让 Chrome 有时间开始加载 URL（避免检测到上一个页面的状态）
@@ -340,7 +340,7 @@ class BrowserSkill(BaseSkill):
         print("⏳ 等待 GoFullPage 截图完成...")
 
         gofullpage_tab_found = False
-        poll_interval = 0.5    # 每 0.5s 检测一次
+        poll_interval = 0.2    # 每 0.2s 检测一次
         max_wait = 20          # 最多等 20s
 
         detect_script = '''
@@ -400,8 +400,8 @@ class BrowserSkill(BaseSkill):
         # 5. 等新文件出现（GoFullPage 打开预览 Tab 时已自动下载，无需 Cmd+S）
         #    Cmd+S 在 GoFullPage 页面触发的是「保存网页」对话框，不是保存图片
         new_file = None
-        for _ in range(30):          # 每 0.5s 检测一次，共 15s
-            time.sleep(0.5)
+        for _ in range(75):          # 每 0.2s 检测一次，共 15s
+            time.sleep(0.2)
             after_snap = _snap()
             diff = after_snap - before_snap
             if diff:

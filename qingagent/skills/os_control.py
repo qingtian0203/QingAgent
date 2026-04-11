@@ -199,19 +199,24 @@ class OSControlSkill(BaseSkill):
         
         from qingagent.core.window import resolve_app_real_name
         
-        # 1. 动态智能解析，彻底丢弃死板的中英文映射表！
-        # 输入 "备忘录" -> 秒级返回 "Notes"
+        import time as _time
+        t_start = _time.time()
+        # 1. 动态智能解析
         actual_mac_app_name = resolve_app_real_name(app_name)
+        print(f"⏱️ [探针] resolve_app_real_name 耗时: {_time.time() - t_start:.2f}s")
         
-        # 2. 直接越过系统权限，强行把后台乃至关闭窗口的 APP 弹跳唤醒到最上层！
+        t0 = _time.time()
+        # 2. 召唤 APP 
         from qingagent.core import window
         print(f"🪄 使用 QingAgent 统一的 window.activate_app 召唤 {actual_mac_app_name} 到台前...")
         window.activate_app(actual_mac_app_name, resolved=True)
         
-        # 等待系统的动画展开：如果本身就是没开着的，多给点时间
-        time.sleep(1.5)
+        # 极致压缩系统前台弹跳休眠：高配机器完全无需 1.5s，0.3s 足矣
+        time.sleep(0.3)
+        print(f"⏱️ [探针] activate_app 及动画休眠耗时: {_time.time() - t0:.2f}s")
             
-        # 2. 从系统底层物理接口瞬间提取窗口真实几何尺寸（抛弃缓慢耗时的全屏视觉大模型扫描！）
+        # 2. 提取物理边界
+        t0 = _time.time()
         print(f"📷 正在通过本地 Quartz API 瞬发检索 {actual_mac_app_name} 窗口物理边界...")
         win = window.find_window([actual_mac_app_name, app_name])
         if not win:
@@ -221,10 +226,10 @@ class OSControlSkill(BaseSkill):
         win_rect = win["rect"]  # (x, y, w, h)
         abs_cx = win_rect[0] + win_rect[2] / 2
         abs_cy = win_rect[1] + win_rect[3] / 2
-        print(f"✅ 秒定重心绝对坐标：({abs_cx:.1f}, {abs_cy:.1f})")
+        print(f"⏱️ [探针] Quartz 搜寻窗口坐标耗时: {_time.time() - t0:.2f}s")
         
-        # 3. 开始表演：利用截图软件的边缘计算白嫖法！
-        # 兼容动作库的 Normalized 相对坐标系（0-1000千分比字典格式）
+        # 3. 开始边缘计算
+        t0 = _time.time()
         target_rect = getattr(self, '_last_screenshot_rect', self._window_rect)
         norm_x = (abs_cx - target_rect[0]) / target_rect[2]
         norm_y = (abs_cy - target_rect[1]) / target_rect[3]
@@ -233,30 +238,30 @@ class OSControlSkill(BaseSkill):
             "ry": int(norm_y * 1000)
         }
         
-        # 先把鼠标幽灵般地挪过去，轻轻盖在目标头上
-        print(f"🖱️ 将光标悬停在 {app_name} 的视窗重心...")
+        # 将光标挪过去
         actions.move_to(target_rect, center_pt)
-        time.sleep(0.3)
+        time.sleep(0.1) # 降低到 0.1s
         
-        # 打开系统黑魔法（触发截图工具）
-        print("⌨️ 触发截图结界 (Ctrl+Cmd+A)...")
+        # 触发截图结界 (Ctrl+Cmd+A)...
         actions.hotkey("ctrl", "command", "a")
-        time.sleep(0.8) # 注意：这一步截图边框正在做 OS 层面的边框查找，必等
+        time.sleep(0.4) # 唤醒截图遮罩，高配 0.4s 足矣
         
-        # 单击降维打击（此时截图软件会自动因为鼠标位置吸附该应用周围一圈的边框）
-        print("🖱️ 窗体已变黑变暗，执行原点单击（吸附并套牢边框）...")
+        # 单击边缘吸附
         actions.click_at_normalized(target_rect, center_pt)
-        time.sleep(0.3)
+        time.sleep(0.15) 
         
-        # 收网
-        print("🖱️ 收网！中心双击并回车确认...")
+        # 收网：双击+回车
         actions.double_click_at_normalized(target_rect, center_pt)
-        time.sleep(0.3)
+        time.sleep(0.1)
         actions.press_key("enter")
-        time.sleep(0.5)
+        time.sleep(0.15) # 回车存入剪贴板后的微弱等待
+        print(f"⏱️ [探针] 键盘鼠标截屏六连击耗时: {_time.time() - t0:.2f}s")
 
-        # 把剪贴板图片保存到磁盘，供后续步骤 ${stepN.screenshot_path} 引用
+        t0 = _time.time()
+        # 把剪贴板图片保存到磁盘
         screenshot_path = self._save_clipboard_image()
+        print(f"⏱️ [探针] _save_clipboard_image 存盘耗时: {_time.time() - t0:.2f}s")
+        print(f"🔥 [探针] System.app_screenshot 方法栈内总计真耗时: {_time.time() - t_start:.2f}s")
         return {
             "success": True,
             "message": f"行云流水！已对 {app_name} 触发独立窗口吸附截取",

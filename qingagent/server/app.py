@@ -117,6 +117,7 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                         "status": "queued",
                         "result": None,
                         "command": command,
+                        "mode": data.get("mode", "safe"),
                         "queue_pos": queue_pos,  # 前方有多少个任务在等
                     }
 
@@ -174,6 +175,10 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
         # 标记为 running，清空排队位置信息
         _tasks[task_id]["status"] = "running"
         _tasks[task_id].pop("queue_pos", None)
+        
+        # 将本次任务的模式打入全局环境变量供底层技能感知
+        import os
+        os.environ["QINGAGENT_MODE"] = _tasks[task_id].get("mode", "safe")
 
         try:
             cancel_check = lambda: _tasks.get(task_id, {}).get("status") == "cancelled"
@@ -701,6 +706,62 @@ def _get_ui_html() -> str:
             background: rgba(239,68,68,0.15);
             transform: scale(0.95);
         }
+        
+        /* 双轨状态胶囊开关 */
+        .mode-capsule {
+            display: flex;
+            align-items: center;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 20px;
+            padding: 4px;
+            margin: 0 16px 12px 16px;
+            width: 160px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            position: relative;
+        }
+        .mode-btn {
+            flex: 1;
+            padding: 6px 0;
+            font-size: 13px;
+            font-weight: 500;
+            color: rgba(255, 255, 255, 0.4);
+            border-radius: 16px;
+            cursor: pointer;
+            text-align: center;
+            position: relative;
+            z-index: 2;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            -webkit-tap-highlight-color: transparent;
+        }
+        .mode-btn.safe.active {
+            color: #10b981;
+            text-shadow: 0 0 8px rgba(16, 185, 129, 0.4);
+        }
+        .mode-btn.fast.active {
+            color: #ef4444;
+            text-shadow: 0 0 10px rgba(239, 68, 68, 0.6);
+            animation: pulseFast 2s infinite;
+        }
+        @keyframes pulseFast {
+            0%, 100% { text-shadow: 0 0 8px rgba(239, 68, 68, 0.4); }
+            50% { text-shadow: 0 0 16px rgba(239, 68, 68, 0.8), 0 0 4px rgba(255, 255, 255, 0.5); }
+        }
+        .mode-slider {
+            position: absolute;
+            top: 4px; bottom: 4px; left: 4px;
+            width: 76px;
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.1);
+            box-shadow: inset 0 1px 1px rgba(255,255,255,0.2), 0 2px 4px rgba(0,0,0,0.2);
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            z-index: 1;
+        }
+        .mode-slider.fast-active {
+            transform: translateX(76px);
+            background: rgba(239, 68, 68, 0.15);
+            box-shadow: inset 0 1px 1px rgba(239,68,68,0.3), 0 2px 8px rgba(239,68,68,0.2);
+        }
     </style>
 </head>
 <body>
@@ -733,6 +794,11 @@ def _get_ui_html() -> str:
                 发送自然语言指令，我来帮你操控桌面应用。
             </div>
         </div>
+    </div>
+    <div class="mode-capsule">
+        <div class="mode-slider" id="modeSlider"></div>
+        <div class="mode-btn safe active" id="modeSafe" onclick="toggleMode('safe')">🛡️ 安全</div>
+        <div class="mode-btn fast" id="modeFast" onclick="toggleMode('fast')">🚀 极速</div>
     </div>
 
     <div class="input-area">
@@ -788,17 +854,30 @@ def _get_ui_html() -> str:
     if (SpeechRecognition) {
         _recognition = new SpeechRecognition();
         _recognition.lang = 'zh-CN';       // 中文识别
-        _recognition.continuous = false;     // 单次识别模式
+        _recognition.continuous = true;      // 开启连续识别，阻断 WebKit 的原生默认结束 Bug
         _recognition.interimResults = true;  // 实时显示中间结果
+
+        let _silenceTimer = null;
+        function resetSilenceTimer() {
+            if (_silenceTimer) clearTimeout(_silenceTimer);
+            _silenceTimer = setTimeout(() => {
+                // 如果 2.5 秒没有检测到新语音，强行人工阻断并收尾，避免原生 Bug 导致的硬件流死锁
+                if (_isListening && _recognition) {
+                    try { _recognition.stop(); } catch(e) {}
+                }
+            }, 2500);
+        }
 
         _recognition.onstart = () => {
             _isListening = true;
             micBtn.classList.add('recording');
             micBtn.textContent = '⏺';
             cmdInput.placeholder = '🎙 正在聆听...';
+            resetSilenceTimer(); // 开始录音时启动防挂死探针
         };
 
         _recognition.onresult = (event) => {
+            resetSilenceTimer(); // 只要还在说话，就不停重置探针
             let finalText = '';
             let interimText = '';
             for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -864,6 +943,14 @@ def _get_ui_html() -> str:
         micBtn.textContent = '🎤';
         cmdInput.placeholder = '输入指令...';
         cmdInput.focus();
+        
+        // 苹果专属终极杀招：手动探测底部硬件媒体流并强行截断，破除黄点死锁
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            navigator.mediaDevices.getUserMedia({ audio: true })
+                .then(stream => {
+                    stream.getTracks().forEach(track => track.stop());
+                }).catch(e => {});
+        }
     }
 
     function now() {
@@ -918,6 +1005,33 @@ def _get_ui_html() -> str:
     let _pollCancelled = false;  // 轮询中断标志
     let _cancelBtnCounter = 0;   // 按钮唯一 ID 计数器
 
+    let _currentMode = 'safe';
+    function toggleMode(mode) {
+        if (isProcessing) {
+            addMsg("⚠️ 操控执行中，为防止状态错落请稍候再切换极速/安全模式。", "agent", "error", false);
+            return;
+        }
+        _currentMode = mode;
+        const slider = document.getElementById('modeSlider');
+        const safeBtn = document.getElementById('modeSafe');
+        const fastBtn = document.getElementById('modeFast');
+        if (mode === 'fast') {
+            slider.classList.add('fast-active');
+            fastBtn.classList.add('active');
+            safeBtn.classList.remove('active');
+            statusDot.style.background = '#ef4444'; // 危险霓虹红
+            statusDot.style.boxShadow = '0 0 12px rgba(239,68,68,0.8)';
+            addMsg("⚠️ **极速盲发模式已解除封印**！<br>所有涉及到对外发送的操作（微信、邮件等）都将无视人工阻断界限！请再次确定这是你想要的！", "agent", "error", false);
+        } else {
+            slider.classList.remove('fast-active');
+            safeBtn.classList.add('active');
+            fastBtn.classList.remove('active');
+            statusDot.style.background = '#10b981'; // 安全绿荫
+            statusDot.style.boxShadow = '0 0 8px rgba(16,185,129,0.5)';
+            addMsg("🛡️ 已退回**安全护航模式**，所有的微信图片及敏感文字操作在发出前，都会进入挂起状态等待你的绝对确认。", "agent", "success", false);
+        }
+    }
+
     async function sendCmd() {
         if (isProcessing) return; // 拦截并发发送
         const cmd = cmdInput.value.trim();
@@ -961,7 +1075,7 @@ def _get_ui_html() -> str:
             const submitRes = await fetch('/api/execute', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ command: cmd })
+                body: JSON.stringify({ command: cmd, mode: _currentMode })
             });
             const submitData = await submitRes.json();
 

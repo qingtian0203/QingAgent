@@ -211,8 +211,21 @@ class WeChatSkill(BaseSkill):
         else:
             actions.type_text(message)
             
-        # [强制拦截机制] 将包含文字、图片或文件的所有发送任务挂起，等待用户点按最终按键
-        print("🛡️ 人工审核挂机：检测到发送操作，已进入阻断安全环...")
+        import os
+        mode = os.environ.get("QINGAGENT_MODE", "safe")
+        
+        if mode == "fast":
+            print("🚀 极速模式结界穿透：已绕过所有阻断机制，直接发送！")
+            _time.sleep(0.5)
+            actions.press_key("enter")
+            return {
+                "success": True,
+                "message": f"🚀 安全限制解除：已将消息极限盲发给 **{contact}**。请注意操作不可逆。",
+                "data": None
+            }
+            
+        # [强制拦截机制安全态] 将包含文字、图片或文件的所有发送任务挂起，等待用户点按最终按键
+        print("🛡️ 人工审核挂机：检测到发送操作，安全阀门已落下...")
         _time.sleep(0.5)
         
         # 存当前全屏底图

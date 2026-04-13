@@ -62,6 +62,8 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
 
         if parsed.path == "/" or parsed.path == "/index.html":
             self._serve_ui()
+        elif parsed.path == "/benchmark":
+            self._serve_benchmark()
         elif parsed.path == "/api/skills":
             self._api_skills()
         elif parsed.path == "/api/health":
@@ -158,6 +160,12 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
 
             threading.Thread(target=_do_emergency_stop, daemon=True).start()
             self._json_response({"success": True, "message": "🚨 紧急终止指令已发出"})
+        elif parsed.path == "/api/benchmark/intent":
+            self._benchmark_intent()
+        elif parsed.path == "/api/benchmark/vision":
+            self._benchmark_vision()
+        elif parsed.path == "/api/benchmark/speed":
+            self._benchmark_speed()
         else:
             self.send_error(404)
 
@@ -275,6 +283,373 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             }
         self._json_response(skills_info)
 
+    def _serve_benchmark(self):
+        """返回模型测试台页面"""
+        html = _get_benchmark_html()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.end_headers()
+        self.wfile.write(html.encode("utf-8"))
+
+    def _read_post_body(self) -> dict:
+        """读取并解析 POST JSON body"""
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode("utf-8")
+        return json.loads(body) if body else {}
+
+    # ─── 模型注册表 ───────────────────────────────────────────────────────
+    @staticmethod
+    def _bench_models():
+        """返回所有可用的基准测试模型配置"""
+        from .. import config as _cfg
+        return {
+            "omlx_26b": {
+                "id": "omlx_26b", "label": "oMLX · Gemma 4 26B",
+                "color": "#60a5fa", "engine": "oMLX",
+                "mode": "openai", "url": "http://localhost:8000/v1",
+                "model": "gemma-4-26b-a4b-it-4bit", "key": _cfg.API_KEY,
+            },
+            "omlx_31b": {
+                "id": "omlx_31b", "label": "oMLX · Gemma 4 31B",
+                "color": "#818cf8", "engine": "oMLX",
+                "mode": "openai", "url": "http://localhost:8000/v1",
+                "model": "gemma-4-31b-it-4bit", "key": _cfg.API_KEY,
+            },
+            "ollama_26b": {
+                "id": "ollama_26b", "label": "Ollama · Gemma 4 26B",
+                "color": "#facc15", "engine": "Ollama",
+                "mode": "ollama", "url": "http://localhost:11434/api/generate",
+                "model": "gemma4:26b", "key": "",
+            },
+            "ollama_31b": {
+                "id": "ollama_31b", "label": "Ollama · Gemma 4 31B",
+                "color": "#fb923c", "engine": "Ollama",
+                "mode": "ollama", "url": "http://localhost:11434/api/generate",
+                "model": "gemma4:31b", "key": "",
+            },
+        }
+
+    @staticmethod
+    def _bench_call(mc: dict, prompt: str, image_b64: str = None, max_tokens: int = 512):
+        """统一模型调用，返回 (text, error, prompt_tokens, completion_tokens)"""
+        import requests as _req
+        try:
+            if mc["mode"] == "openai":
+                url = mc["url"].rstrip("/") + "/chat/completions"
+                hdr = {"Content-Type": "application/json"}
+                if mc.get("key"):
+                    hdr["Authorization"] = f"Bearer {mc['key']}"
+                content = [{"type": "text", "text": prompt}]
+                if image_b64:
+                    content.append({"type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{image_b64}"}})
+                resp = _req.post(url, json={
+                    "model": mc["model"],
+                    "messages": [{"role": "user", "content": content}],
+                    "stream": False, "max_tokens": max_tokens,
+                }, headers=hdr, timeout=120)
+                
+                rj = resp.json() 
+                if not resp.ok:
+                    err_msg = rj.get("error", {}).get("message", str(rj)) if isinstance(rj.get("error"), dict) else str(rj.get("error", rj))
+                    return None, f"HTTP {resp.status_code}: {err_msg}", 0, 0
+                    
+                text = rj["choices"][0]["message"]["content"].strip()
+                usage = rj.get("usage", {})
+                return text, None, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+            else:  # ollama
+                body = {"model": mc["model"], "prompt": prompt, "stream": False}
+                if image_b64:
+                    body["images"] = [image_b64]
+                resp = _req.post(mc["url"], json=body, timeout=120)
+                
+                rj = resp.json()
+                if not resp.ok:
+                    return None, f"HTTP {resp.status_code}: {rj.get('error', str(rj))}", 0, 0
+                    
+                text = rj.get("response", "").strip()
+                return text, None, rj.get("prompt_eval_count", 0), rj.get("eval_count", 0)
+        except Exception as e:
+            return None, str(e), 0, 0
+
+    def _benchmark_intent(self):
+        """意图解析测试：单模型调用，支持预热"""
+        import time
+        try:
+            data = self._read_post_body()
+            text = data.get("text", "").strip()
+            model_id = data.get("model_id", "omlx_26b")
+            warmup = data.get("warmup", False)
+
+            if not text:
+                self._json_response({"error": "text 不能为空"}); return
+
+            models = self._bench_models()
+            mc = models.get(model_id)
+            if not mc:
+                self._json_response({"error": f"未知模型: {model_id}"}); return
+
+            capability_doc = _planner.registry.get_full_capability_description()
+            prompt = f"""你是一个应用控制层，从用户指令中识别目标应用和操作意图。
+
+已注册的技能：
+{capability_doc}
+
+用户说：「{text}」
+
+请仅返回一个严格的 JSON（不要包含任何多余文字）：
+{{
+  "steps": [
+    {{
+      "app": "应用名",
+      "intent": "意图名",
+      "slots": {{}},
+      "description": "简短描述"
+    }}
+  ]
+}}"""
+
+            # 预热
+            warmup_elapsed = None
+            if warmup:
+                t0 = time.time()
+                self._bench_call(mc, "好", max_tokens=8)
+                warmup_elapsed = round(time.time() - t0, 2)
+
+            # 正式测试
+            t0 = time.time()
+            raw_text, error, pt, ct = self._bench_call(mc, prompt, max_tokens=512)
+            elapsed = round(time.time() - t0, 2)
+
+            # 解析 JSON
+            parsed_ok, parsed_data = False, None
+            if raw_text:
+                try:
+                    t = raw_text
+                    if t.startswith("```json"): t = t[7:]
+                    elif t.startswith("```"): t = t[3:]
+                    if t.endswith("```"): t = t[:-3]
+                    parsed_data = json.loads(t.strip())
+                    parsed_ok = True
+                except Exception:
+                    pass
+
+            self._json_response({
+                "success": True,
+                "model_id": model_id, "label": mc["label"], "color": mc["color"],
+                "elapsed": elapsed, "warmup_elapsed": warmup_elapsed,
+                "raw": raw_text, "parsed_ok": parsed_ok, "parsed": parsed_data,
+                "error": error,
+            })
+        except Exception as e:
+            self._json_response({"success": False, "error": str(e)})
+
+    def _benchmark_vision(self):
+        """视觉定位测试：单模型调用，支持预热"""
+        import time
+        try:
+            data = self._read_post_body()
+            image_b64 = data.get("image_b64", "")
+            desc = data.get("desc", "").strip()
+            model_id = data.get("model_id", "omlx_26b")
+            warmup = data.get("warmup", False)
+            img_w = data.get("img_w", 0)  # 图片原始宽高（用于像素坐标归一化）
+            img_h = data.get("img_h", 0)
+
+            if not image_b64 or not desc:
+                self._json_response({"error": "image_b64 和 desc 不能为空"}); return
+
+            models = self._bench_models()
+            mc = models.get(model_id)
+            if not mc:
+                self._json_response({"error": f"未知模型: {model_id}"}); return
+
+            prompt = f"""这是一张应用界面截图。
+请找到以下元素：{desc}
+
+请仅返回一个严格 JSON（不要包含任何其他内容）：
+{{"x": 0, "y": 0}}
+其中 x, y 是元素中心点的千分比相对坐标（0 到 1000 之间的整数，例如 500 代表图片正中间）。"""
+
+            # 预热
+            warmup_elapsed = None
+            if warmup:
+                t0 = time.time()
+                self._bench_call(mc, "好", max_tokens=8)
+                warmup_elapsed = round(time.time() - t0, 2)
+
+            # 正式测试
+            t0 = time.time()
+            raw_text, error, pt, ct = self._bench_call(mc, prompt, image_b64=image_b64, max_tokens=64)
+            elapsed = round(time.time() - t0, 2)
+
+            # 解析坐标
+            coord = None
+            if raw_text:
+                try:
+                    t = raw_text
+                    if t.startswith("```json"): t = t[7:]
+                    elif t.startswith("```"): t = t[3:]
+                    if t.endswith("```"): t = t[:-3]
+                    coord = json.loads(t.strip())
+                except Exception:
+                    import re
+                    m = re.search(r'"x"\s*:\s*([\d.]+).*?"y"\s*:\s*([\d.]+)', raw_text, re.S)
+                    if m:
+                        coord = {"x": float(m.group(1)), "y": float(m.group(2))}
+
+            # 归一化坐标（如果是千分比坐标 [0~1000] 则除以 1000）
+            norm_coord = None
+            if coord:
+                nx = coord["x"] / 1000.0 if coord["x"] > 1 else coord["x"]
+                ny = coord["y"] / 1000.0 if coord["y"] > 1 else coord["y"]
+                norm_coord = {"x": round(nx, 4), "y": round(ny, 4),
+                              "px": coord["x"], "py": coord["y"]}
+
+            self._json_response({
+                "success": True,
+                "model_id": model_id, "label": mc["label"], "color": mc["color"],
+                "elapsed": elapsed, "warmup_elapsed": warmup_elapsed,
+                "raw": raw_text, "coord": coord, "norm_coord": norm_coord,
+                "error": error,
+            })
+        except Exception as e:
+            self._json_response({"success": False, "error": str(e)})
+
+    def _benchmark_speed(self):
+        """速度基准测试：单模型调用"""
+        import time
+        try:
+            data = self._read_post_body()
+            model_id = data.get("model_id", "omlx_26b")
+            warmup = data.get("warmup", False)
+
+            models = self._bench_models()
+            mc = models.get(model_id)
+            if not mc:
+                self._json_response({"error": f"未知模型: {model_id}"}); return
+
+            prompt = "请用中文简要介绍一下大语言模型的工作原理，包括 Transformer 架构、注意力机制、预训练与微调三个方面，300字内。"
+
+            # 预热
+            warmup_elapsed = None
+            if warmup:
+                t0 = time.time()
+                self._bench_call(mc, "好", max_tokens=8)
+                warmup_elapsed = round(time.time() - t0, 2)
+
+            # 正式测试
+            t0 = time.time()
+            text_out, error, pt, ct = self._bench_call(mc, prompt, max_tokens=512)
+            elapsed = round(time.time() - t0, 2)
+            tps = round(ct / elapsed, 1) if ct and elapsed > 0 else None
+
+            self._json_response({
+                "success": True,
+                "model_id": model_id, "label": mc["label"], "color": mc["color"],
+                "elapsed": elapsed, "warmup_elapsed": warmup_elapsed,
+                "prompt_tokens": pt, "completion_tokens": ct, "tps": tps,
+                "preview": (text_out or "")[:200],
+                "error": error,
+            })
+        except Exception as e:
+            self._json_response({"success": False, "error": str(e)})
+
+
+            capability_doc = _planner.registry.get_full_capability_description()
+            prompt = f"""你是一个应用控制层，从用户指令中识别目标应用和操作意图。
+
+已注册的技能：
+{capability_doc}
+
+用户说：「{text}」
+
+请仅返回一个严格的 JSON（不要包含任何多余文字）：
+{{
+  "steps": [
+    {{
+      "app": "应用名",
+      "intent": "意图名",
+      "slots": {{}},
+      "description": "简短描述"
+    }}
+  ]
+}}"""
+
+            results = []
+            # 模型配置：oMLX 26B/31B + Ollama 26B/31B
+            model_configs = [
+                {"id": "omlx_26b", "label": "oMLX · Gemma 4 26B",
+                 "mode": "openai", "url": "http://localhost:8000/v1",
+                 "model": "gemma-4-26b-a4b-it-4bit", "key": _cfg.API_KEY},
+                {"id": "omlx_31b", "label": "oMLX · Gemma 4 31B",
+                 "mode": "openai", "url": "http://localhost:8000/v1",
+                 "model": "gemma-4-31b-a4b-it-4bit", "key": _cfg.API_KEY},
+                {"id": "ollama_26b", "label": "Ollama · Gemma 4 26B",
+                 "mode": "ollama", "url": "http://localhost:11434/api/generate",
+                 "model": "gemma4:26b", "key": ""},
+                {"id": "ollama_31b", "label": "Ollama · Gemma 4 31B",
+                 "mode": "ollama", "url": "http://localhost:11434/api/generate",
+                 "model": "gemma4:31b", "key": ""},
+            ]
+
+            import requests as _req
+            for mc in model_configs:
+                t0 = time.time()
+                raw_text = None
+                error = None
+                try:
+                    if mc["mode"] == "openai":
+                        url = mc["url"].rstrip("/") + "/chat/completions"
+                        hdr = {"Content-Type": "application/json"}
+                        if mc["key"]:
+                            hdr["Authorization"] = f"Bearer {mc['key']}"
+                        resp = _req.post(url, json={
+                            "model": mc["model"],
+                            "messages": [{"role": "user", "content": prompt}],
+                            "stream": False, "max_tokens": 512,
+                        }, headers=hdr, timeout=60)
+                        resp.raise_for_status()
+                        raw_text = resp.json()["choices"][0]["message"]["content"].strip()
+                    else:
+                        resp = _req.post(mc["url"], json={
+                            "model": mc["model"], "prompt": prompt, "stream": False
+                        }, timeout=90)
+                        resp.raise_for_status()
+                        raw_text = resp.json().get("response", "").strip()
+                except Exception as e:
+                    error = str(e)
+
+                elapsed = round(time.time() - t0, 2)
+
+                # 尝试解析 JSON
+                parsed_ok = False
+                parsed_data = None
+                if raw_text:
+                    try:
+                        t = raw_text
+                        if t.startswith("```json"): t = t[7:]
+                        elif t.startswith("```"): t = t[3:]
+                        if t.endswith("```"): t = t[:-3]
+                        parsed_data = json.loads(t.strip())
+                        parsed_ok = True
+                    except Exception:
+                        pass
+
+                results.append({
+                    "id": mc["id"], "label": mc["label"],
+                    "elapsed": elapsed,
+                    "raw": raw_text,
+                    "parsed_ok": parsed_ok,
+                    "parsed": parsed_data,
+                    "error": error,
+                })
+
+            self._json_response({"success": True, "results": results})
+        except Exception as e:
+            self._json_response({"success": False, "error": str(e)})
+
     def _serve_ui(self):
         """返回内嵌的 Web 界面"""
         html = _get_ui_html()
@@ -347,7 +722,7 @@ def start_server(host: str = None, port: int = None):
 def _get_ui_html() -> str:
     """内嵌的 Web 界面 HTML — 移动端优先设计"""
     return '''<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" id="htmlRoot">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -381,6 +756,138 @@ def _get_ui_html() -> str:
             --success: #4ade80;
             --error: #f87171;
             --safe-bottom: env(safe-area-inset-bottom, 0px);
+        }
+
+        /* === 浅色主题覆盖 === */
+        [data-theme="light"] {
+            --bg-primary: #f0f2f7;
+            --bg-secondary: #ffffff;
+            --bg-card: #eef0ff;
+            --bg-card-inner: #e6eaff;
+            --border: rgba(90,111,232,0.13);
+            --text-primary: #111827;
+            --text-secondary: #4b5563;
+            --accent-start: #5a6fe8;
+            --accent-end: #6a3f9e;
+            --success: #16a34a;
+            --error: #dc2626;
+        }
+        [data-theme="light"] ::-webkit-scrollbar-thumb {
+            background: rgba(0,0,0,0.14);
+        }
+        /* 快捷栏 chip - 深文字、可辨识背景 */
+        [data-theme="light"] .quick-chip {
+            background: rgba(90,111,232,0.08);
+            color: #374151;
+            border: 1px solid rgba(90,111,232,0.15);
+        }
+        [data-theme="light"] .quick-chip:hover {
+            background: rgba(90,111,232,0.16);
+            color: var(--accent-start);
+            border-color: rgba(90,111,232,0.3);
+        }
+        /* Agent 消息气泡 */
+        [data-theme="light"] .msg-row.agent .msg-bubble {
+            background: #f5f6ff;
+            color: #111827;
+            border: 1px solid rgba(90,111,232,0.16);
+            box-shadow: 0 2px 10px rgba(90,111,232,0.08);
+        }
+        /* 气泡内的数据卡片（日历/文件选择等） */
+        [data-theme="light"] .msg-row.agent .msg-bubble [style*="var(--bg-card)"],
+        [data-theme="light"] .msg-row.agent .msg-bubble > div > div {
+            /* 通过继承 --bg-card 变量自动生效 */
+        }
+        /* 数据/代码展示块 */
+        [data-theme="light"] .msg-data {
+            background: #f0f4ff;
+            color: #1e293b;
+            border: 1px solid rgba(90,111,232,0.15);
+        }
+        /* 输入区 */
+        [data-theme="light"] .input-area {
+            background: #ffffff;
+            border-top: 1px solid rgba(0,0,0,0.09);
+        }
+        [data-theme="light"] .input-area input {
+            background: #f0f2f7;
+            color: #111827;
+            border-color: rgba(0,0,0,0.12);
+        }
+        [data-theme="light"] .input-area input::placeholder {
+            color: rgba(0,0,0,0.32);
+        }
+        [data-theme="light"] .input-area input:focus {
+            background: #e8ecf8;
+            border-color: rgba(90,111,232,0.4);
+        }
+        [data-theme="light"] .send-btn {
+            background: rgba(90,111,232,0.1);
+            color: var(--accent-start);
+        }
+        [data-theme="light"] .send-btn:hover {
+            background: rgba(90,111,232,0.2);
+        }
+        [data-theme="light"] .mic-btn {
+            background: rgba(0,0,0,0.05);
+            color: #374151;
+        }
+        [data-theme="light"] .mic-btn:hover {
+            background: rgba(0,0,0,0.1);
+        }
+        /* 模式胶囊开关 */
+        [data-theme="light"] .mode-capsule {
+            background: rgba(0,0,0,0.07);
+            border-color: rgba(0,0,0,0.1);
+        }
+        [data-theme="light"] .mode-btn {
+            color: rgba(0,0,0,0.35);
+        }
+        [data-theme="light"] .mode-btn.safe.active {
+            color: #16a34a;
+        }
+        [data-theme="light"] .mode-btn.fast.active {
+            color: #dc2626;
+        }
+        [data-theme="light"] .mode-indicator {
+            background: rgba(0,0,0,0.07);
+        }
+        /* 弹窗 */
+        [data-theme="light"] .modal-overlay { background: rgba(0,0,0,0.32); }
+        [data-theme="light"] .modal-content {
+            background: #ffffff;
+            border: 1px solid rgba(0,0,0,0.1);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.18);
+            color: #111827;
+        }
+        [data-theme="light"] .skill-card {
+            background: #f8f9fc;
+            border-color: rgba(0,0,0,0.07);
+            color: #111827;
+        }
+        [data-theme="light"] .skill-card:hover {
+            background: rgba(90,111,232,0.06);
+            border-color: rgba(90,111,232,0.2);
+        }
+        /* 主题切换按钮 (布局样式已提至 header-btn 统一处理) */
+        .theme-toggle {
+            width: 30px; height: 30px;
+            border-radius: 8px;
+            background: rgba(128, 138, 157, 0.12);
+            color: var(--text-secondary);
+            font-size: 15px;
+        }
+        .theme-toggle:hover {
+            background: rgba(102,126,234,0.15);
+            color: var(--accent-start);
+            transform: translateY(-1px);
+        }
+        [data-theme="light"] .theme-toggle:hover {
+            background: rgba(90,111,232,0.12);
+            color: var(--accent-start);
+        }
+        .theme-toggle:active {
+            transform: scale(0.96);
         }
 
         html, body {
@@ -446,41 +953,36 @@ def _get_ui_html() -> str:
             50% { opacity: 0.4; }
         }
 
-        /* === 快捷操作 === */
-        .quick-bar {
-            padding: 10px 16px;
-            display: flex;
-            gap: 8px;
-            overflow-x: auto;
-            -webkit-overflow-scrolling: touch;
-            scrollbar-width: none;
-            flex-shrink: 0;
-            background: var(--bg-primary);
-            border-bottom: 1px solid var(--border);
-        }
-        .quick-bar::-webkit-scrollbar { display: none; }
-
-        .quick-chip {
-            padding: 5px 12px;
-            border-radius: 6px;
+        /* === 顶部功能按键及统一样式 === */
+        .header-btn, .theme-toggle, .emergency-btn {
             border: none;
-            background: rgba(255,255,255,0.05);
-            color: rgba(255,255,255,0.55);
-            font-size: 11px;
-            font-weight: 400;
+            display: flex; align-items: center; justify-content: center;
             cursor: pointer;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            flex-shrink: 0;
             white-space: nowrap;
-            transition: all 0.18s ease;
             -webkit-tap-highlight-color: transparent;
-            letter-spacing: 0.2px;
         }
-        .quick-chip:hover {
-            background: rgba(255,255,255,0.09);
-            color: rgba(255,255,255,0.80);
+
+        .header-btn, .emergency-btn {
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 500;
+            gap: 4px;
         }
-        .quick-chip:active {
-            background: rgba(255,255,255,0.13);
-            transform: scale(0.95);
+
+        .header-btn {
+            background: rgba(128, 138, 157, 0.12);
+            color: var(--text-secondary);
+        }
+        .header-btn:hover {
+            background: rgba(128, 138, 157, 0.2);
+            color: var(--text-primary);
+            transform: translateY(-1px);
+        }
+        .header-btn:active {
+            transform: scale(0.96);
         }
 
         /* === 聊天区 === */
@@ -681,30 +1183,18 @@ def _get_ui_html() -> str:
         .send-btn:active, .mic-btn:active { transform: scale(0.9); opacity: 0.7; }
         .send-btn:disabled { opacity: 0.2; }
 
-        /* 紧急停止按钮 */
+        /* 紧急停止按钮 (布局样式已提至 header-btn) */
         .emergency-btn {
-            padding: 4px 10px;
-            border-radius: 6px;
-            border: 1px solid rgba(239,68,68,0.3);
-            background: transparent;
-            color: rgba(239,68,68,0.75);
-            font-size: 11px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.18s ease;
-            -webkit-tap-highlight-color: transparent;
-            white-space: nowrap;
-            flex-shrink: 0;
-            letter-spacing: 0.2px;
+            background: rgba(239, 68, 68, 0.1);
+            color: #ef4444;
+            font-weight: 600;
         }
         .emergency-btn:hover {
-            background: rgba(239,68,68,0.08);
-            color: #f87171;
-            border-color: rgba(239,68,68,0.55);
+            background: rgba(239, 68, 68, 0.18);
+            transform: translateY(-1px);
         }
         .emergency-btn:active {
-            background: rgba(239,68,68,0.15);
-            transform: scale(0.95);
+            transform: scale(0.96);
         }
         
         /* 双轨状态胶囊开关 */
@@ -775,16 +1265,21 @@ def _get_ui_html() -> str:
             <p>晴帅的私人 AI 桌面助手</p>
         </div>
         <div class="status-dot" id="statusDot" title="在线"></div>
-        <button class="emergency-btn" onclick="emergencyStop()" title="立即终止所有正在执行的任务">🚨 急停</button>
-    </div>
-
-    <div class="quick-bar">
-        <div class="quick-chip" onclick="quickSend('给AI发条微信说测试消息')">📱 微信发消息</div>
-        <div class="quick-chip" onclick="quickSend('看看工作群有没有新消息')">💬 查消息</div>
-        <div class="quick-chip" onclick="quickSend('看看今天有什么任务')">📅 查日历</div>
-        <div class="quick-chip" onclick="quickSend('打开晴天Util拉取更新并重启')">🔄 拉取更新</div>
-        <div class="quick-chip" onclick="quickSend('打开百度')">🌐 浏览器</div>
-        <div class="quick-chip" onclick="hardReload()" title="清除缓存并强制刷新页面">🔃 强刷</div>
+        <button class="header-btn" onclick="clearHistory()" title="一键清屏，重新开始">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+            <span>清屏</span>
+        </button>
+        <button class="header-btn" onclick="window.location.href='/benchmark'" title="模型横评测试台">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+            <span>测试台</span>
+        </button>
+        <button class="theme-toggle" id="themeToggleBtn" onclick="toggleTheme()" title="切换明/暗主题">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+        </button>
+        <button class="emergency-btn" onclick="emergencyStop()" title="立即终止所有正在执行的任务">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"></polygon><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+            <span>急停</span>
+        </button>
     </div>
 
     <div class="chat-area" id="chatArea">
@@ -797,15 +1292,25 @@ def _get_ui_html() -> str:
     </div>
     <div class="mode-capsule">
         <div class="mode-slider" id="modeSlider"></div>
-        <div class="mode-btn safe active" id="modeSafe" onclick="toggleMode('safe')">🛡️ 安全</div>
-        <div class="mode-btn fast" id="modeFast" onclick="toggleMode('fast')">🚀 极速</div>
+        <div class="mode-btn safe active" id="modeSafe" onclick="toggleMode('safe')" style="display:flex; align-items:center; justify-content:center; gap:4px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+            <span>安全</span>
+        </div>
+        <div class="mode-btn fast" id="modeFast" onclick="toggleMode('fast')" style="display:flex; align-items:center; justify-content:center; gap:4px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+            <span>极速</span>
+        </div>
     </div>
 
     <div class="input-area">
         <input type="text" id="cmdInput" placeholder="输入指令..."
                enterkeyhint="send">
-        <button class="mic-btn" id="micBtn" title="语音输入">🎤</button>
-        <button class="send-btn" id="sendBtn" onclick="sendCmd()" title="发送">➤</button>
+        <button class="mic-btn" id="micBtn" title="语音输入">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
+        </button>
+        <button class="send-btn" id="sendBtn" onclick="sendCmd()" title="发送">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+        </button>
     </div>
 </div>
 
@@ -840,6 +1345,17 @@ def _get_ui_html() -> str:
         }
     } catch(e) {
         _history = [];
+    }
+
+    function clearHistory() {
+        chatArea.innerHTML = `
+        <div class="msg-row agent">
+            <div class="msg-bubble">
+                👋 屏幕已清空，我在等待你的桌面指令...
+            </div>
+        </div>`;
+        _history = [];
+        saveHistory();
     }
 
     let isProcessing = false; // 全局防抖锁
@@ -1226,25 +1742,197 @@ def _get_ui_html() -> str:
                     content += `<div style="margin-top:8px;">
                         <img src="${imgUrl}" alt="\u5f85\u786e\u8ba4\u622a\u56fe" style="width:100%; border-radius:10px; border:1px solid rgba(255,255,255,0.06); display:block;" />
                         <div style="display:flex; align-items:center; justify-content:space-between; margin-top:8px; padding:8px 10px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.06); border-radius:8px;">
-                            <span style="font-size:11px; color:rgba(255,255,255,0.4);">ℹ️ \u5185\u5bb9\u5df2\u5c31\u7eea\uff0c\u5f85\u786e\u8ba4</span>
+                            <span style="font-size:11px; color:rgba(255,255,255,0.4); display:flex; align-items:center; gap:4px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg> \u5185\u5bb9\u5df2\u5c31\u7eea\uff0c\u5f85\u786e\u8ba4</span>
                             <div style="display:flex; gap:8px;">
                                 <button
                                     onclick="quickSend('\u6267\u884c\u5fae\u4fe1\u786e\u8ba4\u53d1\u9001'); this.closest('div[style]').style.opacity='0.4'; this.closest('div[style]').style.pointerEvents='none';"
                                     onmouseover="this.style.background='rgba(52,211,153,0.25)'; this.style.borderColor='rgba(52,211,153,0.5)';"
                                     onmouseout="this.style.background='rgba(52,211,153,0.1)'; this.style.borderColor='rgba(52,211,153,0.25)';"
-                                    style="padding:5px 12px; background:rgba(52,211,153,0.1); border:1px solid rgba(52,211,153,0.25); border-radius:6px; color:#6ee7b7; font-size:11px; font-weight:500; cursor:pointer; transition:all 0.15s;">
-                                    \u2705 \u786e\u8ba4\u53d1\u9001
+                                    style="padding:5px 12px; background:rgba(52,211,153,0.1); border:1px solid rgba(52,211,153,0.25); border-radius:6px; color:#6ee7b7; font-size:11px; font-weight:500; cursor:pointer; transition:all 0.15s; display:flex; align-items:center; justify-content:center; gap:4px;">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg> \u786e\u8ba4\u53d1\u9001
                                 </button>
                                 <button
                                     onclick="addMsg('\u5df2\u53d6\u6d88\u53d1\u4ef6', 'user'); this.parentElement.parentElement.style.opacity='0.3';"
                                     onmouseover="this.style.background='rgba(239,68,68,0.15)'; this.style.borderColor='rgba(239,68,68,0.4)';"
                                     onmouseout="this.style.background='transparent'; this.style.borderColor='rgba(255,255,255,0.12)';"
-                                    style="padding:5px 12px; background:transparent; border:1px solid rgba(255,255,255,0.12); border-radius:6px; color:rgba(255,255,255,0.45); font-size:11px; cursor:pointer; transition:all 0.15s;">
-                                    \u2715 \u53d6\u6d88
+                                    style="padding:5px 12px; background:transparent; border:1px solid rgba(255,255,255,0.12); border-radius:6px; color:rgba(255,255,255,0.45); font-size:11px; cursor:pointer; transition:all 0.15s; display:flex; align-items:center; justify-content:center; gap:4px;">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg> \u53d6\u6d88
                                 </button>
                             </div>
                         </div>
                     </div>`;
+                }
+                // =============== [新增拦截层 3]：添加日程成功确认卡片 ================
+                else if (d.ui_type === 'calendar_task') {
+                    const typeTag = d.task_type
+                        ? `<span style="
+                            font-size: 10px;
+                            color: var(--text-secondary);
+                            background: rgba(255,255,255,0.05);
+                            padding: 1px 6px; border-radius: 4px;
+                            margin-left: 6px; white-space: nowrap;
+                          ">${d.task_type}</span>`
+                        : '';
+                    content += `<div style="
+                        margin: 12px 0 0 0;
+                        background: var(--bg-card);
+                        border: 1px solid var(--border);
+                        border-radius: 14px;
+                        overflow: hidden;
+                        min-width: 220px;
+                    ">
+                        <!-- 头部 -->
+                        <div style="
+                            display: flex; align-items: center; gap: 10px;
+                            padding: 12px 16px;
+                            border-bottom: 1px solid var(--border);
+                        ">
+                            <div style="
+                                width: 28px; height: 28px; border-radius: 7px;
+                                background: rgba(74,222,128,0.15);
+                                border: 1px solid rgba(74,222,128,0.25);
+                                display: flex; align-items: center; justify-content: center; color: #4ade80;
+                                font-size: 14px; flex-shrink: 0;
+                            "><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg></div>
+                            <div style="flex: 1;">
+                                <div style="font-size: 12px; font-weight: 600; color: #4ade80; line-height: 1;">已添加日程</div>
+                                <div style="font-size: 10px; color: var(--text-secondary); margin-top: 3px; display:flex; align-items:center; gap:3px;"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg> ${d.date}</div>
+                            </div>
+                        </div>
+                        <!-- 任务内容行 -->
+                        <div style="
+                            display: flex; align-items: center; gap: 10px;
+                            padding: 12px 16px;
+                        ">
+                            <div style="
+                                width: 14px; height: 14px; flex-shrink: 0;
+                                border-radius: 50%;
+                                border: 1.5px solid var(--border);
+                                display: flex; align-items: center; justify-content: center;
+                            "></div>
+                            <div style="flex: 1; display: flex; align-items: center; flex-wrap: wrap; gap: 2px;">
+                                <div style="font-size: 14px; font-weight: 500; color: var(--text-primary);">${d.title}</div>
+                                ${typeTag}
+                            </div>
+                        </div>
+                    </div>`;
+                }
+                // =============== [新增拦截层 4]：日历查询结果列表 ================
+                else if (d.ui_type === 'calendar_query') {
+                    const tasks = d.tasks || [];
+                    const total = tasks.length;
+                    const completed = tasks.filter(t => t.completed).length;
+                    const pct = total > 0 ? Math.round(completed / total * 100) : 0;
+
+                    // 进度条颜色：全完成绿，有未完成紫蓝
+                    const barColor = (completed === total && total > 0)
+                        ? 'linear-gradient(90deg,#4ade80,#22c55e)'
+                        : 'linear-gradient(90deg, var(--accent-start), var(--accent-end))';
+
+                    // 负向偏移让卡片突破气泡宽度限制
+                    let html = `<div style="
+                        margin: 12px 0 0 0;
+                        background: var(--bg-card);
+                        border: 1px solid var(--border);
+                        border-radius: 14px;
+                        overflow: hidden;
+                        min-width: 220px;
+                    ">
+                        <!-- 头部标题行 -->
+                        <div style="
+                            display: flex;
+                            align-items: center;
+                            justify-content: space-between;
+                            padding: 12px 16px 10px;
+                            border-bottom: 1px solid var(--border);
+                        ">
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <div style="
+                                    width: 28px; height: 28px; border-radius: 7px;
+                                    background: linear-gradient(135deg, var(--accent-start), var(--accent-end));
+                                    display: flex; align-items: center; justify-content: center; color: #fff;
+                                    font-size: 14px; flex-shrink: 0;
+                                "><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg></div>
+                                <div>
+                                    <div style="font-size: 13px; font-weight: 600; color: var(--text-primary); line-height: 1;">${d.date}</div>
+                                    <div style="font-size: 10px; color: var(--text-secondary); margin-top: 2px;">${d.target_date || ''}</div>
+                                </div>
+                            </div>
+                            <div style="
+                                font-size: 11px; font-weight: 500;
+                                color: ${completed===total && total>0 ? '#4ade80' : 'var(--text-secondary)'};
+                                background: ${completed===total && total>0 ? 'rgba(74,222,128,0.1)' : 'rgba(255,255,255,0.06)'};
+                                padding: 3px 10px; border-radius: 20px;
+                            ">${completed} / ${total} 已完成</div>
+                        </div>`;
+
+                    // 进度条（只在有任务时显示）
+                    if (total > 0) {
+                        html += `<div style="padding: 0 16px;">
+                            <div style="height: 2px; background: var(--border); border-radius: 1px; margin: 0;">
+                                <div style="height: 100%; width: ${pct}%; background: ${barColor}; border-radius: 1px; transition: width 0.4s ease;"></div>
+                            </div>
+                        </div>`;
+                    }
+
+                    // 任务列表
+                    if (total === 0) {
+                        html += `<div style="
+                            text-align: center; padding: 24px 16px;
+                            color: var(--text-secondary); font-size: 12px;
+                            display: flex; align-items: center; justify-content: center; gap: 6px;
+                        "><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8h1a4 4 0 0 1 0 8h-1"></path><path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z"></path><line x1="6" y1="1" x2="6" y2="4"></line><line x1="10" y1="1" x2="10" y2="4"></line><line x1="14" y1="1" x2="14" y2="4"></line></svg> <span>当日暂无任何任务安排</span></div>`;
+                    } else {
+                        html += `<div style="padding: 8px 12px; display: flex; flex-direction: column; gap: 6px;">`;
+                        tasks.forEach(t => {
+                            const isDone = t.completed;
+                            const titleStyle = isDone
+                                ? 'text-decoration: line-through; color: var(--text-secondary);'
+                                : 'color: var(--text-primary);';
+                            const rowBg = isDone
+                                ? 'rgba(0,0,0,0.02)'
+                                : 'rgba(90,111,232,0.05)';
+                            const dotColor = isDone ? 'var(--success)' : 'var(--border)';
+                            const dotInner = isDone
+                                ? `<div style="width:6px;height:6px;border-radius:50%;background:#4ade80;"></div>`
+                                : '';
+                            const badge = t.task_type
+                                ? `<span style="
+                                    font-size: 10px;
+                                    color: rgba(255,255,255,0.3);
+                                    background: rgba(255,255,255,0.04);
+                                    padding: 1px 6px; border-radius: 4px;
+                                    margin-left: 6px; white-space: nowrap;
+                                  ">${t.task_type}</span>`
+                                : '';
+
+                            html += `
+                            <div style="
+                                display: flex; align-items: center; gap: 10px;
+                                padding: 10px 12px;
+                                background: ${rowBg};
+                                border-radius: 10px;
+                                transition: background 0.15s;
+                            ">
+                                <!-- 状态小圆点 -->
+                                <div style="
+                                    width: 14px; height: 14px; flex-shrink: 0;
+                                    border-radius: 50%;
+                                    border: 1.5px solid ${dotColor};
+                                    display: flex; align-items: center; justify-content: center;
+                                ">${dotInner}</div>
+                                <!-- 标题 + 标签 -->
+                                <div style="flex: 1; min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 2px;">
+                                    <div style="font-size: 13px; line-height: 1.4; ${titleStyle}">${t.title}</div>
+                                    ${badge}
+                                </div>
+                            </div>`;
+                        });
+                        html += `</div>`;
+                    }
+
+                    html += `</div>`;
+                    content += html;
                 }
                 // ================= 默认常规大图片和JSON ================
                 else if (d.screenshot_path) {
@@ -1258,8 +1946,7 @@ def _get_ui_html() -> str:
                         </div>
                     </div>`;
                 } else {
-                    const pretty = JSON.stringify(d, null, 2);
-                    content += `<div class="msg-data"><pre style="margin:0;font-size:11px;opacity:0.7">${pretty}</pre></div>`;
+                    // JSON兜底删除，避免与UI卡片重复或破坏美观
                 }
             } else {
                 content += `<div class="msg-data">${d}</div>`;
@@ -1309,6 +1996,696 @@ def _get_ui_html() -> str:
         // 3. 恢复 UI 状态
         finish();
     }
+
+    // ── 明暗主题切换 ─────────────────────────────────────────
+    const SVG_MOON = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>`;
+    const SVG_SUN = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>`;
+
+    function toggleTheme() {
+        const root = document.getElementById('htmlRoot');
+        const btn  = document.getElementById('themeToggleBtn');
+        const isLight = root.getAttribute('data-theme') === 'light';
+        if (isLight) {
+            root.removeAttribute('data-theme');
+            btn.innerHTML = SVG_MOON;
+            localStorage.setItem('qa_theme', 'dark');
+        } else {
+            root.setAttribute('data-theme', 'light');
+            btn.innerHTML = SVG_SUN;
+            localStorage.setItem('qa_theme', 'light');
+        }
+    }
+    // 页面加载时恢复上次的主题选择
+    (function initTheme() {
+        const saved = localStorage.getItem('qa_theme');
+        if (saved === 'light') {
+            document.getElementById('htmlRoot').setAttribute('data-theme', 'light');
+            const btn = document.getElementById('themeToggleBtn');
+            if (btn) btn.innerHTML = SVG_SUN;
+        }
+    })();
+</script>
+</body>
+</html>'''
+
+
+
+
+
+def _get_benchmark_html() -> str:
+    """模型测试台页面 v2：单模型独立运行 + 历史对比"""
+    return '''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🧪 模型测试台 · QingAgent</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:#0b0b11; --bg2:#13131d; --card:#1a1a2e; --card2:#1e1e30;
+  --border:rgba(255,255,255,0.07); --text:#e8e8ed; --muted:#8888a0;
+  --as:#667eea; --ae:#764ba2; --green:#4ade80; --red:#f87171;
+  --btn-bg:rgba(255,255,255,0.04); --btn-hov:rgba(255,255,255,0.08); --bdg:rgba(255,255,255,0.06);
+}
+html[data-theme="light"] {
+  --bg:#f6f7fa; --bg2:#ffffff; --card:rgba(255,255,255,0.7); --card2:#fafafa;
+  --border:rgba(0,0,0,0.06); --text:rgba(0,0,0,0.85); --muted:rgba(0,0,0,0.45);
+  --as:#667eea; --ae:#764ba2; --green:#22c55e; --red:#ef4444;
+  --btn-bg:rgba(0,0,0,0.03); --btn-hov:rgba(0,0,0,0.06); --bdg:rgba(0,0,0,0.05);
+}
+.theme-toggle{background:transparent;border:none;color:var(--muted);cursor:pointer;transition:.18s;display:flex;align-items:center;justify-content:center;}
+.theme-toggle:hover{color:var(--text);}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column;}
+
+/* ── 顶栏 ── */
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:var(--bg2);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:20;}
+.topbar-left{display:flex;align-items:center;gap:10px;}
+.logo{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--as),var(--ae));display:flex;align-items:center;justify-content:center;font-size:15px;}
+.topbar h1{font-size:14px;font-weight:600;}
+.topbar-sub{font-size:10px;color:var(--muted);margin-top:2px;}
+.back{padding:5px 12px;border-radius:6px;border:1px solid var(--border);background:var(--btn-bg);color:var(--muted);font-size:11px;cursor:pointer;text-decoration:none;transition:.18s;}
+.back:hover{background:var(--btn-hov);color:var(--text);}
+
+/* ── Tab ── */
+.tabs{display:flex;gap:4px;padding:14px 20px 0;border-bottom:1px solid var(--border);}
+.tab-btn{padding:7px 14px;border-radius:7px 7px 0 0;border:none;background:transparent;color:var(--muted);font-size:12px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent;transition:.18s;}
+.tab-btn:hover{color:var(--text);background:var(--btn-bg);}
+.tab-btn.active{color:var(--text);background:var(--card);border-bottom-color:var(--as);}
+
+/* ── 主布局 ── */
+.layout{display:grid;grid-template-columns:320px 1fr;flex:1;overflow:hidden;}
+@media(max-width:760px){.layout{grid-template-columns:1fr;}}
+
+/* ── 左侧配置面板 ── */
+.config{padding:16px;overflow-y:auto;border-right:1px solid var(--border);display:flex;flex-direction:column;gap:12px;}
+.section{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;}
+.sec-title{font-size:10px;font-weight:600;color:var(--muted);letter-spacing:.4px;margin-bottom:10px;text-transform:uppercase;}
+
+/* 模型按钮组 */
+.model-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
+.model-btn{display:flex;align-items:center;gap:7px;padding:8px 10px;border-radius:8px;border:1.5px solid var(--border);background:var(--btn-bg);cursor:pointer;transition:.18s;text-align:left;}
+.model-btn:hover{background:var(--btn-hov);}
+.model-btn.selected{border-color:var(--dot-color,#667eea);background:rgba(var(--dot-rgb,102 126 234)/.12);}
+.model-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;}
+.model-name{font-size:11px;font-weight:600;color:var(--text);}
+.model-engine{font-size:9px;color:var(--muted);}
+
+/* 输入区 */
+.tab-input{display:none;flex-direction:column;gap:8px;}
+.tab-input.active{display:flex;}
+label.lbl{font-size:10px;color:var(--muted);font-weight:500;}
+textarea,input[type=text],input[type=file]{width:100%;padding:8px 10px;background:var(--btn-bg);border:1px solid var(--btn-bg);border-radius:7px;color:var(--text);font-size:12px;font-family:inherit;outline:none;transition:border-color .2s;}
+textarea{min-height:70px;resize:vertical;}
+textarea:focus,input:focus{border-color:rgba(255,255,255,.2);}
+input[type=file]{color:var(--muted);}
+
+/* 滑块 */
+.slider-row{display:flex;align-items:center;gap:8px;}
+.slider-row label{font-size:10px;color:var(--muted);white-space:nowrap;}
+.slider-row input[type=range]{flex:1;accent-color:var(--as);}
+.slider-val{font-size:11px;color:var(--text);min-width:24px;text-align:right;}
+
+/* 预热选项 */
+.warmup-row{display:flex;align-items:center;gap:6px;padding:4px 0;}
+.warmup-row input[type=checkbox]{accent-color:var(--as);}
+.warmup-row span{font-size:11px;color:var(--muted);}
+
+/* 运行按钮 */
+.action-row{display:flex;gap:8px;align-items:center;}
+.run-btn{flex:1;display:inline-flex;align-items:center;justify-content:center;gap:5px;padding:9px;border-radius:8px;border:none;background:linear-gradient(135deg,var(--as),var(--ae));color:#fff;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .18s;}
+.run-btn:disabled{opacity:.4;cursor:not-allowed;}
+.run-btn:not(:disabled):hover{opacity:.88;}
+.clear-btn{padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--btn-bg);color:var(--muted);font-size:11px;cursor:pointer;transition:.18s;}
+.clear-btn:hover{background:var(--btn-hov);color:var(--text);}
+
+/* loading */
+.loading{display:none;align-items:center;gap:6px;font-size:11px;color:var(--muted);}
+.loading.show{display:flex;}
+.spinner{width:12px;height:12px;border-radius:50%;border:2px solid rgba(255,255,255,.1);border-top-color:var(--as);animation:spin .7s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+/* ── 右侧结果面板 ── */
+.results{padding:16px;overflow-y:auto;display:flex;flex-direction:column;gap:12px;}
+
+/* vision 画布区 */
+.vision-ws{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;}
+.ws-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;gap:8px;flex-wrap:wrap;}
+.ws-title{font-size:11px;font-weight:600;color:var(--muted);}
+.legend{display:flex;gap:8px;flex-wrap:wrap;}
+.legend-item{display:flex;align-items:center;gap:4px;font-size:10px;color:var(--muted);}
+.legend-dot{width:8px;height:8px;border-radius:50%;}
+.canvas-wrap{position:relative;display:inline-block;border-radius:8px;overflow:hidden;border:1px solid var(--border);background:#000;max-width:100%;}
+.canvas-wrap img{display:block;max-width:100%;height:auto;}
+#dotCanvas{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;}
+
+/* 对比摘要表 */
+.summary{background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;}
+.summary-head{padding:10px 14px;border-bottom:1px solid var(--border);font-size:11px;font-weight:600;color:var(--muted);}
+.summary-table{width:100%;border-collapse:collapse;font-size:11px;}
+.summary-table th{padding:7px 10px;text-align:left;color:var(--muted);font-weight:500;border-bottom:1px solid var(--border);}
+.summary-table td{padding:7px 10px;border-bottom:1px solid rgba(255,255,255,.04);}
+.summary-table tr:last-child td{border-bottom:none;}
+.best{color:var(--green);font-weight:600;}
+
+/* 历史列表 */
+.history-head{display:flex;align-items:center;justify-content:space-between;}
+.history-head span{font-size:11px;font-weight:600;color:var(--muted);}
+.count-badge{background:var(--bdg);border-radius:20px;padding:2px 8px;font-size:10px;color:var(--muted);}
+.empty{text-align:center;padding:32px;color:var(--muted);font-size:12px;}
+
+/* 历史卡片 */
+.hist-card{background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;transition:.2s;}
+.hist-head{display:flex;align-items:center;justify-content:space-between;padding:9px 13px;background:var(--btn-bg);}
+.hist-model{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;}
+.hist-badges{display:flex;align-items:center;gap:6px;}
+.time-badge{font-family:'JetBrains Mono',monospace;font-size:10px;padding:2px 7px;border-radius:12px;background:var(--bdg);color:var(--muted);}
+.time-badge.fast{background:rgba(74,222,128,.12);color:var(--green);}
+.ok-badge{font-size:9px;padding:2px 6px;border-radius:10px;}
+.ok-badge.ok{background:rgba(74,222,128,.12);color:var(--green);}
+.ok-badge.fail{background:rgba(248,113,113,.12);color:var(--red);}
+.warmup-tag{font-size:9px;padding:2px 6px;border-radius:10px;background:rgba(250,204,21,.1);color:#facc15;}
+.hist-body{padding:10px 13px;}
+.coord-txt{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text);margin-bottom:6px;}
+.json-pre{background:rgba(0,0,0,.3);border-radius:7px;padding:8px 10px;font-size:10px;font-family:'JetBrains Mono',monospace;color:#a5f3fc;overflow-x:auto;white-space:pre-wrap;word-break:break-all;max-height:160px;overflow-y:auto;border:1px solid rgba(255,255,255,.05);}
+.json-pre.err{color:var(--red);}
+.speed-row{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;}
+.speed-row:last-child{border-bottom:none;}
+.speed-val{font-family:'JetBrains Mono',monospace;font-weight:600;}
+.bar-wrap{height:3px;background:rgba(255,255,255,.06);border-radius:2px;margin-top:8px;overflow:hidden;}
+.bar{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--as),var(--ae));transition:width .5s ease;}
+</style>
+<script>
+(function(){if(localStorage.getItem('qa_theme')==='light')document.documentElement.setAttribute('data-theme','light');})();
+</script>
+</head>
+<body>
+
+<!-- 顶栏 -->
+<div class="topbar">
+  <div class="topbar-left">
+    <div class="logo">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2v7.31"></path><path d="M14 9.3V2"></path><path d="M8.5 2h7"></path><path d="M14 9.3a6.5 6.5 0 1 1-4 0"></path><line x1="5.52" y1="16" x2="18.48" y2="16"></line></svg>
+    </div>
+    <div>
+      <div class="topbar h1" style="font-size:14px;font-weight:600;">模型测试台</div>
+      <div class="topbar-sub">单模型独立运行 · 历史结果对比</div>
+    </div>
+  </div>
+  <div style="display:flex; align-items:center; gap:16px;">
+    <button class="theme-toggle" id="themeToggleBtn" onclick="toggleTheme()" title="切换明/暗主题">
+        <!-- SVG -->
+    </button>
+    <a class="back" href="/" style="display:flex;align-items:center;gap:4px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg> 返回控制台</a>
+  </div>
+</div>
+
+<!-- Tab 选择 -->
+<div class="tabs">
+  <button class="tab-btn active" onclick="switchTab('intent',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"></path><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"></path></svg> 意图解析</button>
+  <button class="tab-btn" onclick="switchTab('vision',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg> 视觉定位</button>
+  <button class="tab-btn" onclick="switchTab('speed',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg> 速度基准</button>
+</div>
+
+<!-- 主布局 -->
+<div class="layout">
+
+  <!-- 左侧配置 -->
+  <div class="config">
+
+    <!-- 模型选择 -->
+    <div class="section">
+      <div class="sec-title">选择模型</div>
+      <div class="model-grid" id="modelGrid"></div>
+    </div>
+
+    <!-- 测试输入 (按 Tab 切换) -->
+    <div class="section">
+      <div id="inp-intent" class="tab-input active">
+        <label class="lbl">测试语句</label>
+        <textarea id="intentText" placeholder="例：帮我给晴天发一条微信说明天上午九点开会"></textarea>
+      </div>
+      <div id="inp-vision" class="tab-input">
+        <label class="lbl">上传截图</label>
+        <input type="file" id="visionFile" accept="image/*" onchange="onImgLoad(this)">
+        <label class="lbl" style="margin-top:6px;">元素描述</label>
+        <input type="text" id="visionDesc" placeholder="例：右上角的绿色 + 添加按钮">
+      </div>
+      <div id="inp-speed" class="tab-input">
+        <p style="font-size:11px;color:var(--muted);line-height:1.7;">
+          将发送固定中文 Prompt 测量推理速度。<br>
+          点击 <strong style="color:var(--text)">运行</strong> 即可开始，结果追加到历史。
+        </p>
+      </div>
+    </div>
+
+    <!-- 选项 -->
+    <div class="section">
+      <div class="warmup-row">
+        <input type="checkbox" id="warmupCheck">
+        <span>预热模式 <span style="font-size:9px;">（先发一次短包丢弃冷启动时间）</span></span>
+      </div>
+    </div>
+
+    <!-- 操作 -->
+    <div class="action-row">
+      <button class="run-btn" id="runBtn" onclick="runBenchmark()">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg> 运行
+      </button>
+      <button class="clear-btn" onclick="clearHistory()" style="display:flex;align-items:center;justify-content:center;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+      </button>
+    </div>
+    <div class="loading" id="mainLoading">
+      <div class="spinner"></div>
+      <span id="loadingTxt">正在请求模型...</span>
+    </div>
+
+  </div><!-- /config -->
+
+  <!-- 右侧结果 -->
+  <div class="results" id="resultsPanel">
+
+    <!-- Vision 画布工作台 -->
+    <div class="vision-ws" id="visionWS" style="display:none;">
+      <div class="ws-top">
+        <span class="ws-title">视觉定位画布</span>
+        <div class="legend" id="dotLegend"></div>
+        <div class="slider-row">
+          <label>标记大小</label>
+          <input type="range" id="dotSize" min="6" max="40" value="14" oninput="redrawDots()">
+          <span class="slider-val" id="dotSizeVal">14</span>
+        </div>
+      </div>
+      <div class="canvas-wrap">
+        <img id="visionPreview" src="" alt="">
+        <canvas id="dotCanvas"></canvas>
+      </div>
+    </div>
+
+    <!-- 对比摘要 -->
+    <div class="summary" id="summaryWrap" style="display:none;">
+      <div class="summary-head" style="display:flex; align-items:center; gap:5px;">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"></line><line x1="18" y1="20" x2="18" y2="4"></line><line x1="6" y1="20" x2="6" y2="16"></line></svg> 快速对比（本次 Tab 所有运行）
+      </div>
+      <table class="summary-table">
+        <thead><tr><th>模型</th><th>耗时</th><th>额外指标</th></tr></thead>
+        <tbody id="summaryBody"></tbody>
+      </table>
+    </div>
+
+    <!-- 历史 -->
+    <div class="history-head">
+      <span>历史记录</span>
+      <span class="count-badge" id="histCount">0 条</span>
+    </div>
+    <div id="histList"><div class="empty">选择模型并点击运行，结果将显示在这里</div></div>
+
+  </div><!-- /results -->
+</div><!-- /layout -->
+
+<script>
+// ── 模型注册表 ─────────────────────────────────────────────
+const MODELS = [
+  {id:'omlx_26b',  label:'Gemma 4 26B', engine:'oMLX',   color:'#60a5fa'},
+  {id:'omlx_31b',  label:'Gemma 4 31B', engine:'oMLX',   color:'#818cf8'},
+  {id:'ollama_26b',label:'Gemma 4 26B', engine:'Ollama', color:'#facc15'},
+  {id:'ollama_31b',label:'Gemma 4 31B', engine:'Ollama', color:'#fb923c'},
+];
+
+// ── 状态 ────────────────────────────────────────────────────
+let currentTab   = 'intent';
+let selectedModel = 'omlx_26b';
+let history      = {intent:[], vision:[], speed:[]};  // 每个 Tab 独立历史
+let visionDots   = [];   // 当前 vision tab 的所有坐标点 [{label,color,nx,ny}]
+let visionImgNW  = 0, visionImgNH = 0;  // 图片原始尺寸
+let visionB64    = '';
+
+// ── 主题与 SVG 常量 ──────────────────────────────────────────
+const SVG_MOON = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>`;
+const SVG_SUN = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>`;
+
+function toggleTheme() {
+    const root = document.documentElement;
+    const btn = document.getElementById('themeToggleBtn');
+    const isLight = root.getAttribute('data-theme') === 'light';
+    if (isLight) {
+        root.removeAttribute('data-theme');
+        if(btn) btn.innerHTML = SVG_MOON;
+        localStorage.setItem('qa_theme', 'dark');
+    } else {
+        root.setAttribute('data-theme', 'light');
+        if(btn) btn.innerHTML = SVG_SUN;
+        localStorage.setItem('qa_theme', 'light');
+    }
+}
+
+// ── 初始化 ──────────────────────────────────────────────────
+(function init() {
+  // 设置主题按钮初始状态
+  const btn = document.getElementById('themeToggleBtn');
+  if (btn) btn.innerHTML = document.documentElement.getAttribute('data-theme') === 'light' ? SVG_SUN : SVG_MOON;
+
+  // 渲染模型按钮
+  const grid = document.getElementById('modelGrid');
+  MODELS.forEach(m => {
+    const btn = document.createElement('button');
+    btn.className = 'model-btn' + (m.id === selectedModel ? ' selected' : '');
+    btn.dataset.id = m.id;
+    btn.style.setProperty('--dot-color', m.color);
+    btn.innerHTML = `
+      <span class="model-dot" style="background:${m.color}"></span>
+      <div>
+        <div class="model-name">${m.label}</div>
+        <div class="model-engine">${m.engine}</div>
+      </div>`;
+    btn.onclick = () => selectModel(m.id);
+    grid.appendChild(btn);
+  });
+})();
+
+// ── Tab ─────────────────────────────────────────────────────
+function switchTab(id, el) {
+  currentTab = id;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  document.querySelectorAll('.tab-input').forEach(p => p.classList.remove('active'));
+  document.getElementById('inp-'+id).classList.add('active');
+  renderHistory();
+  // vision 工作台显示控制
+  document.getElementById('visionWS').style.display = id==='vision' ? '' : 'none';
+}
+
+// ── 模型选择 ────────────────────────────────────────────────
+function selectModel(id) {
+  selectedModel = id;
+  document.querySelectorAll('.model-btn').forEach(b => {
+    b.classList.toggle('selected', b.dataset.id === id);
+  });
+}
+
+// ── 运行 ─────────────────────────────────────────────────────
+async function runBenchmark() {
+  const warmup = document.getElementById('warmupCheck').checked;
+  const m = MODELS.find(x => x.id === selectedModel);
+
+  document.getElementById('runBtn').disabled = true;
+  const loadEl = document.getElementById('mainLoading');
+  loadEl.classList.add('show');
+
+  const wTxt = warmup ? ' (含预热)' : '';
+  document.getElementById('loadingTxt').textContent =
+    `正在请求 ${m.engine} ${m.label}${wTxt}...`;
+
+  try {
+    if (currentTab === 'intent') await runIntent(warmup, m);
+    else if (currentTab === 'vision') await runVision(warmup, m);
+    else await runSpeed(warmup, m);
+  } catch(e) {
+    alert('请求失败：'+e.message);
+  } finally {
+    document.getElementById('runBtn').disabled = false;
+    loadEl.classList.remove('show');
+  }
+}
+
+// ── 意图解析 ─────────────────────────────────────────────────
+async function runIntent(warmup, m) {
+  const text = document.getElementById('intentText').value.trim();
+  if (!text) { alert('请输入测试语句'); return; }
+  const t_start = Date.now();
+  const res = await fetch('/api/benchmark/intent', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({text, model_id: m.id, warmup})
+  });
+  const d = await res.json();
+  const total_elapsed = (Date.now() - t_start) / 1000;
+  if (!d.success) { alert('失败：'+(d.error||'')); return; }
+  history.intent.unshift({...d, input: text, ts: Date.now(), total_elapsed});
+  renderHistory();
+}
+
+// ── 视觉定位 ─────────────────────────────────────────────────
+async function runVision(warmup, m) {
+  if (!visionB64) { alert('请先上传截图'); return; }
+  const desc = document.getElementById('visionDesc').value.trim();
+  if (!desc) { alert('请输入元素描述'); return; }
+  const t_start = Date.now();
+  const res = await fetch('/api/benchmark/vision', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      image_b64: visionB64, desc, model_id: m.id, warmup,
+      img_w: visionImgNW, img_h: visionImgNH
+    })
+  });
+  const d = await res.json();
+  const total_elapsed = (Date.now() - t_start) / 1000;
+  if (!d.success) { alert('失败：'+(d.error||'')); return; }
+  history.vision.unshift({...d, input: desc, ts: Date.now(), total_elapsed});
+
+  // 如果有归一化坐标，加入画布点
+  if (d.norm_coord) {
+    visionDots.push({label:d.label, color:d.color, nx:d.norm_coord.x, ny:d.norm_coord.y});
+    updateLegend();
+    redrawDots();
+  }
+  renderHistory();
+}
+
+// ── 速度基准 ─────────────────────────────────────────────────
+async function runSpeed(warmup, m) {
+  const t_start = Date.now();
+  const res = await fetch('/api/benchmark/speed', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({model_id: m.id, warmup})
+  });
+  const d = await res.json();
+  const total_elapsed = (Date.now() - t_start) / 1000;
+  if (!d.success) { alert('失败：'+(d.error||'')); return; }
+  history.speed.unshift({...d, ts: Date.now(), total_elapsed});
+  renderHistory();
+}
+
+// ── 图片上传 ─────────────────────────────────────────────────
+function onImgLoad(input) {
+  const file = input.files[0]; if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    visionB64 = e.target.result.split(',')[1];
+    const img = document.getElementById('visionPreview');
+    img.src = e.target.result;
+    img.onload = () => {
+      visionImgNW = img.naturalWidth;
+      visionImgNH = img.naturalHeight;
+      document.getElementById('visionWS').style.display = '';
+      // 新图片清空旧点
+      visionDots = [];
+      updateLegend();
+      clearCanvas();
+    };
+  };
+  reader.readAsDataURL(file);
+}
+
+// ── Canvas ───────────────────────────────────────────────────
+function clearCanvas() {
+  const c = document.getElementById('dotCanvas');
+  const img = document.getElementById('visionPreview');
+  c.width = img.clientWidth; c.height = img.clientHeight;
+  c.getContext('2d').clearRect(0,0,c.width,c.height);
+}
+
+function redrawDots() {
+  const sz = parseInt(document.getElementById('dotSize').value);
+  document.getElementById('dotSizeVal').textContent = sz;
+  const c = document.getElementById('dotCanvas');
+  const img = document.getElementById('visionPreview');
+  c.width = img.clientWidth; c.height = img.clientHeight;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  visionDots.forEach(pt => {
+    const px = pt.nx * c.width, py = pt.ny * c.height;
+    // 光晕
+    ctx.beginPath(); ctx.arc(px,py,sz+5,0,Math.PI*2);
+    ctx.fillStyle = pt.color+'28'; ctx.fill();
+    // 实心圆
+    ctx.beginPath(); ctx.arc(px,py,sz/2,0,Math.PI*2);
+    ctx.fillStyle = pt.color; ctx.fill();
+    // 十字
+    ctx.strokeStyle = pt.color; ctx.lineWidth = 1.5; ctx.globalAlpha = .7;
+    ctx.beginPath();
+    ctx.moveTo(px-sz,py); ctx.lineTo(px+sz,py);
+    ctx.moveTo(px,py-sz); ctx.lineTo(px,py+sz);
+    ctx.stroke(); ctx.globalAlpha = 1;
+  });
+}
+
+function updateLegend() {
+  const el = document.getElementById('dotLegend');
+  el.innerHTML = visionDots.map(pt =>
+    `<div class="legend-item">
+      <span class="legend-dot" style="background:${pt.color}"></span>
+      ${escHtml(pt.label)}
+    </div>`).join('');
+}
+
+window.addEventListener('resize', () => { if(visionDots.length) redrawDots(); });
+
+// ── 清空历史 ─────────────────────────────────────────────────
+function clearHistory() {
+  if (!confirm('确认清空当前 Tab 的历史记录？')) return;
+  history[currentTab] = [];
+  if (currentTab === 'vision') { visionDots = []; updateLegend(); clearCanvas(); }
+  renderHistory();
+}
+
+// ── 渲染历史 ─────────────────────────────────────────────────
+function renderHistory() {
+  const list = history[currentTab];
+  document.getElementById('histCount').textContent = list.length + ' 条';
+
+  // 对比摘要
+  renderSummary(list);
+
+  const el = document.getElementById('histList');
+  if (list.length === 0) {
+    el.innerHTML = '<div class="empty">运行测试后，结果将显示在这里</div>';
+    return;
+  }
+  el.innerHTML = list.map((r,i) => renderCard(r, i)).join('');
+}
+
+function renderCard(r, i) {
+  const m = MODELS.find(x => x.id === r.model_id) || {};
+  const warmupTag = r.warmup_elapsed != null
+    ? `<span class="warmup-tag">预热 ${r.warmup_elapsed}s</span>` : '';
+  const timeCls = isFastest(r) ? 'fast' : '';
+
+  let body = '';
+  if (currentTab === 'intent') {
+    const status = r.error ? 'fail' : (r.parsed_ok ? 'ok' : 'fail');
+    const statusTxt = r.error ? '✗ 请求失败' : (r.parsed_ok ? '✓ JSON 解析' : '✗ 解析失败');
+    body = `
+      <div class="hist-body">
+        <div style="margin-bottom:6px;font-size:10px;color:var(--muted);">
+          输入：<span style="color:var(--text)">${escHtml(r.input||'')}</span>
+        </div>
+        <span class="ok-badge ${status}" style="margin-bottom:8px;display:inline-block;">${statusTxt}</span>
+        ${r.error
+          ? `<div class="json-pre err">${escHtml(r.error)}</div>`
+          : `<pre class="json-pre">${escHtml(JSON.stringify(r.parsed||r.raw,null,2))}</pre>`}
+      </div>`;
+  } else if (currentTab === 'vision') {
+    const nc = r.norm_coord;
+    const coordTxt = nc
+      ? `像素: (${nc.px}, ${nc.py}) · 归一化: (${nc.x}, ${nc.y})`
+      : (r.error ? '请求失败' : '坐标解析失败');
+    const dotColor = m.color || '#fff';
+    body = `
+      <div class="hist-body">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:4px;">
+          描述：<span style="color:var(--text)">${escHtml(r.input||'')}</span>
+        </div>
+        <div class="coord-txt" style="color:${nc?'var(--text)':'var(--red)'}">
+          <span class="model-dot" style="background:${dotColor};display:inline-block;margin-right:4px;vertical-align:middle;"></span>
+          ${escHtml(coordTxt)}
+        </div>
+        ${r.error
+          ? `<div class="json-pre err">${escHtml(r.error)}</div>`
+          : `<pre class="json-pre">${escHtml(r.raw||'')}</pre>`}
+      </div>`;
+  } else {
+    // speed
+    const maxTps = Math.max(...history.speed.map(x=>x.tps||0));
+    const barPct = maxTps > 0 ? Math.round((r.tps||0)/maxTps*100) : 0;
+    body = `
+      <div class="hist-body">
+        <div class="speed-row"><span>Token/s</span>
+          <span class="speed-val" style="color:${isFastest(r)?'var(--green)':'var(--text)'}">${r.tps??'—'}</span></div>
+        <div class="speed-row"><span>输入 tokens</span><span class="speed-val">${r.prompt_tokens||'—'}</span></div>
+        <div class="speed-row"><span>输出 tokens</span><span class="speed-val">${r.completion_tokens||'—'}</span></div>
+        <div class="bar-wrap"><div class="bar" style="width:${barPct}%"></div></div>
+        ${r.preview?`<div style="margin-top:8px;font-size:10px;color:var(--muted);line-height:1.6">${escHtml(r.preview)}…</div>`:''}
+        ${r.error?`<div class="json-pre err" style="margin-top:8px">${escHtml(r.error)}</div>`:''}
+      </div>`;
+  }
+
+  return `
+    <div class="hist-card" id="hcard-${i}">
+      <div class="hist-head">
+        <div class="hist-model">
+          <span class="model-dot" style="background:${m.color||'#fff'}"></span>
+          ${escHtml(r.label||'')}
+        </div>
+        <div class="hist-badges" style="display:flex; flex-direction:column; align-items:flex-end;">
+          <div style="display:flex; gap:6px; align-items:center;">
+             ${warmupTag}
+             <span class="time-badge ${timeCls}">网终总计: ${fmtT(r.total_elapsed)}</span>
+             <span class="time-badge ${timeCls}" style="opacity:0.8;">纯推理: ${fmtT(r.elapsed)}</span>
+          </div>
+          <div style="font-size:9px;color:rgba(255,255,255,0.3);margin-top:2px;">
+             I/O及解析开销: ${r.total_elapsed && r.elapsed ? fmtT(r.total_elapsed - r.elapsed) : '—'}
+          </div>
+        </div>
+      </div>
+      ${body}
+    </div>`;
+}
+
+function renderSummary(list) {
+  const sw = document.getElementById('summaryWrap');
+  // 只统计成功没有 error 的记录
+  const validList = list.filter(r => !r.error);
+  if (validList.length < 2) { sw.style.display='none'; return; }
+  sw.style.display = '';
+
+  // 按 model_id 分组取最佳
+  const best = {};
+  validList.forEach(r => {
+    if (!best[r.model_id] || r.elapsed < best[r.model_id].elapsed) best[r.model_id] = r;
+  });
+  const rows = Object.values(best).sort((a,b)=>a.elapsed-b.elapsed);
+  const minT = rows[0].elapsed;
+
+  const tbody = document.getElementById('summaryBody');
+  tbody.innerHTML = rows.map(r => {
+    const extra = currentTab==='speed'
+      ? (r.tps != null ? r.tps+' tok/s' : '—')
+      : (currentTab==='vision' && r.norm_coord
+        ? `(${r.norm_coord.x}, ${r.norm_coord.y})`
+        : (r.parsed_ok != null ? (r.parsed_ok?'✓':'✗') : '—'));
+    const m = MODELS.find(x=>x.id===r.model_id)||{};
+    return `<tr>
+      <td><span class="model-dot" style="background:${m.color||'#fff'};display:inline-block;margin-right:5px;vertical-align:middle;"></span>${escHtml(r.label||'')}</td>
+      <td class="${r.elapsed===minT?'best':''}">${fmtT(r.elapsed)}</td>
+      <td style="color:var(--muted)">${extra}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── 辅助函数 ────────────────────────────────────────────────
+function isFastest(r) {
+  const list = history[currentTab];
+  if (list.length === 0) return false;
+  const minT = Math.min(...list.map(x=>x.elapsed));
+  return r.elapsed === minT;
+}
+
+function fmtT(s) {
+  return s >= 60 ? (s/60).toFixed(1)+' min' : s.toFixed(2)+' s';
+}
+
+function fmtDate(ts) {
+  const d = new Date(ts);
+  return d.getHours().toString().padStart(2,'0')+':'+
+    d.getMinutes().toString().padStart(2,'0')+':'+
+    d.getSeconds().toString().padStart(2,'0');
+}
+
+function escHtml(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
 </script>
 </body>
 </html>'''

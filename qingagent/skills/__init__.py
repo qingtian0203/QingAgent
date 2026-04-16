@@ -11,6 +11,8 @@ from .antigravity import AntigravitySkill
 from .qingtian_util import QingTianUtilSkill
 from .os_control import OSControlSkill
 from .minesweeper import MinesweeperSkill
+from .task_monitor import TaskMonitorSkill
+from .code_query import CodeQuerySkill
 from .base import BaseSkill
 
 
@@ -32,7 +34,7 @@ class SkillRegistry:
     def register(self, skill: BaseSkill):
         """注册一个 Skill"""
         self._skills[skill.app_name] = skill
-        print(f"📋 已注册 Skill：{skill.app_name} ({len(skill.get_intents())} 个意图)")
+        print(f"[*] 已注册 Skill：{skill.app_name} ({len(skill.get_intents())} 个意图)")
 
     def auto_register(self):
         """自动注册所有内置 Skill"""
@@ -42,6 +44,8 @@ class SkillRegistry:
         self.register(QingTianUtilSkill())
         self.register(OSControlSkill())
         self.register(MinesweeperSkill())
+        self.register(TaskMonitorSkill())
+        self.register(CodeQuerySkill())
 
     def get_all_skills(self) -> dict[str, BaseSkill]:
         return self._skills

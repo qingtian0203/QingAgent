@@ -18,13 +18,9 @@ from qingagent.core import vision, actions
 
 
 # ============================================================
-#  微信界面固定坐标（归一化 0-1000）
-#  基于实际测试数据，微信窗口布局稳定
+#  联系人定位与焦点策略（告别硬编码坐标）
+#  全流程采用 Cmd+F 以及基于 AppleOS 的默认焦点流转
 # ============================================================
-# 搜索框位置（左上角 "🔍 搜索"）—— 已由 Cmd+F 替代，保留备用
-SEARCH_BOX = {"rx": 140, "ry": 45}
-# 聊天输入框（右侧底部）
-CHAT_INPUT_BOX = {"rx": 650, "ry": 850}
 
 
 class WeChatSkill(BaseSkill):
@@ -49,8 +45,8 @@ class WeChatSkill(BaseSkill):
         
         self.add_intent(Intent(
             name="confirm_send_action",
-            description="当需要向微信补充按下回车键以确认发送前文处于待发送状态的消息/文件时使用。当用户说'确认发送'、'发送微信'时使用。",
-            examples=["微信确认发送"]
+            description="当需要向微信补充按下回车键以确认发送前文处于待发送状态的消息/文件时使用。严格对应用户的最终发送许可动作。",
+            examples=["微信确认发送", "执行微信确认发送", "确认发送微信"]
         ))
         self.add_intent(Intent(
             name="check_messages",
@@ -177,11 +173,11 @@ class WeChatSkill(BaseSkill):
         self.check_cancel()
         _time.sleep(0.5)  # 等聊天窗口切换动画完成
 
-        # 步骤 3：点击输入框（位置固定）
+        # 步骤 3：准备发送
+        # 优化说明：通过 Cmd+F 唤醒搜索并回车后，微信原生行为会自动将焦点锚定到文字输入框。
+        # 因此，这里彻底移除了之前 `actions.click_at_normalized` 的固定坐标（绝对坐标容易因窗口大小变化而失效），
+        # 我们利用系统的自然焦点流转，达到分辨率无关的优雅控制。
         self.check_cancel()
-        t0 = _time.time()
-        actions.click_at_normalized(self._window_rect, CHAT_INPUT_BOX)
-        print(f"⏱️ [输入框直接定位] 耗时：{_time.time() - t0:.1f}s")
 
         # 步骤 4：输入并发送
         self.check_cancel()
@@ -217,7 +213,8 @@ class WeChatSkill(BaseSkill):
         if mode == "fast":
             print("🚀 极速模式结界穿透：已绕过所有阻断机制，直接发送！")
             _time.sleep(0.5)
-            actions.press_key("enter")
+            import subprocess
+            subprocess.run(["osascript", "-e", 'tell application "System Events" to key code 36'])  # 强力触发 Mac 物理回车
             return {
                 "success": True,
                 "message": f"🚀 安全限制解除：已将消息极限盲发给 **{contact}**。请注意操作不可逆。",
@@ -311,8 +308,10 @@ class WeChatSkill(BaseSkill):
         time.sleep(0.3)  # 确认发送前等微信窗口激活稳定
         
         # 只敲下最后的审判回车
-        from qingagent.core import actions
-        actions.press_key("enter")
+        # macOS 强力回车注入：使用 osascript 发送 key code 36（主键盘区回车）
+        # 完全绕过 pyautogui 的键位映射问题，100% 触发微信的发送事件
+        import subprocess
+        subprocess.run(["osascript", "-e", 'tell application "System Events" to key code 36'])
         return {
             "success": True,
             "message": "已成功确认并触发发送动作！🎯",

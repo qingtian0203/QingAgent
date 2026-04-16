@@ -166,6 +166,8 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             self._benchmark_vision()
         elif parsed.path == "/api/benchmark/speed":
             self._benchmark_speed()
+        elif parsed.path == "/api/benchmark/ag":
+            self._benchmark_ag()
         else:
             self.send_error(404)
 
@@ -190,6 +192,19 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
 
         try:
             cancel_check = lambda: _tasks.get(task_id, {}).get("status") == "cancelled"
+
+            # [硬编码指令拦截]：彻底绕过大模型的解析幻觉
+            if command.strip() in ["执行微信确认发送", "微信确认发送", "确认发送微信"]:
+                from ..skills.wechat import WeChatSkill
+                skill = WeChatSkill()
+                result = skill.execute_confirm_send_action({})
+                if not cancel_check():
+                    _tasks[task_id] = {"status": "done", "result": result}
+                return
+            elif command.strip() == "已取消发件":
+                if not cancel_check():
+                    _tasks[task_id] = {"status": "done", "result": {"success": True, "message": "发送操作已安全中止！", "data": None}}
+                return
 
             # 进度回调：执行多步骤任务链时，把每步进度写入任务状态供前端轮询
             def progress_callback(current_step: int, total_steps: int, description: str):
@@ -556,6 +571,142 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
         except Exception as e:
             self._json_response({"success": False, "error": str(e)})
 
+    def _benchmark_ag(self):
+        """AG识别测试：通过OSControlSkill走QQ截图（无需录屏权限），测试读额度/读模型/切换模型"""
+        import time
+        import base64
+        import io
+        from PIL import Image
+        try:
+            data = self._read_post_body()
+            action = data.get("action", "read_quota")
+
+            from qingagent.core import vision, window, actions
+            from qingagent.skills.os_control import OSControlSkill
+
+            # ── 用 OSControlSkill 截取 Cursor 窗口（走QQ截图，不触发录屏权限）──
+            skill = OSControlSkill()
+            result = skill.execute_app_screenshot({"app_name": "Antigravity"})
+            if not result.get("success") or not result.get("data", {}).get("screenshot_path"):
+                self._json_response({"success": False, "error": f"截图失败: {result.get('message', '')}"})
+                return
+
+            screenshot_path = result["data"]["screenshot_path"]
+
+            # 读取截图文件 → base64（Python只做IO，无TCC问题）
+            img_full = Image.open(screenshot_path)
+            img_w, img_h = img_full.size
+
+            def img_to_b64(img):
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+            # 等窗口稳定后再继续（QQ截图完成后Cursor窗口依然在前台）
+            time.sleep(0.3)
+
+            t0 = time.time()
+
+            if action == "read_quota":
+                # ── 裁剪底部40px状态栏读取Group额度 ──
+                bottom_strip = img_full.crop((0, img_h - 40, img_w, img_h))
+                raw = vision.read_screen_content(
+                    img_to_b64(bottom_strip),
+                    question="找到文字'Group 1:'后面跟着的百分比数字，以及'Group 3:'后面跟着的百分比数字。只返回纯JSON格式：{\"group1\": 整数, \"group3\": 整数}，不要其他文字。",
+                    context="这是软件底部状态栏，格式类似：Group 1: 80% | Group 3: 15%"
+                )
+                elapsed = round(time.time() - t0, 3)
+                self._json_response({
+                    "success": True, "action": action,
+                    "elapsed": elapsed, "raw": raw,
+                    "description": "读取底部状态栏 Group1(Gemini) / Group3(Claude) 额度"
+                })
+
+            elif action == "read_model":
+                # ── 用全图读取当前模型名 ──
+                raw = vision.read_screen_content(
+                    img_to_b64(img_full),
+                    question="在Antigravity对话面板底部工具栏中，'Planning'右边、'MCP Error'左边显示的当前模型名称是什么？只返回模型名称文字，不要其他内容。",
+                    context="这是AI对话面板底部状态栏"
+                )
+                elapsed = round(time.time() - t0, 3)
+                self._json_response({
+                    "success": True, "action": action,
+                    "elapsed": elapsed, "raw": raw,
+                    "description": "读取当前模型名（Planning右侧按钮）"
+                })
+
+            elif action in ("switch_gemini", "switch_claude"):
+                # ── 先定位切换按钮（从已有截图），再用 window_rect 做点击 ──
+                win_result = window.find_window(["Cursor", "Antigravity", "cursor"], silent=True)
+                if not win_result:
+                    self._json_response({"success": False, "error": "截图后找不到窗口坐标"})
+                    return
+                window_rect = win_result["rect"]
+
+                img_b64 = img_to_b64(img_full)
+                btn_coords = vision.find_element(
+                    img_b64,
+                    description="Antigravity对话面板底部工具栏中，左边'Planning'文字右边且'MCP Error'文字左边的当前模型名称按钮",
+                    context="这是AI对话面板底部状态栏，不是代码编辑区"
+                )
+                step1_ok = btn_coords is not None
+                step1_info = f"按钮坐标: {btn_coords}" if btn_coords else "未找到模型切换按钮"
+
+                step2_ok = False
+                step2_info = "跳过（step1失败）"
+                if btn_coords:
+                    actions.click_at_normalized(window_rect, btn_coords)
+                    time.sleep(0.7)
+
+                    # 点击后菜单弹出 → 再截一张（这次仍然走QQ截图）
+                    result2 = skill.execute_app_screenshot({"app_name": "Antigravity"})
+                    if result2.get("success") and result2["data"].get("screenshot_path"):
+                        img2 = Image.open(result2["data"]["screenshot_path"])
+                        
+                        # 物理外挂：把除了右下方弹窗区域以外的地方全部涂白！
+                        # 既避免了 AI 看到代码导致错乱，又不需要做复杂的坐标系换算（因为图片原始大小没变）
+                        from PIL import ImageDraw
+                        draw = ImageDraw.Draw(img2)
+                        w, h = img2.size
+                        # 涂白左侧 50% 和 顶部 60% 的区域
+                        draw.rectangle([0, 0, w, int(h * 0.6)], fill="white")
+                        draw.rectangle([0, 0, int(w * 0.5), h], fill="white")
+                        
+                        img2_b64 = img_to_b64(img2)
+
+                        if action == "switch_gemini":
+                            hint = "屏幕右下角的灰色浮层菜单中的一项，文字包含 'Gemini 3.1 Pro (High)'"
+                        else:
+                            hint = "屏幕右下角的灰色浮层菜单中的一项，文字包含 'Claude Sonnet 4.6 (Thinking)'"
+
+                        menu_coords = vision.find_element(
+                            img2_b64, 
+                            description=hint,
+                            context="警告！屏幕中间可能有包含这段文字的 Python 源代码，绝对不要点击代码编辑区！你必须且只能在屏幕右下角弹出的黑色/灰色浮动菜单中寻找！"
+                        )
+                        step2_ok = menu_coords is not None
+                        step2_info = f"目标菜单项坐标: {menu_coords}" if menu_coords else "未找到目标菜单项"
+
+                        if menu_coords:
+                            actions.click_at_normalized(window_rect, menu_coords)
+                            time.sleep(0.4)
+
+                elapsed = round(time.time() - t0, 3)
+                target_name = "Gemini 3.1 Pro (High)" if action == "switch_gemini" else "Claude Sonnet 4.6 (Thinking)"
+                self._json_response({
+                    "success": step1_ok and step2_ok,
+                    "action": action, "elapsed": elapsed,
+                    "raw": f"Step1(找切换按钮): {'✅' if step1_ok else '❌'} {step1_info} | Step2(找菜单项): {'✅' if step2_ok else '❌'} {step2_info}",
+                    "description": f"切换到 {target_name}"
+                })
+            else:
+                self._json_response({"success": False, "error": f"未知action: {action}"})
+
+        except Exception as e:
+            import traceback
+            self._json_response({"success": False, "error": str(e), "trace": traceback.format_exc()})
+
 
             capability_doc = _planner.registry.get_full_capability_description()
             prompt = f"""你是一个应用控制层，从用户指令中识别目标应用和操作意图。
@@ -703,14 +854,14 @@ def start_server(host: str = None, port: int = None):
 
     worker = threading.Thread(target=_task_worker, daemon=True, name="task-worker")
     worker.start()
-    print("✅ 任务队列 Worker 已启动（串行执行，防止物理操作并发冲突）")
+    print("[✓] 任务队列 Worker 已启动（串行执行，防止并发冲突）")
 
     server = ThreadedHTTPServer((h, p), QingAgentHandler)
-    print(f"\n{'='*50}")
-    print(f"🚀 QingAgent Web 服务已启动")
-    print(f"🌐 本机访问: http://localhost:{p}")
-    print(f"📱 手机访问: http://{local_ip}:{p}")
-    print(f"{'='*50}\n")
+    print(f"\n{'-'*54}")
+    print(f"[*] QingAgent Web 服务已启动")
+    print(f" -> 本机访问: http://localhost:{p}")
+    print(f" -> 手机访问: http://{local_ip}:{p}")
+    print(f"{'-'*54}\n")
 
     try:
         server.serve_forever()
@@ -1041,6 +1192,35 @@ def _get_ui_html() -> str:
             padding: 0 4px;
         }
 
+        /* 用户消息重用按鈕 */
+        .msg-row.user .reuse-btn {
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            border: none;
+            background: transparent;
+            color: var(--text-secondary);
+            font-size: 14px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0.35; /* 默认微隐可见，避免纯隐藏找不到 */
+            transition: all 0.2s ease;
+            margin-bottom: 6px;
+        }
+        .msg-row.user:hover .reuse-btn {
+            opacity: 0.7;
+        }
+        .msg-row.user .reuse-btn:hover {
+            opacity: 1;
+            color: var(--accent-start);
+            background: rgba(99,102,241,0.12);
+        }
+        .msg-row.user .reuse-btn:active {
+            transform: scale(0.9);
+        }
+
         /* 加载动画 */
         .loading-dots {
             display: inline-flex;
@@ -1338,7 +1518,20 @@ def _get_ui_html() -> str:
             _history.forEach(item => {
                 const row = document.createElement('div');
                 row.className = `msg-row ${item.role} ${item.cls || ''}`;
-                row.innerHTML = `<div class="msg-bubble">${item.html}</div><div class="msg-time">${item.time || ''}</div>`;
+                
+                if (item.role === 'user') {
+                    const escaped = (item.html || '').replace(/"/g, '&quot;');
+                    row.innerHTML = `
+                        <div style="display:flex; align-items:flex-end; gap:6px;">
+                            <button class="reuse-btn" title="再次发送" onclick="reuseMsg(this)" data-text="${escaped}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"></polyline><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path></svg></button>
+                            <div class="msg-bubble">${item.html}</div>
+                        </div>
+                        <div class="msg-time">${item.time || ''}</div>
+                    `;
+                } else {
+                    row.innerHTML = `<div class="msg-bubble">${item.html}</div><div class="msg-time">${item.time || ''}</div>`;
+                }
+                
                 chatArea.appendChild(row);
             });
             setTimeout(() => { chatArea.scrollTop = chatArea.scrollHeight; }, 100);
@@ -1477,10 +1670,24 @@ def _get_ui_html() -> str:
         const timeStr = now();
         const row = document.createElement('div');
         row.className = `msg-row ${type} ${cls}`;
-        row.innerHTML = `
-            <div class="msg-bubble">${html}</div>
-            <div class="msg-time">${timeStr}</div>
-        `;
+
+        if (type === 'user') {
+            // 用户消息：附加一个重用按鈕，通过 flex 与气泡并排显示
+            const escaped = html.replace(/"/g, '&quot;');
+            row.innerHTML = `
+                <div style="display:flex; align-items:flex-end; gap:6px;">
+                    <button class="reuse-btn" title="再次发送" onclick="reuseMsg(this)" data-text="${escaped}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"></polyline><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path></svg></button>
+                    <div class="msg-bubble">${html}</div>
+                </div>
+                <div class="msg-time">${timeStr}</div>
+            `;
+        } else {
+            row.innerHTML = `
+                <div class="msg-bubble">${html}</div>
+                <div class="msg-time">${timeStr}</div>
+            `;
+        }
+
         chatArea.appendChild(row);
         chatArea.scrollTop = chatArea.scrollHeight;
         
@@ -1493,6 +1700,16 @@ def _get_ui_html() -> str:
             saveHistory();
         }
         return row;
+    }
+
+    // 重用按鈕回调：将此条消息填回输入框
+    function reuseMsg(btn) {
+        const text = btn.getAttribute('data-text').replace(/&quot;/g, '"');
+        cmdInput.value = text;
+        cmdInput.focus();
+        // 轻微闪烁反馈：按鈕变为彩色再恢复
+        btn.style.color = 'var(--success)';
+        setTimeout(() => { btn.style.color = ''; }, 600);
     }
 
     // 清缓存强制刷新——解决浏览器缓存旧版 JS/CSS 的问题
@@ -1699,8 +1916,8 @@ def _get_ui_html() -> str:
                         const dir = getDir(item.path);
                         content += `
                         <div style="
-                            background: rgba(255,255,255,0.03);
-                            border: 1px solid rgba(255,255,255,0.07);
+                            background: var(--bg-card-inner);
+                            border: 1px solid var(--border);
                             border-radius: 10px;
                             padding: 10px 12px;
                             cursor: pointer;
@@ -1710,7 +1927,7 @@ def _get_ui_html() -> str:
                             gap: 12px;
                         " 
                         onmouseover="this.style.background='rgba(102,126,234,0.12)'; this.style.borderColor='rgba(102,126,234,0.35)';"
-                        onmouseout="this.style.background='rgba(255,255,255,0.03)'; this.style.borderColor='rgba(255,255,255,0.07)';"
+                        onmouseout="this.style.background='var(--bg-card-inner)'; this.style.borderColor='var(--border)';"
                         onclick="this.style.opacity='0.4'; this.style.pointerEvents='none'; quickSend('请发送：${escapedPath}');">
                             <div style="
                                 width: 36px; height: 36px;
@@ -1721,17 +1938,17 @@ def _get_ui_html() -> str:
                                 flex-shrink: 0;
                             ">${icon}</div>
                             <div style="flex:1; min-width:0;">
-                                <div style="font-size:13px; font-weight:500; color:#e2e8f0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${item.name}</div>
-                                <div style="font-size:10px; color:rgba(255,255,255,0.35); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${dir}</div>
+                                <div style="font-size:13px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${item.name}</div>
+                                <div style="font-size:10px; color:var(--text-secondary); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${dir}</div>
                             </div>
-                            <div style="font-size:10px; color:rgba(102,126,234,0.7); flex-shrink:0; padding: 2px 8px; background:rgba(102,126,234,0.1); border-radius:6px;">选择</div>
+                            <div style="font-size:10px; color:var(--accent-start); flex-shrink:0; padding: 2px 8px; background:rgba(90,111,232,0.1); border-radius:6px;">选择</div>
                         </div>`;
                     });
                     content += `
                     <button onclick="addMsg('已放弃文件选择', 'user'); this.parentElement.style.display='none';" 
-                     style="margin-top:2px; padding:7px; border-radius:8px; background:transparent; border:1px solid rgba(239,68,68,0.15); color:rgba(239,68,68,0.6); font-size:11px; cursor:pointer; width:100%; transition:0.2s;"
-                     onmouseover="this.style.background='rgba(239,68,68,0.07)'" 
-                     onmouseout="this.style.background='transparent'">
+                     style="margin-top:4px; padding:7px; border-radius:8px; background:transparent; border:1px solid var(--error); color:var(--error); opacity:0.7; font-size:11px; cursor:pointer; width:100%; transition:0.2s;"
+                     onmouseover="this.style.opacity='1'; this.style.background='rgba(239,68,68,0.07)';" 
+                     onmouseout="this.style.opacity='0.7'; this.style.background='transparent';">
                         ✕ 都不对，放弃本次操作
                     </button>
                     </div>`;
@@ -1740,22 +1957,22 @@ def _get_ui_html() -> str:
                 else if (d.type === 'confirm_send' && d.screenshot_path) {
                     const imgUrl = `/api/image?path=${encodeURIComponent(d.screenshot_path)}`;
                     content += `<div style="margin-top:8px;">
-                        <img src="${imgUrl}" alt="\u5f85\u786e\u8ba4\u622a\u56fe" style="width:100%; border-radius:10px; border:1px solid rgba(255,255,255,0.06); display:block;" />
-                        <div style="display:flex; align-items:center; justify-content:space-between; margin-top:8px; padding:8px 10px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.06); border-radius:8px;">
-                            <span style="font-size:11px; color:rgba(255,255,255,0.4); display:flex; align-items:center; gap:4px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg> \u5185\u5bb9\u5df2\u5c31\u7eea\uff0c\u5f85\u786e\u8ba4</span>
+                        <img src="${imgUrl}" alt="\u5f85\u786e\u8ba4\u622a\u56fe" style="width:100%; border-radius:10px; border:1px solid var(--border); display:block;" />
+                        <div style="display:flex; align-items:center; justify-content:space-between; margin-top:8px; padding:8px 10px; background:var(--bg-card-inner); border:1px solid var(--border); border-radius:8px;">
+                            <span style="font-size:11px; color:var(--text-secondary); display:flex; align-items:center; gap:4px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg> \u5185\u5bb9\u5df2\u5c31\u7eea\uff0c\u5f85\u786e\u8ba4</span>
                             <div style="display:flex; gap:8px;">
                                 <button
                                     onclick="quickSend('\u6267\u884c\u5fae\u4fe1\u786e\u8ba4\u53d1\u9001'); this.closest('div[style]').style.opacity='0.4'; this.closest('div[style]').style.pointerEvents='none';"
-                                    onmouseover="this.style.background='rgba(52,211,153,0.25)'; this.style.borderColor='rgba(52,211,153,0.5)';"
-                                    onmouseout="this.style.background='rgba(52,211,153,0.1)'; this.style.borderColor='rgba(52,211,153,0.25)';"
-                                    style="padding:5px 12px; background:rgba(52,211,153,0.1); border:1px solid rgba(52,211,153,0.25); border-radius:6px; color:#6ee7b7; font-size:11px; font-weight:500; cursor:pointer; transition:all 0.15s; display:flex; align-items:center; justify-content:center; gap:4px;">
+                                    onmouseover="this.style.opacity='0.8';"
+                                    onmouseout="this.style.opacity='1';"
+                                    style="padding:5px 12px; background:var(--success); border:none; border-radius:6px; color:#ffffff; font-size:11px; font-weight:500; cursor:pointer; transition:all 0.15s; display:flex; align-items:center; justify-content:center; gap:4px;">
                                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg> \u786e\u8ba4\u53d1\u9001
                                 </button>
                                 <button
                                     onclick="addMsg('\u5df2\u53d6\u6d88\u53d1\u4ef6', 'user'); this.parentElement.parentElement.style.opacity='0.3';"
-                                    onmouseover="this.style.background='rgba(239,68,68,0.15)'; this.style.borderColor='rgba(239,68,68,0.4)';"
-                                    onmouseout="this.style.background='transparent'; this.style.borderColor='rgba(255,255,255,0.12)';"
-                                    style="padding:5px 12px; background:transparent; border:1px solid rgba(255,255,255,0.12); border-radius:6px; color:rgba(255,255,255,0.45); font-size:11px; cursor:pointer; transition:all 0.15s; display:flex; align-items:center; justify-content:center; gap:4px;">
+                                    onmouseover="this.style.background='var(--error)'; this.style.color='#fff';"
+                                    onmouseout="this.style.background='transparent'; this.style.color='var(--text-secondary)';"
+                                    style="padding:5px 12px; background:transparent; border:1px solid var(--text-secondary); border-radius:6px; color:var(--text-secondary); font-size:11px; cursor:pointer; transition:all 0.15s; display:flex; align-items:center; justify-content:center; gap:4px;">
                                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg> \u53d6\u6d88
                                 </button>
                             </div>
@@ -2075,7 +2292,7 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
 .tab-btn.active{color:var(--text);background:var(--card);border-bottom-color:var(--as);}
 
 /* ── 主布局 ── */
-.layout{display:grid;grid-template-columns:320px 1fr;flex:1;overflow:hidden;}
+.layout{display:grid;grid-template-columns:380px 1fr;flex:1;overflow:hidden;}
 @media(max-width:760px){.layout{grid-template-columns:1fr;}}
 
 /* ── 左侧配置面板 ── */
@@ -2206,6 +2423,7 @@ input[type=file]{color:var(--muted);}
   <button class="tab-btn active" onclick="switchTab('intent',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"></path><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"></path></svg> 意图解析</button>
   <button class="tab-btn" onclick="switchTab('vision',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg> 视觉定位</button>
   <button class="tab-btn" onclick="switchTab('speed',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg> 速度基准</button>
+  <button class="tab-btn" onclick="switchTab('ag',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg> AG识别</button>
 </div>
 
 <!-- 主布局 -->
@@ -2237,6 +2455,31 @@ input[type=file]{color:var(--muted);}
           将发送固定中文 Prompt 测量推理速度。<br>
           点击 <strong style="color:var(--text)">运行</strong> 即可开始，结果追加到历史。
         </p>
+      </div>
+      <div id="inp-ag" class="tab-input">
+        <label class="lbl">测试操作</label>
+        <p style="font-size:11px;color:var(--muted);line-height:1.7;margin:0 0 8px;">
+          直接截取当前 Antigravity 窗口进行识别，无需选择 LLM 模型。<br>
+          选择下方操作后点击 <strong style="color:var(--text)">运行</strong>。
+        </p>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="radio" name="agAction" value="read_quota" checked>
+            <span style="font-size:12px;">📊 读取底部 Group1 / Group3 额度</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="radio" name="agAction" value="read_model">
+            <span style="font-size:12px;">🔍 读取当前模型名称（Planning右侧）</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="radio" name="agAction" value="switch_gemini">
+            <span style="font-size:12px;">🔄 切换到 Gemini 3.1 Pro (High) — Group1</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="radio" name="agAction" value="switch_claude">
+            <span style="font-size:12px;">🔄 切换到 Claude Sonnet 4.6 (Thinking) — Group3</span>
+          </label>
+        </div>
       </div>
     </div>
 
@@ -2317,7 +2560,7 @@ const MODELS = [
 // ── 状态 ────────────────────────────────────────────────────
 let currentTab   = 'intent';
 let selectedModel = 'omlx_26b';
-let history      = {intent:[], vision:[], speed:[]};  // 每个 Tab 独立历史
+let history      = {intent:[], vision:[], speed:[], ag:[]};  // 每个 Tab 独立历史
 let visionDots   = [];   // 当前 vision tab 的所有坐标点 [{label,color,nx,ny}]
 let visionImgNW  = 0, visionImgNH = 0;  // 图片原始尺寸
 let visionB64    = '';
@@ -2401,6 +2644,7 @@ async function runBenchmark() {
   try {
     if (currentTab === 'intent') await runIntent(warmup, m);
     else if (currentTab === 'vision') await runVision(warmup, m);
+    else if (currentTab === 'ag') await runAG();
     else await runSpeed(warmup, m);
   } catch(e) {
     alert('请求失败：'+e.message);
@@ -2408,6 +2652,35 @@ async function runBenchmark() {
     document.getElementById('runBtn').disabled = false;
     loadEl.classList.remove('show');
   }
+}
+
+// ── AG 识别测试 ─────────────────────────────────────────────
+async function runAG() {
+  const action = document.querySelector('input[name="agAction"]:checked')?.value;
+  if (!action) { alert('请选择测试操作'); return; }
+
+  const actionLabels = {
+    read_quota:    '📊 读取 Group 额度',
+    read_model:    '🔍 读取当前模型名',
+    switch_gemini: '🔄 切换到 Gemini 3.1 Pro (High)',
+    switch_claude: '🔄 切换到 Claude Sonnet 4.6 (Thinking)',
+  };
+  document.getElementById('loadingTxt').textContent = `正在执行: ${actionLabels[action]}...`;
+
+  const t_start = Date.now();
+  const res = await fetch('/api/benchmark/ag', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action})
+  });
+  const d = await res.json();
+  const total_elapsed = (Date.now() - t_start) / 1000;
+  history.ag.unshift({
+    ...d,
+    input: actionLabels[action] || action,
+    ts: Date.now(),
+    total_elapsed
+  });
+  renderHistory();
 }
 
 // ── 意图解析 ─────────────────────────────────────────────────
@@ -2467,19 +2740,42 @@ async function runSpeed(warmup, m) {
   renderHistory();
 }
 
-// ── 图片上传 ─────────────────────────────────────────────────
+// ── 图片上传及压缩 ─────────────────────────────────────────────
 function onImgLoad(input) {
   const file = input.files[0]; if (!file) return;
   const reader = new FileReader();
   reader.onload = e => {
-    visionB64 = e.target.result.split(',')[1];
     const img = document.getElementById('visionPreview');
-    img.src = e.target.result;
-    img.onload = () => {
-      visionImgNW = img.naturalWidth;
-      visionImgNH = img.naturalHeight;
+    // 创建一个背后隐藏的 Image 对象用于获取原始尺寸和压缩
+    const rawImg = new Image();
+    rawImg.src = e.target.result;
+    rawImg.onload = () => {
+      visionImgNW = rawImg.naturalWidth;
+      visionImgNH = rawImg.naturalHeight;
+      
+      // 进行长边 1200 的极致压缩，防止 OMLX 或 Nginx 处理大图超时 (504)
+      const MAX_SIDE = 1200;
+      let w = visionImgNW, h = visionImgNH;
+      if (w > MAX_SIDE || h > MAX_SIDE) {
+        if (w > h) { h = Math.round(h * MAX_SIDE / w); w = MAX_SIDE; }
+        else { w = Math.round(w * MAX_SIDE / h); h = MAX_SIDE; }
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      // 铺个白底防透明图
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(rawImg, 0, 0, w, h);
+      
+      // 提取压缩后的 base64 发给后端
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+      visionB64 = dataUrl.split(',')[1];
+      
+      // 显示到前端界面
+      img.src = dataUrl;
+      // 渲染画布
       document.getElementById('visionWS').style.display = '';
-      // 新图片清空旧点
       visionDots = [];
       updateLegend();
       clearCanvas();
@@ -2540,10 +2836,43 @@ function clearHistory() {
   renderHistory();
 }
 
+// ── AG 历史渲染 ──────────────────────────────────────────────
+function renderAGHistory(list) {
+  if (!list.length) return '<div class="empty">选择操作并点击运行，结果将显示在这里</div>';
+  return list.map(r => {
+    const ok = r.success;
+    const badge = ok
+      ? `<span style="color:#10b981;font-weight:600;">✅ 成功</span>`
+      : `<span style="color:#ef4444;font-weight:600;">❌ 失败</span>`;
+    const elapsed = r.elapsed ? `${r.elapsed}s` : '-';
+    const totalE = r.total_elapsed ? `${r.total_elapsed.toFixed(2)}s(含网络)` : '';
+    return `
+    <div class="hist-item" style="border-left:3px solid ${ok?'#10b981':'#ef4444'};">
+      <div class="hist-head">
+        <span class="hist-label" style="display:flex;align-items:center;gap:6px;">
+          ${escHtml(r.input||r.action||'')} ${badge}
+        </span>
+        <span class="hist-time">${elapsed} / ${totalE}</span>
+      </div>
+      <div class="hist-desc" style="font-size:11px;color:var(--muted);margin:4px 0 2px;">${escHtml(r.description||'')}</div>
+      <pre style="margin:4px 0 0;padding:0;font-size:12px;white-space:pre-wrap;word-break:break-all;line-height:1.6;">${escHtml(r.raw||r.error||'')}</pre>
+    </div>`;
+  }).join('');
+}
+
+
+
 // ── 渲染历史 ─────────────────────────────────────────────────
 function renderHistory() {
   const list = history[currentTab];
   document.getElementById('histCount').textContent = list.length + ' 条';
+
+  // AG Tab 独立渲染，不走 renderCard / renderSummary
+  if (currentTab === 'ag') {
+    document.getElementById('summaryWrap').style.display = 'none';
+    document.getElementById('histList').innerHTML = renderAGHistory(list);
+    return;
+  }
 
   // 对比摘要
   renderSummary(list);

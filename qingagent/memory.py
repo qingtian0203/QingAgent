@@ -51,9 +51,9 @@ class MemoryManager:
         try:
             with open(_MEMORY_FILE, "r", encoding="utf-8") as f:
                 self._static = json.load(f)
-            print(f"✅ [Memory] 记忆文件已加载：{_MEMORY_FILE}")
+            print(f"[+] [Memory] 记忆文件已加载：{_MEMORY_FILE}")
         except Exception as e:
-            print(f"❌ [Memory] 记忆文件加载失败：{e}")
+            print(f"[-] [Memory] 记忆文件加载失败：{e}")
 
     def reload(self):
         """热重载记忆文件（修改 memory.json 后无需重启）。"""

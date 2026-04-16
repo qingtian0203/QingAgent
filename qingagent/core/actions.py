@@ -49,7 +49,12 @@ def click_at_normalized(rect: tuple, coords: dict, delay: float = None):
     """
     px, py = normalized_to_physical(rect, coords["rx"], coords["ry"])
     print(f"🖱️ 点击 → ({px:.0f}, {py:.0f})")
-    pyautogui.click(px, py)
+    
+    # 将瞬间点击改为带短暂停留的点击，避免 Electron 菜单吃掉由于过快导致的点击事件
+    pyautogui.mouseDown(px, py)
+    time.sleep(0.05)
+    pyautogui.mouseUp(px, py)
+    
     time.sleep(delay or config.ACTION_DELAY)
 
 
@@ -61,7 +66,9 @@ def click_at_physical(x: float, y: float, delay: float = None):
         x, y: 屏幕物理坐标
         delay: 点击后等待
     """
-    pyautogui.click(x, y)
+    pyautogui.mouseDown(x, y)
+    time.sleep(0.05)
+    pyautogui.mouseUp(x, y)
     time.sleep(delay or config.ACTION_DELAY)
 
 
@@ -85,13 +92,28 @@ def type_text(text: str):
     """
     通过剪贴板粘贴文本 — 避免 pyautogui.write() 的中文兼容问题。
 
+    ⚠️ 注意：在 macOS 下，如果当前输入法是腾讯微信输入法(WeType)，
+    粘贴触发的 insertText: 回调会访问已释放的 Tkinter NSWindow 对象
+    导致 EXC_BAD_ACCESS (SIGSEGV) Crash。
+    修复方案：粘贴前强制切换到系统 ABC 输入法，完成后切回。
+
     参数:
         text: 要输入的文本（支持中文）
     """
+    import subprocess
+    # 切换到系统 ABC 输入法（安全），避免 WeType 与 Tkinter 的兼容性 crash
+    subprocess.run(
+        ["osascript", "-e",
+         'tell application "System Events" to key code 49 using {control down, shift down}'],
+        capture_output=True, timeout=3
+    )
+    time.sleep(0.15)
+    
     pyperclip.copy(text)
     pyautogui.hotkey("command", "v")
     time.sleep(0.3)
     print(f"⌨️ 已输入：{text[:50]}{'...' if len(text) > 50 else ''}")
+
 
 
 def press_key(key: str, delay: float = 0.3):

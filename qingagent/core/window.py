@@ -47,6 +47,7 @@ def find_window(app_aliases: list[str], _retry_count: int = 0, silent: bool = Fa
                     "rect": (int(bounds["X"]), int(bounds["Y"]), int(w), int(h)),
                     "size": w * h,
                     "owner": owner,
+                    "id": window.get("kCGWindowNumber", 0),
                 })
 
     if not found:
@@ -65,7 +66,7 @@ def find_window(app_aliases: list[str], _retry_count: int = 0, silent: bool = Fa
     if best["rect"][2] < config.MIN_WINDOW_WIDTH:
         if _retry_count > 3:
             print(f"❌ 唤醒缩略图失败多次，强行返回当前窗口大小。")
-            return {"rect": best["rect"], "owner": best["owner"]}
+            return {"rect": best["rect"], "owner": best["owner"], "id": best["id"]}
 
         print(f"⚠️ 检测到 {best['owner']} 缩略图（宽: {best['rect'][2]}, 高: {best['rect'][3]}），尝试唤醒... ({_retry_count + 1}/3)")
         import pyautogui
@@ -78,7 +79,7 @@ def find_window(app_aliases: list[str], _retry_count: int = 0, silent: bool = Fa
         time.sleep(config.THUMBNAIL_WAKE_DELAY)
         return find_window(app_aliases, _retry_count + 1)  # 递归重新查找
 
-    return {"rect": best["rect"], "owner": best["owner"]}
+    return {"rect": best["rect"], "owner": best["owner"], "id": best["id"]}
 
 
 

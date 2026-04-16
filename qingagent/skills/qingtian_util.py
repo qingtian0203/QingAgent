@@ -128,26 +128,69 @@ class QingTianUtilSkill(BaseSkill):
         }
 
     def execute_check_calendar(self, slots: dict) -> dict:
-        """查看日历任务"""
-        date = slots.get("date", "今天")
+        """查看日历任务（纯数据库直连，无需打开 UI）"""
+        date_raw = slots.get("date", "今天")
+        
+        import os, json, re
+        from datetime import datetime, timedelta
+        
+        # 1. 简易 NLP 日期推导
+        text = date_raw.strip().lower()
+        now = datetime.now()
+        target_date_str = now.strftime("%Y-%m-%d")
+        
+        if text in ["今天", "今日", "today"]:
+            target_date_str = now.strftime("%Y-%m-%d")
+        elif text in ["明天", "明日", "tomorrow"]:
+            target_date_str = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        elif text in ["昨天", "昨日", "yesterday"]:
+            target_date_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        elif text in ["后天"]:
+            target_date_str = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+        else:
+            match = re.search(r"(\d+)月(\d+)日", text)
+            if match:
+                try:
+                    target_date_str = datetime(now.year, int(match.group(1)), int(match.group(2))).strftime("%Y-%m-%d")
+                except: pass
 
-        if not self.activate():
-            return {"success": False, "message": "无法打开晴天Util", "data": None}
+        print(f"📅 [直连数据库] 查询日期：{date_raw} → {target_date_str}")
 
-        # 切到日历
-        self.find_and_click("日历 或 Calendar 的标签/按钮")
+        # 2. 直读本地持久化数据库，不打开任何 UI
+        db_path = os.path.expanduser("~/AIProject/QingUtil/data/calendar_data.json")
+        tasks = []
+        if os.path.exists(db_path):
+            try:
+                with open(db_path, "r", encoding="utf-8") as f:
+                    db_data = json.load(f)
+                
+                for t in db_data.get("tasks", []):
+                    if t.get("date") == target_date_str:
+                        project_label = t.get("project", "")
+                        type_label = t.get("type", "")
+                        task_type_str = f"{project_label} · {type_label}".strip(" ·")
+                        tasks.append({
+                            "title": t.get("content", ""),
+                            "task_type": task_type_str,
+                            "completed": bool(t.get("done", False))
+                        })
+                print(f"✅ [直连数据库] 命中 {len(tasks)} 条任务")
+            except Exception as e:
+                print(f"❌ 直连获取日历数据源失败: {e}")
+                return {"success": False, "message": f"读取数据库失败: {e}", "data": None}
+        else:
+            print(f"⚠️ 数据库文件不存在: {db_path}")
 
-        import time
-        time.sleep(1)
-
-        content = self.read_content(
-            f"请阅读日历中{date}的所有任务和日程安排，列出每项的标题和状态。"
-        )
-
+        no_task_msg = "当日暂无任务安排" if not tasks else f"共 {len(tasks)} 条任务"
         return {
             "success": True,
-            "message": f"{date}的日程",
-            "data": content,
+            "message": f"{date_raw}的日程查询完毕（{no_task_msg}）",
+            "data": {
+                "ui_type": "calendar_query",
+                "date": date_raw,
+                "target_date": target_date_str,
+                "tasks": tasks
+            }
         }
 
     def execute_add_calendar(self, slots: dict) -> dict:
@@ -179,13 +222,20 @@ class QingTianUtilSkill(BaseSkill):
             return {"success": False, "message": "无法打开晴天Util", "data": None}
 
         # 步骤 1：切到工作日历标签
+        # ⚠️ 先截一次热身图，确保 _last_screenshot_rect 已被赋值含 PAD 的扩边 rect
+        # 否则激活后第一次 find_and_click 会直接用无 PAD 的 _window_rect 做坐标换算导致点歪
+        self.screenshot()
         self.check_cancel()
         self.find_and_click("顶部标签栏中'工作日历'文字")
         _time.sleep(1)
 
         # 步骤 2：点击 "+ 添加" 按钮
+        # ⚠️ 注意：窗口右上角还有一个紫色"一键升级"大按钮，绝对不能点那个！
+        # 目标是日历右侧任务列表头部"4月XX日 周X"标题行最右边的绿色小"+ 添加"按钮
         self.check_cancel()
-        add_ok = self.find_and_click("右侧任务面板右上角的绿色'+ 添加'按钮")
+        add_ok = self.find_and_click(
+            "日历右侧任务列表区域顶部、日期标题行（如'4月14日 周二'）最右侧的绿色小'+ 添加'按钮，注意不要点窗口顶部的紫色'一键升级'按钮"
+        )
         if not add_ok:
             return {"success": False, "message": "找不到添加按钮", "data": None}
         _time.sleep(1)
@@ -203,7 +253,7 @@ class QingTianUtilSkill(BaseSkill):
             type_text = type_map.get(task_type, task_type) if task_type else ""
 
             elements = {
-                "input":    "'任务内容'标签下方的白色大输入框区域",
+                "input":    "标题'任务内容'正下方的极其宽大的纯白色、空白圆角矩形区域的绝对正中心处（这是输入框内部）",
                 "date_btn": f"日期区域下方快捷按钮中的'{date_raw}'按钮",
                 "confirm":  "底部右侧的绿色'✓ 确认添加'按钮",
             }
@@ -218,7 +268,7 @@ class QingTianUtilSkill(BaseSkill):
 
             def _fallback():
                 """批量定位失败时的逐步回退操作"""
-                self.find_and_click("'任务内容'标签下方的白色文本输入框区域（大的空白方框）")
+                self.find_and_click("标题'任务内容'正下方的巨大纯白色空白矩形区域的内部正中心")
                 _time.sleep(0.3)
                 actions.type_text(title)
                 _time.sleep(0.2)
@@ -272,7 +322,7 @@ class QingTianUtilSkill(BaseSkill):
 
             # 输入任务内容
             self.check_cancel()
-            content_ok = self.find_and_click("'任务内容'标签下方的白色文本输入框区域（大的空白方框）")
+            content_ok = self.find_and_click("标题'任务内容'正下方的巨大纯白色空白矩形区域的内部正中心")
             if content_ok:
                 _time.sleep(0.3)
                 actions.type_text(title)
@@ -329,8 +379,13 @@ class QingTianUtilSkill(BaseSkill):
 
         return {
             "success": save_ok,
-            "message": f"{'已添加' if save_ok else '添加失败'}日程：{title}",
-            "data": {"title": title, "date": date_raw, "type": task_type},
+            "message": f"{'已添加' if save_ok else '添加失败'}日程",
+            "data": {
+                "ui_type": "calendar_task", 
+                "title": title, 
+                "date": date_raw, 
+                "task_type": task_type
+            },
         }
 
 

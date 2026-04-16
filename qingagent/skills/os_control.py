@@ -222,45 +222,55 @@ class OSControlSkill(BaseSkill):
         if not win:
             return {"success": False, "message": f"系统底层未找到 {app_name} 对应的窗口句柄，可能已被隐藏或最小化", "data": app_name}
         
-        # 计算该应用窗口在屏幕上的绝对中心坐标
-        win_rect = win["rect"]  # (x, y, w, h)
-        abs_cx = win_rect[0] + win_rect[2] / 2
-        abs_cy = win_rect[1] + win_rect[3] / 2
-        print(f"⏱️ [探针] Quartz 搜寻窗口坐标耗时: {_time.time() - t0:.2f}s")
+        win_id = win.get("id")
+        if not win_id:
+            print(f"⚠️ [探针] 获取不到窗口 ID，系统级拦截或未授权。尝试回退原始坐标点击...")
+            return {"success": False, "message": f"拿不到 {app_name} 的底层 Window ID。请确认 QingUtil 拥有录屏权限！", "data": app_name}
+            
+        print(f"⏱️ [探针] Quartz 搜寻窗口坐标及 ID 耗时: {_time.time() - t0:.2f}s")
         
-        # 3. 开始边缘计算
+        # 3. 开始执行原生底层截图 (无需任何鼠标、键盘交互，无视遮挡)
         t0 = _time.time()
-        target_rect = getattr(self, '_last_screenshot_rect', self._window_rect)
-        norm_x = (abs_cx - target_rect[0]) / target_rect[2]
-        norm_y = (abs_cy - target_rect[1]) / target_rect[3]
-        center_pt = {
-            "rx": int(norm_x * 1000),
-            "ry": int(norm_y * 1000)
-        }
+        import subprocess
+        from datetime import datetime
+        import os
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_path = f"/tmp/qingagent_screenshot_{timestamp}.png"
         
-        # 将光标极速瞬移过去（穿透默认 duration=0.5s 的束缚）
-        actions.move_to(target_rect, center_pt, duration=0.05)
-        time.sleep(0.1) 
+        print(f"📸 启动 macOS 原生底层快门 (Window ID: {win_id})...")
+        # ⚠️ 注意：必须用 osascript 做中转，让「系统进程」去执行截图！
+        # 直接 subprocess.run(["screencapture",...]) 时，macOS TCC 会因为调用方是 Python 沙箱进程
+        # 而拦截录屏权限，导致截出来是全黑图片（文件正常存在但内容全黑）。
+        # 与 vision.py 的方案保持一致：委托 osascript 信任链规避 TCC 沙箱。
+        # -o 去掉窗口阴影，避免产生带透明像素的 RGBA 图（AI 识别时全黑）
+        apple_script = f'do shell script "screencapture -l {win_id} -o \\"{save_path}\\""'
+        ret = subprocess.run(["osascript", "-e", apple_script], capture_output=True, timeout=10)
         
-        # 触发截图结界 (Ctrl+Cmd+A)...
-        actions.hotkey("ctrl", "command", "a", delay=0.1)
-        time.sleep(0.4) # 必须给系统截图遮罩一个展开变黑的时间
+        if ret.returncode != 0 or not os.path.exists(save_path) or os.path.getsize(save_path) < 10:
+            err = ret.stderr.decode(errors="replace").strip()
+            print(f"⚠️ 截图失败 (returncode={ret.returncode}): {err}")
+            return {"success": False, "message": f"底层录屏失败：{err or '文件为空，请检查录屏权限'}", "data": app_name}
         
-        # 单击边缘吸附（强制覆盖 actions 库中默认的 0.6s ACTION_DELAY 死亡停顿）
-        actions.click_at_normalized(target_rect, center_pt, delay=0.05)
-        time.sleep(0.05) 
-        
-        # 收网：双击+回车
-        actions.double_click_at_normalized(target_rect, center_pt, delay=0.05)
-        time.sleep(0.05)
-        actions.press_key("enter", delay=0.05)
-        time.sleep(0.1) 
-        print(f"⏱️ [探针] 键盘鼠标截屏六连击耗时: {_time.time() - t0:.2f}s")
+        # 强制将 RGBA 透明通道合并到白色背景 → RGB，防止模型识别到全黑图
+        try:
+            from PIL import Image as _PIL_Image
+            _img = _PIL_Image.open(save_path)
+            if _img.mode in ("RGBA", "LA"):
+                _bg = _PIL_Image.new("RGB", _img.size, (255, 255, 255))
+                _bg.paste(_img, mask=_img.split()[-1])
+                _bg.save(save_path, format="PNG")
+            elif _img.mode != "RGB":
+                _img.convert("RGB").save(save_path, format="PNG")
+        except Exception as _e:
+            print(f"⚠️ 透明通道合并处理失败（无影响）: {_e}")
+            
+        print(f"⏱️ [探针] screencapture(osascript代理) 落盘耗时: {_time.time() - t0:.2f}s")
+        print(f"💾 截图已原生保存：{save_path}")
 
-        t0 = _time.time()
-        # 把剪贴板图片保存到磁盘
-        screenshot_path = self._save_clipboard_image()
-        print(f"⏱️ [探针] _save_clipboard_image 存盘耗时: {_time.time() - t0:.2f}s")
+        # 同步写入剪贴板（兼容之前依赖剪贴板的下一步意图流转）
+        actions.copy_image_to_clipboard(save_path)
+
+        screenshot_path = save_path
         print(f"🔥 [探针] System.app_screenshot 方法栈内总计真耗时: {_time.time() - t_start:.2f}s")
         return {
             "success": True,

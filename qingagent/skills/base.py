@@ -150,6 +150,9 @@ class BaseSkill:
             )
             print(f"✅ {self.app_name} 窗口就绪（等待了 {_time.time() - start_poll:.1f}s）：{self._window_rect}")
             print(f"⏱️ [激活应用] 耗时：{_time.time() - t0:.1f}s")
+            # 预热截图，确保 _last_screenshot_rect 已被赋值（含 PAD 扩边），
+            # 防止之后第一次 find_and_click 回退到无 PAD 的裸 _window_rect 导致偏移
+            self.screenshot()
             return True
         else:
             print(f"❌ 等待 {max_wait}s 仍无法找到 {self.app_name} 窗口")
@@ -164,14 +167,12 @@ class BaseSkill:
         import pyautogui
         screen_w, screen_h = pyautogui.size()
         x, y, w, h = self._window_rect
-        PAD = 200
-        
-        nx = max(0, x - PAD)
-        ny = max(0, y - PAD)
-        # 确保整体宽度和高度不越过屏幕边界
-        nw = min(screen_w - nx, w + (x - nx) + PAD)
-        nh = min(screen_h - ny, h + (y - ny) + PAD)
-        
+        # ⚠️ 不加任何 PAD！精确截取窗口本身。
+        # 原来 PAD=200 会把桌面、其他 App 图标、macOS 菜单栏都截进来，
+        # AI 模型在大图里迷失方向，找到"日历相关词汇"的其他元素。
+        # 弹窗/菜单出现在窗口外时，应通过 switch_to_popup() 切换到弹窗矩形来处理。
+        nx, ny, nw, nh = x, y, w, h
+
         self._last_screenshot_rect = (int(nx), int(ny), int(nw), int(nh))
         return vision.capture_screenshot(self._last_screenshot_rect, save_path)
 

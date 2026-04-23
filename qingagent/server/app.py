@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from .. import config
 from ..skills import SkillRegistry
 from ..planner.planner import Planner
+from .supervisor import supervisor_instance
 
 
 # 全局实例
@@ -71,6 +72,21 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
         elif parsed.path.startswith("/api/task/"):
             task_id = parsed.path.split("/")[-1]
             self._api_task_status(task_id)
+        elif parsed.path == "/api/supervisor/status":
+            self._json_response(supervisor_instance.get_status())
+        elif parsed.path == "/api/supervisor/pick_queue_file":
+            # 调用 macOS 系统文件选择对话框，返回所选文件的完整路径
+            import subprocess
+            result = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to set theFile to POSIX path of '
+                 '(choose file with prompt "选择任务队列文件" of type {"txt"})'],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                self._json_response({"success": True, "path": result.stdout.strip()})
+            else:
+                self._json_response({"success": False, "path": None})
         elif parsed.path == "/api/image":
             # 提供图片预览接口 (限 /tmp/ 目录下的 png 图片)
             from urllib.parse import parse_qs
@@ -162,12 +178,25 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             self._json_response({"success": True, "message": "🚨 紧急终止指令已发出"})
         elif parsed.path == "/api/benchmark/intent":
             self._benchmark_intent()
+        elif parsed.path == "/api/benchmark/code":
+            self._benchmark_code()
         elif parsed.path == "/api/benchmark/vision":
             self._benchmark_vision()
         elif parsed.path == "/api/benchmark/speed":
             self._benchmark_speed()
         elif parsed.path == "/api/benchmark/ag":
             self._benchmark_ag()
+        elif parsed.path == "/api/supervisor/start":
+            data = self._read_post_body()
+            interval = int(data.get("interval", 15))
+            max_loops = int(data.get("max_loops", 5))
+            contact = data.get("contact", "晴天小米")
+            queue_file = data.get("queue_file") or None  # 前端传来的队列文件路径（可选）
+            success = supervisor_instance.start(interval, max_loops, contact, queue_file=queue_file)
+            self._json_response({"success": success})
+        elif parsed.path == "/api/supervisor/stop":
+            supervisor_instance.stop()
+            self._json_response({"success": True})
         else:
             self.send_error(404)
 
@@ -343,13 +372,71 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                 "mode": "ollama", "url": "http://localhost:11434/api/generate",
                 "model": "gemma4:31b", "key": "",
             },
+            "omlx_qwen_35b": {
+                "id": "omlx_qwen_35b", "label": "Qwen 3.6 35B 4bit",
+                "color": "#10b981", "engine": "oMLX",
+                "mode": "openai", "url": "http://localhost:8000/v1",
+                # omlx 重启后模型 ID 为目录名，迁移前先保留 8080 备用
+                "model": "Qwen3.6-35B-A3B-4bit", "key": _cfg.API_KEY,
+            },
+            "omlx_qwen_claude_27b": {
+                "id": "omlx_qwen_claude_27b", "label": "oMLX · Claude 蒸馏版 27B",
+                "color": "#ec4899", "engine": "oMLX",
+                "mode": "openai", "url": "http://localhost:8000/v1",
+                "model": "Qwen3.5-27b-Claude-Distilled", "key": _cfg.API_KEY,
+            },
+            "omlx_qwen_35b_8bit": {
+                "id": "omlx_qwen_35b_8bit", "label": "Qwen 3.6 35B 8bit",
+                "color": "#059669", "engine": "oMLX",
+                "mode": "openai", "url": "http://localhost:8000/v1",
+                "model": "Qwen3.6-35B-A3B-8bit", "key": _cfg.API_KEY,
+            },
+            "ollama_qwen_35b": {
+                "id": "ollama_qwen_35b", "label": "Ollama · Qwen 3.6 35B",
+                "color": "#34d399", "engine": "Ollama",
+                "mode": "ollama", "url": "http://localhost:11434/api/generate",
+                "model": "qwen3.6:35b", "key": "",
+            },
         }
 
     @staticmethod
-    def _bench_call(mc: dict, prompt: str, image_b64: str = None, max_tokens: int = 512):
-        """统一模型调用，返回 (text, error, prompt_tokens, completion_tokens)"""
+    def _strip_thinking(text: str) -> str:
+        """
+        通用思维链剔除工具（支持两种格式）：
+        - mlx_lm 格式: <think>...</think>最终答案
+        - omlx 格式: 'Thinking Process:\\n\\n1. ...' 开头，完成后返回纯净答案
+          若 content 头部为思维链头（token 截断未完成），则返回占位提示
+        """
+        import re as _re
+        if not text:
+            return text
+        # 格式1: <think>...</think> 包裹（mlx_lm 输出）
+        clean = _re.sub(r'<think>[\s\S]*?</think>', '', text).strip()
+        if clean and clean != text:
+            return clean
+        # 格式2: "Thinking Process:" 或 "Here's a thinking process:" 开头
+        # omlx 在思维链完成时会把最终答案单独返回 content，这种情况 content 不会以此开头
+        # 以此开头说明 token 被截断、思维链未完成，返回占位
+        if _re.match(r"(?:Here's a thinking process|Thinking Process):", text, _re.IGNORECASE):
+            return "⚡ 思维链模式 · 答案将在下方代码分析中完整输出"
+        return text
+
+    @staticmethod
+    def _bench_call(mc: dict, prompt: str, image_b64: str = None,
+                    max_tokens: int = 512, extra_body: dict = None,
+                    strip_thinking: bool = True):
+        """
+        统一模型调用，返回 (text, error, prompt_tokens, completion_tokens)。
+        - strip_thinking=True（默认）：自动对 Qwen 模型升级 max_tokens 并剔除思维链
+        - 上层调用无需关心模型是否为思考型模型
+        """
         import requests as _req
         try:
+            # Qwen3 思维链自适应：需足够 token 才能完成思考并输出最终答案
+            is_qwen = "qwen" in mc.get("model", "").lower()
+            if strip_thinking and is_qwen and max_tokens < 2048:
+                max_tokens = 2048   # 思维链约消耗 1000-1500 tok，保证有空间写答案
+
             if mc["mode"] == "openai":
                 url = mc["url"].rstrip("/") + "/chat/completions"
                 hdr = {"Content-Type": "application/json"}
@@ -359,22 +446,45 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                 if image_b64:
                     content.append({"type": "image_url",
                                     "image_url": {"url": f"data:image/png;base64,{image_b64}"}})
-                resp = _req.post(url, json={
+                messages = [{"role": "user", "content": content}]
+                # 超时按 max_tokens 动态计算：8bit 大模型生成慢，给足时间
+                _timeout = max(120, int(max_tokens / 20))  # 约 20 tok/s 保守估计，最低 120s
+                req_body = {
                     "model": mc["model"],
-                    "messages": [{"role": "user", "content": content}],
-                    "stream": False, "max_tokens": max_tokens,
-                }, headers=hdr, timeout=120)
+                    "messages": messages,
+                    "stream": False,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.1,             # 强制使用低沉稳温度
+                    "frequency_penalty": 1.0,       # 增加出现惩罚以防死循环
+                }
+                resp = _req.post(url, json=req_body, headers=hdr, timeout=_timeout)
                 
                 rj = resp.json() 
                 if not resp.ok:
                     err_msg = rj.get("error", {}).get("message", str(rj)) if isinstance(rj.get("error"), dict) else str(rj.get("error", rj))
                     return None, f"HTTP {resp.status_code}: {err_msg}", 0, 0
                     
-                text = rj["choices"][0]["message"]["content"].strip()
+                msg = rj["choices"][0]["message"]
+                # mlx_lm 各版本字段名不统一：
+                #   4bit → content（含 <think> 块 或 omlx 格式思维链）
+                #   8bit → reasoning（纯推理文本，无 <think> 标签）
+                text = (msg.get("content") or msg.get("reasoning_content")
+                        or msg.get("reasoning") or "").strip()
                 usage = rj.get("usage", {})
+                # 通用思维链剔除（strip_thinking=True 时自动处理）
+                if strip_thinking:
+                    text = QingAgentHandler._strip_thinking(text)
                 return text, None, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
             else:  # ollama
-                body = {"model": mc["model"], "prompt": prompt, "stream": False}
+                body = {
+                    "model": mc["model"], 
+                    "prompt": prompt, 
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,         # 沉稳温度
+                        "repeat_penalty": 1.15      # 针对 Ollama 语法的防复读极限制
+                    }
+                }
                 if image_b64:
                     body["images"] = [image_b64]
                 resp = _req.post(mc["url"], json=body, timeout=120)
@@ -432,10 +542,29 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                 self._bench_call(mc, "好", max_tokens=8)
                 warmup_elapsed = round(time.time() - t0, 2)
 
-            # 正式测试
+            # Qwen3 模型禁用思维链，避免思维过程占据所有 token
+            is_qwen = "qwen" in mc.get("model", "").lower()
+            qwen_extra = {"_no_think": True} if is_qwen else None
+
+            # 正式测试：Qwen 思维链约需 1500 token，给足 2048 才能输出最终答案
+            speed_max_tokens = 2048 if is_qwen else 512
             t0 = time.time()
-            raw_text, error, pt, ct = self._bench_call(mc, prompt, max_tokens=512)
+            raw_text, error, pt, ct = self._bench_call(mc, prompt, max_tokens=speed_max_tokens, extra_body=qwen_extra)
             elapsed = round(time.time() - t0, 2)
+
+            # 剔除思维链（展示层清洁化）
+            is_thinking_mode = False
+            if raw_text:
+                import re as _sre
+                # 格式1: mlx_lm 4bit → <think>...</think>最终答案
+                _a = _sre.sub(r'<think>[\s\S]*?</think>', '', raw_text).strip()
+                if _a and _a != raw_text:
+                    raw_text = _a
+                # 格式2: omlx → 思维链未完成（token 耗尽仍在思考中）
+                elif _sre.match(r"(?:Here's a thinking process|Thinking Process):", raw_text, _sre.IGNORECASE):
+                    is_thinking_mode = True
+                    raw_text = "⚡ 思维链模式 · 答案将在代码分析时完整输出"
+
 
             # 解析 JSON
             parsed_ok, parsed_data = False, None
@@ -460,16 +589,149 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
         except Exception as e:
             self._json_response({"success": False, "error": str(e)})
 
+    def _benchmark_code(self):
+        """代码分析测试：本地文件读取 + 单模型"""
+        import time, os
+        try:
+            data = self._read_post_body()
+            file_path = data.get("file_path", "").strip()
+            text = data.get("text", "").strip()
+            model_id = data.get("model_id", "omlx_26b")
+            warmup = data.get("warmup", False)
+            context_paths = data.get("context_paths", [])  # 附加上下文文件路径列表
+
+            if not file_path:
+                self._json_response({"error": "本地文件路径不能为空"}); return
+            if not os.path.exists(file_path):
+                self._json_response({"error": f"找不到本地文件: {file_path}"}); return
+
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    code_content = f.read()
+            except Exception as e:
+                self._json_response({"error": f"读取文件失败: {e}"}); return
+
+            # ── 上下文窗口保护器 ──────────────────────────────────
+            # 粗估 Token 数：英文代码约 1 Token ≈ 4 字符
+            original_chars = len(code_content)
+            original_lines = code_content.count('\n')
+            EST_TOKENS_PER_CHAR = 0.28          # 保守估值（中英混合约 0.3）
+            PROMPT_OVERHEAD   = 300             # System Prompt 固定开销
+            OUTPUT_RESERVE    = 1500            # 留给模型输出
+            MAX_CTX           = 28000           # 保险线（模型上限 32768）
+            MAX_CODE_TOKENS   = MAX_CTX - PROMPT_OVERHEAD - OUTPUT_RESERVE
+            max_chars = int(MAX_CODE_TOKENS / EST_TOKENS_PER_CHAR)
+
+            truncated = False
+            if original_chars > max_chars:
+                truncated = True
+                # 策略：头部 65% + 尾部 25%，中间用省略符隔断
+                head_chars = int(max_chars * 0.65)
+                tail_chars = int(max_chars * 0.25)
+                head_part = code_content[:head_chars]
+                tail_part = code_content[-tail_chars:]
+                head_lines = head_part.count('\n')
+                tail_lines = tail_part.count('\n')
+                skip_lines = original_lines - head_lines - tail_lines
+                code_content = (
+                    head_part +
+                    f"\n\n// ════════════════════════════════════════════════════════\n"
+                    f"// ⚠️  [AI 智能截断]  文件过大，已省略中间约 {skip_lines} 行\n"
+                    f"// 文件全长: {original_lines} 行 / {original_chars:,} 字符\n"
+                    f"// ════════════════════════════════════════════════════════\n\n" +
+                    tail_part
+                )
+            # ─────────────────────────────────────────────────────────
+
+            models = self._bench_models()
+            mc = models.get(model_id)
+            if not mc:
+                self._json_response({"error": f"未知模型: {model_id}"}); return
+
+            trunc_tip = f"（⚠️ 文件超长，已自动截断至 {len(code_content):,} 字符，原始全长 {original_chars:,} 字符 / {original_lines} 行）" if truncated else ""
+
+            # ── 附加上下文文件注入 ────────────────────────────────────
+            # 附加文件通常是小型 JSON 知识图谱，独立 Token 预算约 3000
+            CTX_FILE_MAX_CHARS = 12000  # 约 3000 tokens，足够放几个 JSON
+            ctx_blocks = []
+            ctx_loaded = []
+            ctx_errors = []
+            for cp in (context_paths or []):
+                cp = cp.strip()
+                if not cp:
+                    continue
+                if not os.path.exists(cp):
+                    ctx_errors.append(f"找不到: {cp}")
+                    continue
+                try:
+                    with open(cp, "r", encoding="utf-8") as f:
+                        ctx_raw = f.read()
+                    if len(ctx_raw) > CTX_FILE_MAX_CHARS:
+                        ctx_raw = ctx_raw[:CTX_FILE_MAX_CHARS] + "\n... [文件过长，已截断]"
+                    fname = os.path.basename(cp)
+                    ctx_blocks.append(f"--- {fname} ---\n{ctx_raw}")
+                    ctx_loaded.append(fname)
+                except Exception as e:
+                    ctx_errors.append(f"{cp}: {e}")
+
+            ctx_section = ""
+            if ctx_blocks:
+                ctx_section = (
+                    "\n\n================附加知识图谱 (page_knowledge / docs)================\n"
+                    + "\n\n".join(ctx_blocks)
+                    + "\n================================================================"
+                )
+            # ─────────────────────────────────────────────────────────
+
+            prompt = f"""你是一个顶级的纯代码逆向与开发工程师。{trunc_tip}
+请仔细阅读以下给出的源代码文件，并针对用户的问题直接给出最专业的答复。
+如果提供了附加知识图谱，请结合知识图谱与源代码一起分析，给出跨层级的全局视角答复。
+
+================源代码内容================
+{code_content}
+==========================================
+{ctx_section}
+
+用户的问题是：「{text}」
+"""
+            # _bench_call 内部已自动处理 Qwen thinking（升级 max_tokens + 剔除思维链）
+            # 预热
+            warmup_elapsed = None
+            if warmup:
+                t0 = time.time()
+                self._bench_call(mc, "好", max_tokens=8)
+                warmup_elapsed = round(time.time() - t0, 2)
+
+            t0 = time.time()
+            raw_text, error, pt, ct = self._bench_call(mc, prompt, max_tokens=8192)
+            elapsed = round(time.time() - t0, 2)
+
+
+
+            if error:
+                self._json_response({"success": False, "error": error}); return
+
+            self._json_response({
+                "success": True,
+                "output": raw_text,
+                "elapsed": elapsed,
+                "warmup_elapsed": warmup_elapsed,
+                "prompt_tokens": pt,
+                "completion_tokens": ct
+            })
+        except Exception as e:
+            self._json_response({"success": False, "error": str(e)})
+
     def _benchmark_vision(self):
-        """视觉定位测试：单模型调用，支持预热"""
-        import time
+        """视觉定位测试：调用 vision.find_element 三段放大策略，生成阶段调试图"""
+        import time, os
         try:
             data = self._read_post_body()
             image_b64 = data.get("image_b64", "")
             desc = data.get("desc", "").strip()
             model_id = data.get("model_id", "omlx_26b")
             warmup = data.get("warmup", False)
-            img_w = data.get("img_w", 0)  # 图片原始宽高（用于像素坐标归一化）
+            img_w = data.get("img_w", 0)
             img_h = data.get("img_h", 0)
 
             if not image_b64 or not desc:
@@ -480,57 +742,83 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             if not mc:
                 self._json_response({"error": f"未知模型: {model_id}"}); return
 
-            prompt = f"""这是一张应用界面截图。
-请找到以下元素：{desc}
+            # ── 临时把前端选定的模型配置注入 config，让 vision 模块使用 ──
+            from .. import config as _cfg
+            _orig_mode  = getattr(_cfg, "API_MODE",  "openai")
+            _orig_url   = getattr(_cfg, "OLLAMA_URL", "")
+            _orig_model = getattr(_cfg, "VISION_MODEL", "")
+            _orig_key   = getattr(_cfg, "API_KEY", "")
+            try:
+                _cfg.API_MODE     = mc["mode"]
+                _cfg.OLLAMA_URL   = mc["url"] if mc["mode"] == "ollama" else mc["url"].rstrip("/") + "/chat/completions"
+                _cfg.VISION_MODEL = mc["model"]
+                _cfg.API_KEY      = mc.get("key", "")
 
-请仅返回一个严格 JSON（不要包含任何其他内容）：
-{{"x": 0, "y": 0}}
-其中 x, y 是元素中心点的千分比相对坐标（0 到 1000 之间的整数，例如 500 代表图片正中间）。"""
+                from ..core import vision as _vision
 
-            # 预热
-            warmup_elapsed = None
-            if warmup:
+                # 预热
+                warmup_elapsed = None
+                if warmup:
+                    t0 = time.time()
+                    self._bench_call(mc, "好", max_tokens=8)
+                    warmup_elapsed = round(time.time() - t0, 2)
+
+                # 记录 debug 目录调用前的文件集合（事后收集新生成的三段图）
+                debug_dir = "/tmp/qingagent_debug"
+                os.makedirs(debug_dir, exist_ok=True)
+                before_files = set(os.listdir(debug_dir))
+
+                # ── 调用三段放大定位引擎 ──
                 t0 = time.time()
-                self._bench_call(mc, "好", max_tokens=8)
-                warmup_elapsed = round(time.time() - t0, 2)
+                pos = _vision.find_element(image_b64, desc, context="这是一张应用界面截图")
+                elapsed = round(time.time() - t0, 2)
 
-            # 正式测试
-            t0 = time.time()
-            raw_text, error, pt, ct = self._bench_call(mc, prompt, image_b64=image_b64, max_tokens=64)
-            elapsed = round(time.time() - t0, 2)
+                # 收集此次新生成的三段 debug 截图
+                after_files = set(os.listdir(debug_dir))
+                new_files = sorted(after_files - before_files)
+                debug_imgs = []
+                for fname in new_files:
+                    fpath = os.path.join(debug_dir, fname)
+                    try:
+                        with open(fpath, "rb") as f:
+                            import base64 as _b64
+                            b64 = _b64.b64encode(f.read()).decode("utf-8")
+                        debug_imgs.append({"name": fname, "b64": b64})
+                    except Exception:
+                        pass
 
-            # 解析坐标
-            coord = None
-            if raw_text:
-                try:
-                    t = raw_text
-                    if t.startswith("```json"): t = t[7:]
-                    elif t.startswith("```"): t = t[3:]
-                    if t.endswith("```"): t = t[:-3]
-                    coord = json.loads(t.strip())
-                except Exception:
-                    import re
-                    m = re.search(r'"x"\s*:\s*([\d.]+).*?"y"\s*:\s*([\d.]+)', raw_text, re.S)
-                    if m:
-                        coord = {"x": float(m.group(1)), "y": float(m.group(2))}
+                # 构建归一化坐标（与原格式兼容）
+                norm_coord = None
+                coord = None
+                if pos:
+                    rx, ry = pos["rx"], pos["ry"]
+                    coord = {"x": rx, "y": ry}
+                    nx = rx / 1000.0
+                    ny = ry / 1000.0
+                    norm_coord = {
+                        "x": round(nx, 4), "y": round(ny, 4),
+                        "px": int(nx * img_w) if img_w else rx,
+                        "py": int(ny * img_h) if img_h else ry,
+                    }
 
-            # 归一化坐标（如果是千分比坐标 [0~1000] 则除以 1000）
-            norm_coord = None
-            if coord:
-                nx = coord["x"] / 1000.0 if coord["x"] > 1 else coord["x"]
-                ny = coord["y"] / 1000.0 if coord["y"] > 1 else coord["y"]
-                norm_coord = {"x": round(nx, 4), "y": round(ny, 4),
-                              "px": coord["x"], "py": coord["y"]}
+                self._json_response({
+                    "success": True,
+                    "model_id": model_id, "label": mc["label"], "color": mc["color"],
+                    "elapsed": elapsed, "warmup_elapsed": warmup_elapsed,
+                    "raw": str(pos), "coord": coord, "norm_coord": norm_coord,
+                    "debug_imgs": debug_imgs,
+                    "error": None,
+                })
+            finally:
+                # 恢复 config 原始值
+                _cfg.API_MODE     = _orig_mode
+                _cfg.OLLAMA_URL   = _orig_url
+                _cfg.VISION_MODEL = _orig_model
+                _cfg.API_KEY      = _orig_key
 
-            self._json_response({
-                "success": True,
-                "model_id": model_id, "label": mc["label"], "color": mc["color"],
-                "elapsed": elapsed, "warmup_elapsed": warmup_elapsed,
-                "raw": raw_text, "coord": coord, "norm_coord": norm_coord,
-                "error": error,
-            })
         except Exception as e:
             self._json_response({"success": False, "error": str(e)})
+
 
     def _benchmark_speed(self):
         """速度基准测试：单模型调用"""
@@ -554,7 +842,7 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                 self._bench_call(mc, "好", max_tokens=8)
                 warmup_elapsed = round(time.time() - t0, 2)
 
-            # 正式测试
+            # 正式测试（_bench_call 内已自动升级 Qwen token 上限并剔除思维链）
             t0 = time.time()
             text_out, error, pt, ct = self._bench_call(mc, prompt, max_tokens=512)
             elapsed = round(time.time() - t0, 2)
@@ -729,75 +1017,76 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
 }}"""
 
             results = []
-            # 模型配置：oMLX 26B/31B + Ollama 26B/31B
-            model_configs = [
-                {"id": "omlx_26b", "label": "oMLX · Gemma 4 26B",
-                 "mode": "openai", "url": "http://localhost:8000/v1",
-                 "model": "gemma-4-26b-a4b-it-4bit", "key": _cfg.API_KEY},
-                {"id": "omlx_31b", "label": "oMLX · Gemma 4 31B",
-                 "mode": "openai", "url": "http://localhost:8000/v1",
-                 "model": "gemma-4-31b-a4b-it-4bit", "key": _cfg.API_KEY},
-                {"id": "ollama_26b", "label": "Ollama · Gemma 4 26B",
-                 "mode": "ollama", "url": "http://localhost:11434/api/generate",
-                 "model": "gemma4:26b", "key": ""},
-                {"id": "ollama_31b", "label": "Ollama · Gemma 4 31B",
-                 "mode": "ollama", "url": "http://localhost:11434/api/generate",
-                 "model": "gemma4:31b", "key": ""},
-            ]
+            # 使用 _bench_models() 按 model_id 查找配置，支持所有模型（含 Qwen）
+            all_models = _bench_models()
+            mc = all_models.get(model_id)
+            if not mc:
+                self._json_response({"success": False, "error": f"未知 model_id: {model_id}"})
+                return
 
             import requests as _req
-            for mc in model_configs:
-                t0 = time.time()
-                raw_text = None
-                error = None
+            t0 = time.time()
+            raw_text = None
+            error = None
+            try:
+                if mc["mode"] == "openai":
+                    url = mc["url"].rstrip("/") + "/chat/completions"
+                    hdr = {"Content-Type": "application/json"}
+                    if mc.get("key"):
+                        hdr["Authorization"] = f"Bearer {mc['key']}"
+                    resp = _req.post(url, json={
+                        "model": mc["model"],
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": False, "max_tokens": 8192,
+                        "temperature": 0.1,
+                        "frequency_penalty": 1.0,
+                    }, headers=hdr, timeout=300)
+                    resp.raise_for_status()
+                    # Qwen3 thinking 模式：剔除 <think>...</think> 块，只取最终答案
+                    _msg = resp.json()["choices"][0]["message"]
+                    _full = (_msg.get("content") or _msg.get("reasoning_content") or "").strip()
+                    import re as _re
+                    _answer = _re.sub(r'<think>[\s\S]*?</think>', '', _full).strip()
+                    raw_text = _answer if _answer else _full  # 若 think 占满则展示全文
+                else:  # ollama
+                    resp = _req.post(mc["url"], json={
+                        "model": mc["model"], "prompt": prompt, "stream": False,
+                        "options": {"temperature": 0.1}
+                    }, timeout=180)
+                    resp.raise_for_status()
+                    raw_text = resp.json().get("response", "").strip()
+            except Exception as e:
+                error = str(e)
+
+            elapsed = round(time.time() - t0, 2)
+
+            # 尝试解析 JSON（兼容旧意图解析测试）
+            parsed_ok = False
+            parsed_data = None
+            if raw_text:
                 try:
-                    if mc["mode"] == "openai":
-                        url = mc["url"].rstrip("/") + "/chat/completions"
-                        hdr = {"Content-Type": "application/json"}
-                        if mc["key"]:
-                            hdr["Authorization"] = f"Bearer {mc['key']}"
-                        resp = _req.post(url, json={
-                            "model": mc["model"],
-                            "messages": [{"role": "user", "content": prompt}],
-                            "stream": False, "max_tokens": 512,
-                        }, headers=hdr, timeout=60)
-                        resp.raise_for_status()
-                        raw_text = resp.json()["choices"][0]["message"]["content"].strip()
-                    else:
-                        resp = _req.post(mc["url"], json={
-                            "model": mc["model"], "prompt": prompt, "stream": False
-                        }, timeout=90)
-                        resp.raise_for_status()
-                        raw_text = resp.json().get("response", "").strip()
-                except Exception as e:
-                    error = str(e)
+                    t = raw_text
+                    if t.startswith("```json"): t = t[7:]
+                    elif t.startswith("```"): t = t[3:]
+                    if t.endswith("```"): t = t[:-3]
+                    parsed_data = json.loads(t.strip())
+                    parsed_ok = True
+                except Exception:
+                    pass
 
-                elapsed = round(time.time() - t0, 2)
-
-                # 尝试解析 JSON
-                parsed_ok = False
-                parsed_data = None
-                if raw_text:
-                    try:
-                        t = raw_text
-                        if t.startswith("```json"): t = t[7:]
-                        elif t.startswith("```"): t = t[3:]
-                        if t.endswith("```"): t = t[:-3]
-                        parsed_data = json.loads(t.strip())
-                        parsed_ok = True
-                    except Exception:
-                        pass
-
-                results.append({
-                    "id": mc["id"], "label": mc["label"],
-                    "elapsed": elapsed,
-                    "raw": raw_text,
-                    "parsed_ok": parsed_ok,
-                    "parsed": parsed_data,
-                    "error": error,
-                })
+            results.append({
+                "id": mc["id"], "label": mc["label"],
+                "model_id": model_id,
+                "elapsed": elapsed,
+                "output": raw_text,   # 与前端 r.output 对齐
+                "raw": raw_text,
+                "parsed_ok": parsed_ok,
+                "parsed": parsed_data,
+                "error": error,
+            })
 
             self._json_response({"success": True, "results": results})
+
         except Exception as e:
             self._json_response({"success": False, "error": str(e)})
 
@@ -2421,9 +2710,11 @@ input[type=file]{color:var(--muted);}
 <!-- Tab 选择 -->
 <div class="tabs">
   <button class="tab-btn active" onclick="switchTab('intent',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"></path><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"></path></svg> 意图解析</button>
+  <button class="tab-btn" onclick="switchTab('code',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg> 代码分析</button>
   <button class="tab-btn" onclick="switchTab('vision',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg> 视觉定位</button>
   <button class="tab-btn" onclick="switchTab('speed',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg> 速度基准</button>
   <button class="tab-btn" onclick="switchTab('ag',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg> AG识别</button>
+  <button class="tab-btn" onclick="switchTab('supervisor',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20"></path><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg> AG 监工</button>
 </div>
 
 <!-- 主布局 -->
@@ -2433,7 +2724,7 @@ input[type=file]{color:var(--muted);}
   <div class="config">
 
     <!-- 模型选择 -->
-    <div class="section">
+    <div class="section" id="modelSec">
       <div class="sec-title">选择模型</div>
       <div class="model-grid" id="modelGrid"></div>
     </div>
@@ -2443,6 +2734,14 @@ input[type=file]{color:var(--muted);}
       <div id="inp-intent" class="tab-input active">
         <label class="lbl">测试语句</label>
         <textarea id="intentText" placeholder="例：帮我给晴天发一条微信说明天上午九点开会"></textarea>
+      </div>
+      <div id="inp-code" class="tab-input">
+        <label class="lbl">本地源代码绝对路径</label>
+        <input type="text" id="codeFilePath" placeholder="例：/Users/konglingjia/.../app.java">
+        <label class="lbl" style="margin-top:8px;">附加上下文文件路径 <span style="color:var(--muted);font-weight:400;">(可选，每行一个，如 page_knowledge/*.json)</span></label>
+        <textarea id="codeContextPaths" placeholder="例：/Users/konglingjia/.../docs/page_knowledge/MainActivity.json" style="min-height:38px;font-family:'JetBrains Mono',monospace;font-size:10px;"></textarea>
+        <label class="lbl" style="margin-top:6px;">审查诉求 / 分析问题</label>
+        <textarea id="codeText" placeholder="例：请找出这个文件里包含的网络参数 Key" style="min-height:40px;"></textarea>
       </div>
       <div id="inp-vision" class="tab-input">
         <label class="lbl">上传截图</label>
@@ -2481,10 +2780,42 @@ input[type=file]{color:var(--muted);}
           </label>
         </div>
       </div>
+      <div id="inp-supervisor" class="tab-input">
+        <label class="lbl">配置后台长任务监工参数</label>
+        <div style="display:flex; flex-direction:column; gap:12px; margin-top:8px;">
+
+            <!-- 任务队列文件选择（调系统文件选择框，不手动输入） -->
+            <div style="display:flex; flex-direction:column; gap:6px;">
+              <span style="font-size:11px; color:var(--muted); font-weight:500;">任务队列文件</span>
+              <div style="display:flex; align-items:center; gap:8px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:7px; padding:7px 10px;">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
+                <span id="supQueueFilePath" title="" style="flex:1; font-size:10px; color:var(--text); font-family:'JetBrains Mono',monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; opacity:0.8;">Fang_oa/docs/scan_queue.txt</span>
+                <button onclick="pickQueueFile()" style="flex-shrink:0; padding:4px 10px; border-radius:5px; border:1px solid rgba(102,126,234,0.4); background:rgba(102,126,234,0.12); color:#a5b4fc; font-size:11px; cursor:pointer; transition:all 0.18s; white-space:nowrap;" onmouseover="this.style.background='rgba(102,126,234,0.22)'" onmouseout="this.style.background='rgba(102,126,234,0.12)'">📂 选择文件</button>
+              </div>
+            </div>
+
+            <div style="display:flex; align-items:center; justify-content:space-between;">
+                <span style="font-size:12px; color:var(--muted);">轮询间隔 (秒)</span>
+                <input type="number" id="supInterval" value="15" style="width:100px; padding:4px 8px; border-radius:4px; border:1px solid #3f3f46; background:var(--card-bg); color:var(--text); font-family:var(--font-mono);">
+            </div>
+            <div style="display:flex; align-items:center; justify-content:space-between;">
+                <span style="font-size:12px; color:var(--muted);">接力续批次数上限</span>
+                <input type="number" id="supLoops" value="5" style="width:100px; padding:4px 8px; border-radius:4px; border:1px solid #3f3f46; background:var(--card-bg); color:var(--text); font-family:var(--font-mono);">
+            </div>
+            <div style="display:flex; align-items:center; justify-content:space-between;">
+                <span style="font-size:12px; color:var(--muted);">失败微信接警人</span>
+                <input type="text" id="supContact" value="晴天小米" style="width:100px; padding:4px 8px; border-radius:4px; border:1px solid #3f3f46; background:var(--card-bg); color:var(--text); font-family:var(--font-mono);">
+            </div>
+        </div>
+        <div style="display:flex; gap:12px; margin-top:16px;">
+            <button id="btnStartSup" onclick="startSupervisor()" style="flex:1; background:#10b981; color:#fff; border:none; padding:8px; border-radius:6px; cursor:pointer; font-weight:bold; transition:all 0.2s;">🚀 启动监工</button>
+            <button id="btnStopSup" onclick="stopSupervisor()" style="flex:1; background:#ef4444; color:#fff; border:none; padding:8px; border-radius:6px; cursor:pointer; font-weight:bold; transition:all 0.2s; opacity:0.5;" disabled>🛑 强行停止</button>
+        </div>
+      </div>
     </div>
 
     <!-- 选项 -->
-    <div class="section">
+    <div class="section" id="optSec">
       <div class="warmup-row">
         <input type="checkbox" id="warmupCheck">
         <span>预热模式 <span style="font-size:9px;">（先发一次短包丢弃冷启动时间）</span></span>
@@ -2551,16 +2882,20 @@ input[type=file]{color:var(--muted);}
 <script>
 // ── 模型注册表 ─────────────────────────────────────────────
 const MODELS = [
-  {id:'omlx_26b',  label:'Gemma 4 26B', engine:'oMLX',   color:'#60a5fa'},
-  {id:'omlx_31b',  label:'Gemma 4 31B', engine:'oMLX',   color:'#818cf8'},
-  {id:'ollama_26b',label:'Gemma 4 26B', engine:'Ollama', color:'#facc15'},
-  {id:'ollama_31b',label:'Gemma 4 31B', engine:'Ollama', color:'#fb923c'},
+  {id:'omlx_26b',           label:'Gemma 4 26B',       engine:'oMLX',   color:'#60a5fa'},
+  {id:'omlx_31b',           label:'Gemma 4 31B',       engine:'oMLX',   color:'#818cf8'},
+  {id:'ollama_26b',         label:'Gemma 4 26B',       engine:'Ollama', color:'#facc15'},
+  {id:'ollama_31b',         label:'Gemma 4 31B',       engine:'Ollama', color:'#fb923c'},
+  {id:'omlx_qwen_35b',      label:'Qwen 3.6 35B 4bit', engine:'oMLX',   color:'#10b981'},
+  {id:'omlx_qwen_claude_27b', label:'Claude 蒸馏版 27B', engine:'oMLX', color:'#ec4899'},
+  {id:'omlx_qwen_35b_8bit', label:'Qwen 3.6 35B 8bit', engine:'oMLX',   color:'#059669'},
+  {id:'ollama_qwen_35b',    label:'Qwen 3.6 35B',      engine:'Ollama', color:'#34d399'},
 ];
 
 // ── 状态 ────────────────────────────────────────────────────
 let currentTab   = 'intent';
 let selectedModel = 'omlx_26b';
-let history      = {intent:[], vision:[], speed:[], ag:[]};  // 每个 Tab 独立历史
+let history      = {intent:[], code:[], vision:[], speed:[], ag:[], supervisor:[]};  // 每个 Tab 独立历史
 let visionDots   = [];   // 当前 vision tab 的所有坐标点 [{label,color,nx,ny}]
 let visionImgNW  = 0, visionImgNH = 0;  // 图片原始尺寸
 let visionB64    = '';
@@ -2616,8 +2951,11 @@ function switchTab(id, el) {
   document.querySelectorAll('.tab-input').forEach(p => p.classList.remove('active'));
   document.getElementById('inp-'+id).classList.add('active');
   renderHistory();
-  // vision 工作台显示控制
-  document.getElementById('visionWS').style.display = id==='vision' ? '' : 'none';
+  // 隐藏与本标签无关的控制区
+  const runActionRow = document.querySelector('.action-row');
+  const optSec = document.getElementById('optSec');
+  if (runActionRow) runActionRow.style.display = id==='supervisor' ? 'none' : 'flex';
+  if (optSec) optSec.style.display = id==='supervisor' ? 'none' : 'block';
 }
 
 // ── 模型选择 ────────────────────────────────────────────────
@@ -2643,6 +2981,7 @@ async function runBenchmark() {
 
   try {
     if (currentTab === 'intent') await runIntent(warmup, m);
+    else if (currentTab === 'code') await runCode(warmup, m);
     else if (currentTab === 'vision') await runVision(warmup, m);
     else if (currentTab === 'ag') await runAG();
     else await runSpeed(warmup, m);
@@ -2696,6 +3035,32 @@ async function runIntent(warmup, m) {
   const total_elapsed = (Date.now() - t_start) / 1000;
   if (!d.success) { alert('失败：'+(d.error||'')); return; }
   history.intent.unshift({...d, input: text, ts: Date.now(), total_elapsed});
+  renderHistory();
+}
+
+// ── 代码分析 ─────────────────────────────────────────────────
+async function runCode(warmup, m) {
+  const file_path = document.getElementById('codeFilePath').value.trim();
+  const text = document.getElementById('codeText').value.trim();
+  // 附加上下文：每行一个路径，过滤空行
+  const context_paths = document.getElementById('codeContextPaths').value
+    .split(String.fromCharCode(10)).map(s => s.trim()).filter(Boolean);
+  if (!file_path) { alert('请输入本地文件绝对路径'); return; }
+  const t_start = Date.now();
+  const res = await fetch('/api/benchmark/code', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({file_path, text, model_id: m.id, warmup, context_paths})
+  });
+  const d = await res.json();
+  const total_elapsed = (Date.now() - t_start) / 1000;
+  if (!d.success) { alert('失败：'+(d.error||'')); return; }
+  // _benchmark_code 返回平钺格式：{success, output, elapsed, ...}
+  history.code.unshift({
+    ...d,
+    id: m.id, label: m.label, model_id: m.id,
+    filePath: file_path, contextPaths: context_paths,
+    input: text, ts: Date.now(), total_elapsed,
+  });
   renderHistory();
 }
 
@@ -2873,6 +3238,14 @@ function renderHistory() {
     document.getElementById('histList').innerHTML = renderAGHistory(list);
     return;
   }
+  if (currentTab === 'supervisor') {
+    document.getElementById('summaryWrap').style.display = 'none';
+    if(!window.supervisorTimer) {
+        window.supervisorTimer = setInterval(pollSupervisor, 2000);
+    }
+    pollSupervisor();
+    return;
+  }
 
   // 对比摘要
   renderSummary(list);
@@ -2904,6 +3277,42 @@ function renderCard(r, i) {
         ${r.error
           ? `<div class="json-pre err">${escHtml(r.error)}</div>`
           : `<pre class="json-pre">${escHtml(JSON.stringify(r.parsed||r.raw,null,2))}</pre>`}
+      </div>`;
+  } else if (currentTab === 'code') {
+    body = `
+      <div class="hist-body">
+        <div style="margin-bottom:8px;">
+          <div style="font-size:9px;color:var(--muted);margin-bottom:3px;letter-spacing:.4px;">文件路径</div>
+          <div style="font-size:10px;color:var(--text);font-family:'JetBrains Mono',monospace;
+            word-break:break-all;white-space:normal;line-height:1.6;
+            background:rgba(0,0,0,.2);padding:5px 8px;border-radius:5px;border:1px solid var(--border);">
+            ${escHtml(r.filePath||'')}
+          </div>
+        </div>
+        <div style="margin-bottom:10px;">
+          <div style="font-size:9px;color:var(--muted);margin-bottom:3px;letter-spacing:.4px;">审查问题</div>
+          <div style="font-size:11px;color:var(--text);line-height:1.6;">${escHtml(r.input||'未填写')}</div>
+        </div>
+        ${(r.contextPaths && r.contextPaths.length > 0) ? (function(){
+          const tags = r.contextPaths.map(p => '<span style="font-size:9px;font-family:JetBrains Mono,monospace;background:rgba(99,179,237,.12);border:1px solid rgba(99,179,237,.3);color:#63b3ed;padding:2px 7px;border-radius:20px;">' + escHtml(p.split('/').pop()) + '</span>').join('');
+          return '<div style="margin-bottom:10px;"><div style="font-size:9px;color:var(--muted);margin-bottom:4px;letter-spacing:.4px;">附加知识图谱</div><div style="display:flex;flex-wrap:wrap;gap:4px;">' + tags + '</div></div>';
+        })() : ''}
+        <div style="font-size:9px;color:var(--muted);margin-bottom:6px;letter-spacing:.4px;">模型分析结果</div>
+        ${r.error
+          ? `<div class="json-pre err">${escHtml(r.error)}</div>`
+          : `<div style="
+              font-size:12px;
+              color:var(--text);
+              line-height:1.8;
+              white-space:pre-wrap;
+              word-break:break-word;
+              background:rgba(0,0,0,.15);
+              border:1px solid var(--border);
+              border-radius:8px;
+              padding:12px 14px;
+              max-height:480px;
+              overflow-y:auto;
+            ">${escHtml(r.output||'')}</div>`}
       </div>`;
   } else if (currentTab === 'vision') {
     const nc = r.norm_coord;
@@ -3002,6 +3411,7 @@ function isFastest(r) {
 }
 
 function fmtT(s) {
+  if (s == null || isNaN(s)) return '—';
   return s >= 60 ? (s/60).toFixed(1)+' min' : s.toFixed(2)+' s';
 }
 
@@ -3014,6 +3424,133 @@ function fmtDate(ts) {
 
 function escHtml(s) {
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+window.supervisorTimer = null;
+// 当前已选的队列文件路径（默认值，可通过「选择文件」按钮更换）
+let _supQueueFile = '/Users/konglingjia/AndroidStudioProjects/Fang_oa/docs/scan_queue.txt';
+
+// 初始化文件路径显示（只展示文件名+父目录，避免全路径太长）
+(function _initQueueFileDisplay() {
+  const el = document.getElementById('supQueueFilePath');
+  if (el) {
+    const parts = _supQueueFile.split('/');
+    el.textContent = parts.slice(-3).join('/');
+    el.title = _supQueueFile;
+  }
+})();
+
+// 调用后端弹出 macOS 系统文件选择框
+async function pickQueueFile() {
+  const btn = document.querySelector('[onclick="pickQueueFile()"]');
+  if (btn) { btn.textContent = '⏳ 选择中...'; btn.disabled = true; }
+  try {
+    const res = await fetch('/api/supervisor/pick_queue_file');
+    const data = await res.json();
+    if (data.success && data.path) {
+      _supQueueFile = data.path;
+      const el = document.getElementById('supQueueFilePath');
+      if (el) {
+        const parts = data.path.split('/');
+        el.textContent = parts.slice(-3).join('/');
+        el.title = data.path;
+      }
+    }
+  } catch(e) {
+    alert('文件选择失败：' + e);
+  } finally {
+    if (btn) { btn.textContent = '📂 选择文件'; btn.disabled = false; }
+  }
+}
+
+async function startSupervisor() {
+  const btnStart = document.getElementById('btnStartSup');
+  if (btnStart) {
+      btnStart.disabled = true;
+      btnStart.innerText = '⏳ 启动中...';
+      btnStart.style.opacity = '0.7';
+  }
+  const interval = document.getElementById('supInterval').value;
+  const max_loops = document.getElementById('supLoops').value;
+  const contact = document.getElementById('supContact').value;
+  try {
+      await fetch('/api/supervisor/start', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({interval, max_loops, contact, queue_file: _supQueueFile})
+      });
+      if(!window.supervisorTimer) {
+          window.supervisorTimer = setInterval(pollSupervisor, 2000);
+      }
+      pollSupervisor();
+  } catch(e) { alert('启动监工失败: ' + e); }
+}
+
+async function stopSupervisor() {
+  try {
+      await fetch('/api/supervisor/stop', {method:'POST'});
+      pollSupervisor();
+  } catch(e) {}
+}
+
+async function pollSupervisor() {
+  if(currentTab !== 'supervisor') return;
+  try {
+      const res = await fetch('/api/supervisor/status');
+      const data = await res.json();
+      renderSupervisorData(data);
+      if(!data.running && window.supervisorTimer) {
+          clearInterval(window.supervisorTimer);
+          window.supervisorTimer = null;
+      }
+  } catch(e) {}
+}
+
+function renderSupervisorData(data) {
+  const btnStart = document.getElementById('btnStartSup');
+  const btnStop = document.getElementById('btnStopSup');
+  if (btnStart && btnStop) {
+      if (data.running) {
+          btnStart.disabled = true;
+          btnStart.innerText = '🏃 巡检运转中';
+          btnStart.style.opacity = '0.5';
+          btnStart.style.cursor = 'not-allowed';
+          
+          btnStop.disabled = false;
+          btnStop.style.opacity = '1';
+          btnStop.style.cursor = 'pointer';
+      } else {
+          btnStart.disabled = false;
+          btnStart.innerText = '🚀 启动监工';
+          btnStart.style.opacity = '1';
+          btnStart.style.cursor = 'pointer';
+          
+          btnStop.disabled = true;
+          btnStop.style.opacity = '0.5';
+          btnStop.style.cursor = 'not-allowed';
+      }
+  }
+
+  const html = [];
+  html.push(`<div style="margin-bottom:12px; padding:12px; background:var(--card-bg); border-radius:6px; border:1px solid #3f3f46;">
+      <div style="font-weight:bold; margin-bottom:8px; color:${data.running?'#10b981':'#ef4444'}">
+          状态: ${data.running ? '🔄 巡检中...' : '⏹ 已停止'}
+      </div>
+      <div style="font-size:12px; color:var(--muted);">
+          当前批次进度：${data.current_loop} / ${data.max_loops} 批次<br>
+          轮询心跳间隔：${data.interval} 秒
+      </div>
+  </div>`);
+  if (data.logs && data.logs.length > 0) {
+      html.push('<div style="font-weight:600; margin-bottom:8px;">实时监工日志 (Top 50)</div>');
+      html.push('<div style="font-family:var(--font-mono); font-size:11px; line-height:1.6; background:#18181b; padding:12px; border-radius:6px; max-height:400px; overflow-y:auto; color:#a1a1aa; border:1px inset #27272a;">');
+      data.logs.forEach(lg => {
+          html.push(`<div style="margin-bottom:4px; padding-bottom:4px; border-bottom:1px solid #27272a;"><span style="color:#60a5fa">[${lg.time}]</span> ${escHtml(lg.message)}</div>`);
+      });
+      html.push('</div>');
+  } else {
+      html.push('<div class="empty">暂无日志...请点击启动以开始巡更</div>');
+  }
+  document.getElementById('histList').innerHTML = html.join('');
 }
 </script>
 </body>

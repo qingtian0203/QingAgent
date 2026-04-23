@@ -268,7 +268,8 @@ class OSControlSkill(BaseSkill):
         print(f"💾 截图已原生保存：{save_path}")
 
         # 同步写入剪贴板（兼容之前依赖剪贴板的下一步意图流转）
-        actions.copy_image_to_clipboard(save_path)
+        # [监控改动]：关闭剪贴板侵入，防止每 15 秒冲刷用户的日常剪贴板！
+        # actions.copy_image_to_clipboard(save_path)
 
         screenshot_path = save_path
         print(f"🔥 [探针] System.app_screenshot 方法栈内总计真耗时: {_time.time() - t_start:.2f}s")
@@ -401,7 +402,8 @@ close access fileRef
                 "success": True,
                 "message": f"文件锁具确认，已装填入剪贴板发射舱准备接续动作：{filepath}",
                 "data": {
-                    "file_path": filepath
+                    "file_path": filepath,
+                    "value": filepath
                 }
             }
         except Exception as e:

@@ -184,16 +184,24 @@ class WeChatSkill(BaseSkill):
         
         image_path = slots.get("image_path")
 
-        # 判断是否需要发图
+        # 判断是否需要发图或发文件
         if image_path:
-            print(f"🖼️ 准备发送物理图片，先将其灌入剪贴板顶层: {image_path}")
-            if actions.copy_image_to_clipboard(image_path):
-                _time.sleep(0.2)
-                actions.hotkey("command", "v")
-                _time.sleep(0.3)  # 粘贴后等图片预览渲染
+            import os
+            ext = os.path.splitext(image_path)[1].lower()
+            if ext in [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]:
+                print(f"🖼️ 准备发送物理图片，先将其灌入剪贴板顶层: {image_path}")
+                img_success = actions.copy_image_to_clipboard(image_path)
+                if not img_success:
+                    print("❌ 图片灌入失败，中止发送")
+                    return {"success": False, "message": "读取本地图片失败", "data": None}
             else:
-                print("❌ 图片灌入失败，中止发送")
-                return {"success": False, "message": "读取本地图片失败", "data": None}
+                print(f"📄 准备发送物理文件，将其作为 POSIX File 对象塞入剪贴板: {image_path}")
+                import subprocess
+                subprocess.run(["osascript", "-e", f'set the clipboard to POSIX file "{image_path}"'])
+
+            _time.sleep(0.2)
+            actions.hotkey("command", "v")
+            _time.sleep(0.8)  # 粘贴后等多媒体/文件对象渲染，留足缓冲时间
                 
         elif message == "[粘贴]" or "{{clipboard" in message or "剪贴板" in message.lower():
             # 传统方案兜底

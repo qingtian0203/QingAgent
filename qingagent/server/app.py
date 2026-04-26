@@ -487,8 +487,8 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             "omlx_qwen25vl_7b": {
                 "id": "omlx_qwen25vl_7b", "label": "oMLX · Qwen2.5-VL 7B",
                 "color": "#a855f7", "engine": "oMLX",
-                "mode": "openai", "url": "http://localhost:8001/v1",
-                "model": "mlx-community/Qwen2.5-VL-7B-Instruct-4bit", "key": _cfg.API_KEY,
+                "mode": "openai", "url": "http://localhost:8000/v1",
+                "model": "Qwen2.5-VL-7B-Instruct-4bit", "key": _cfg.API_KEY,
             },
         }
 

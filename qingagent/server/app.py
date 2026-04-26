@@ -3371,6 +3371,8 @@ input[type=file]{color:var(--muted);}
       const j = await res.json();
       if(j.success) {
         const d = j.data;
+        let totalBytes = 0;
+        
         // oMLX
         if(d.omlx.status === 'online') {
           document.getElementById('omlxStatus').textContent = '🟢 运行中';
@@ -3378,7 +3380,7 @@ input[type=file]{color:var(--muted);}
           document.getElementById('omlxStatus').style.background = 'rgba(74,222,128,0.1)';
           const gb = (d.omlx.rss_bytes / 1024 / 1024 / 1024).toFixed(1);
           document.getElementById('omlxRss').textContent = gb + ' GB';
-          document.getElementById('sysMemBrief').textContent = gb + 'G';
+          totalBytes += d.omlx.rss_bytes;
         } else {
           document.getElementById('omlxStatus').textContent = '🔴 离线';
           document.getElementById('omlxStatus').style.color = 'var(--red)';
@@ -3394,6 +3396,7 @@ input[type=file]{color:var(--muted);}
             mList.innerHTML = '<div style="font-size:10px; color:var(--muted); text-align:center;">无缓存模型</div>';
           } else {
             mList.innerHTML = d.ollama.models.map(m => {
+              totalBytes += m.size_vram || 0;
               const gb = (m.size_vram / 1024 / 1024 / 1024).toFixed(1);
               return `<div style="display:flex; justify-content:space-between; align-items:center; background:rgba(255,255,255,0.05); padding:4px 8px; border-radius:4px;">
                 <span style="font-size:10px; font-family:'JetBrains Mono',monospace;">${m.name.split(':')[0]}</span>
@@ -3407,6 +3410,14 @@ input[type=file]{color:var(--muted);}
         } else {
           document.getElementById('ollamaStatus').textContent = '🔴 离线';
           document.getElementById('ollamaStatus').style.color = 'var(--red)';
+        }
+        
+        // 更新顶栏汇总
+        if(totalBytes > 0) {
+          const totalGb = (totalBytes / 1024 / 1024 / 1024).toFixed(1);
+          document.getElementById('sysMemBrief').textContent = totalGb + 'G';
+        } else {
+          document.getElementById('sysMemBrief').textContent = '--';
         }
       }
     } catch(e) {}

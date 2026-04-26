@@ -3501,7 +3501,7 @@ input[type=file]{color:var(--muted);}
         <div class="legend" id="dotLegend"></div>
         <div class="slider-row">
           <label>标记大小</label>
-          <input type="range" id="dotSize" min="6" max="40" value="14" oninput="redrawDots()">
+          <input type="range" id="dotSize" min="1" max="40" value="14" oninput="redrawDots()">
           <span class="slider-val" id="dotSizeVal">14</span>
         </div>
       </div>

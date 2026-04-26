@@ -484,6 +484,12 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                 "mode": "ollama", "url": "http://localhost:11434/api/generate",
                 "model": "qwen3.6:35b", "key": "",
             },
+            "omlx_qwen25vl_7b": {
+                "id": "omlx_qwen25vl_7b", "label": "oMLX · Qwen2.5-VL 7B",
+                "color": "#a855f7", "engine": "oMLX",
+                "mode": "openai", "url": "http://localhost:8001/v1",
+                "model": "mlx-community/Qwen2.5-VL-7B-Instruct-4bit", "key": _cfg.API_KEY,
+            },
         }
 
     @staticmethod

@@ -422,6 +422,15 @@ class AGSupervisor:
                                 # 清除状态标记，获取纯净的下一个任务类名
                                 target_class = raw_first.split(" [")[0].strip()
                                 # ★ 安全设计：先构建任务文本，不立即删队列，等激活窗口成功后再出队
+                                step3_extra = ""
+                                if "e-user-android" in queue_file:
+                                    step3_extra = (
+                                        "【⚠️C端项目特殊要求】：由于本项目使用 TheRouter 组件化跳转，"
+                                        "如果在代码中看到类似 `APP_BATTERY_FRAGMENT.createFragment()` 或 `USER_ACT_AUTH.navigation()`，"
+                                        "你**必须**先使用工具搜索该大写常量绑定的真实目标类名（即带有 `@Route(path = ...)` 的类），"
+                                        "把找到的**真实物理类名**（例如 BatteryHomeFragment）加入队列！绝不能把大写的常量名称加入队列！\n"
+                                    )
+
                                 task_target = (
                                     f"[自动调度] 扫库节点：{target_class}。请执行动态探索，严格按以下格式输出：\n\n"
                                     f"## 步骤1：生成 {output_dir}/{target_class}.md\n"
@@ -444,7 +453,8 @@ class AGSupervisor:
                                     f"若本类有网络接口调用，向 api_catalog.md 底部追加表格行：\n"
                                     f"| {target_class} | /接口URL | GET/POST | 功能说明 |\n\n"
                                     f"## 步骤3：顶置新依赖到 {queue_file}\n"
-                                    f"把本类中 startActivity 跳转的目标类、尚未在 {output_dir}/processed_classes.txt 中的类，顶置到队列首行。\n\n"
+                                    f"把本类中 startActivity 跳转的目标类、尚未在 {output_dir}/processed_classes.txt 中的类，顶置到队列首行。\n"
+                                    f"{step3_extra}\n"
                                     f"## 步骤4：本类名写入 {output_dir}/processed_classes.txt\n\n"
                                     f"## 步骤5：路由图追加到 {output_dir}/global_routing_graph.md\n"
                                     f"格式：上一节点 -> {target_class}(调用特征/触发条件)\n"

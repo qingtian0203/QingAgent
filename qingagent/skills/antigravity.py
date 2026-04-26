@@ -18,6 +18,7 @@ from qingagent.core import actions
 
 class AntigravitySkill(BaseSkill):
     app_name = "Antigravity"
+    ui_label = "AI 助手控制"
     app_aliases = ["Antigravity", "AG", "ag", "编辑器", "Cursor"]
     app_context = "IDE 代码编辑器截图"
     cold_start_wait = 5.0   # AG 冷启动需要更长时间加载 Agent 面板

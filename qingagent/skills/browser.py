@@ -334,21 +334,22 @@ class BrowserSkill(BaseSkill):
         print("📸 触发 GoFullPage 全页截图（⌥⇧P）...")
         actions.hotkey("option", "shift", "p")
 
-        # 3. 轮询等待截图 Tab 出现
-        #    GoFullPage 截图完成后会自动打开新 Tab，URL 包含扩展 ID
+        # 3. 轮询等待 GoFullPage 截图 Tab 出现
         self.check_cancel()
         print("⏳ 等待 GoFullPage 截图完成...")
 
         gofullpage_tab_found = False
-        poll_interval = 0.2    # 每 0.2s 检测一次
-        max_wait = 20          # 最多等 20s
+        poll_interval = 0.2
+        max_wait = 30
 
+        # 检测条件：URL 含扩展 ID，或 Title 含 "GoFullPage" 或 "Screenshot"
         detect_script = '''
         tell application "Google Chrome"
             repeat with w in windows
                 repeat with t in tabs of w
                     set u to URL of t
-                    if u contains "GoFullPage" or u contains "fdpohaocaechifi" then
+                    set ttl to title of t
+                    if u contains "fdpohaocaechifi" or ttl contains "GoFullPage" or ttl contains "Screenshot - GoFullPage" then
                         return "found"
                     end if
                 end repeat
@@ -366,62 +367,192 @@ class BrowserSkill(BaseSkill):
                 )
                 if "found" in result.stdout.lower():
                     gofullpage_tab_found = True
+                    gofullpage_tab_found = True
                     print("✅ 截图 Tab 已出现")
+
+                    # 调试：立刻打印所有 Tab 信息
+                    debug_script2 = '''
+                    tell application "Google Chrome"
+                        set info to ""
+                        repeat with w in windows
+                            repeat with t in tabs of w
+                                set info to info & (title of t) & " | " & (URL of t) & "\n"
+                            end repeat
+                        end repeat
+                        return info
+                    end tell
+                    '''
+                    try:
+                        dr2 = subprocess.run(["osascript", "-e", debug_script2],
+                                             capture_output=True, text=True, timeout=5)
+                        print(f"🔍 当前所有 Tab：\n{dr2.stdout.strip()}")
+                    except Exception as de:
+                        print(f"🔍 Tab 列表获取失败：{de}")
                     break
+
             except subprocess.TimeoutExpired:
                 pass
             time.sleep(poll_interval)
 
         if not gofullpage_tab_found:
+            # 调试：打印当前所有 Tab 标题和 URL，找出实际名称
+            debug_script = '''
+            tell application "Google Chrome"
+                set result to ""
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        set result to result & (title of t) & " | " & (URL of t) & "\n"
+                    end repeat
+                end repeat
+                return result
+            end tell
+            '''
+            try:
+                dr = subprocess.run(["osascript", "-e", debug_script],
+                                    capture_output=True, text=True, timeout=5)
+                print(f"🔍 当前所有 Tab 列表：\n{dr.stdout.strip()}")
+            except Exception:
+                pass
             return {
                 "success": False,
-                "message": "⚠️ 等待超时（20s），GoFullPage 截图 Tab 未出现。请检查快捷键 ⌥⇧P 是否已正确设置",
+                "message": "⚠️ 等待超时，GoFullPage 截图 Tab 未出现",
                 "data": None,
             }
 
-        # 稍等 0.3s 让截图 Tab 完全加载好再操作
+        # 4. 轮询等 GoFullPage Tab URL 含 ?（只查，不激活，避免 index of t 出错）
+        print("⏳ 等待 GoFullPage Tab 内容就绪...")
+        wait_ready_script = '''
+        tell application "Google Chrome"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    set u to URL of t
+                    set ttl to title of t
+                    if u contains "fdpohaocaechifi" or ttl contains "GoFullPage" or ttl contains "Screenshot - GoFullPage" then
+                        if u contains "?" then
+                            return "ready"
+                        else
+                            return "loading"
+                        end if
+                    end if
+                end repeat
+            end repeat
+        end tell
+        return "not_found"
+        '''
+
+        # 激活脚本单独跑（和 URL 检查分开，避免 set active tab index 出错）
+        activate_gofullpage_script = '''
+        tell application "Google Chrome"
+            set tabIdx to 0
+            repeat with w in windows
+                set tabIdx to 0
+                repeat with t in tabs of w
+                    set tabIdx to tabIdx + 1
+                    set u to URL of t
+                    set ttl to title of t
+                    if u contains "fdpohaocaechifi" or ttl contains "GoFullPage" or ttl contains "Screenshot - GoFullPage" then
+                        set active tab index of w to tabIdx
+                        set index of w to 1
+                        activate
+                        return "activated"
+                    end if
+                end repeat
+            end repeat
+        end tell
+        return "not_found"
+        '''
+
+        tab_ready = False
+        for _ in range(50):   # 最多等 10s
+            self.check_cancel()
+            try:
+                rw = subprocess.run(["osascript", "-e", wait_ready_script],
+                                    capture_output=True, text=True, timeout=5)
+                status = rw.stdout.strip()
+                if status == "ready":
+                    tab_ready = True
+                    print("✅ GoFullPage Tab 内容就绪，准备激活并复制")
+                    # 单独激活
+                    subprocess.run(["osascript", "-e", activate_gofullpage_script],
+                                   capture_output=True, text=True, timeout=5)
+                    break
+                elif status == "loading":
+                    pass
+                elif status == "not_found":
+                    pass
+                else:
+                    print(f"⚠️ Tab 状态异常：'{status}' stderr={rw.stderr.strip()[:80]}")
+            except subprocess.TimeoutExpired:
+                pass
+            time.sleep(0.2)
+
+        if not tab_ready:
+            print("⚠️ 等待超时，Tab 未就绪，仍尝试继续...")
+
+        # 5. Cmd+C —— GoFullPage Tab 已激活，复制截图到剪贴板
+        print("📋 Cmd+C 复制截图到剪贴板...")
+        actions.hotkey("command", "c")
+        time.sleep(1.2)
+
+        # 6. 把剪贴板 PNG 存盘，供 screenshot_path 使用
+        import os as _os
+        from datetime import datetime as _dt
+        timestamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+        save_path = f"/tmp/qingagent_fullpage_{timestamp}.png"
+        save_clip_script = f'''
+        try
+            set fileRef to open for access POSIX file "{save_path}" with write permission
+            write (the clipboard as «class PNGf») to fileRef
+            close access fileRef
+            return "ok"
+        on error e
+            return "err:" & e
+        end try
+        '''
+        new_file = None
+        try:
+            r2 = subprocess.run(["osascript", "-e", save_clip_script],
+                                capture_output=True, text=True, timeout=8)
+            out2 = r2.stdout.strip()
+            if out2 == "ok" and _os.path.exists(save_path) and _os.path.getsize(save_path) > 1000:
+                new_file = save_path
+                print(f"💾 截图已存盘：{new_file}")
+            else:
+                print(f"⚠️ 存盘失败：{out2}")
+        except Exception as e:
+            print(f"⚠️ 存盘异常：{e}")
+
+        # 7. 精准关闭 GoFullPage Tab（按 URL 找，不依赖焦点）
+        self.check_cancel()
+        print("🗑️ 关闭 GoFullPage Tab...")
+        close_tab_script = '''
+        tell application "Google Chrome"
+            set tabIdx to 0
+            repeat with w in windows
+                set tabIdx to 0
+                repeat with t in tabs of w
+                    set tabIdx to tabIdx + 1
+                    set u to URL of t
+                    set ttl to title of t
+                    if u contains "fdpohaocaechifi" or ttl contains "GoFullPage" or ttl contains "Screenshot - GoFullPage" then
+                        set active tab index of w to tabIdx
+                        close t
+                        return "closed"
+                    end if
+                end repeat
+            end repeat
+        end tell
+        return "not_found"
+        '''
+        subprocess.run(["osascript", "-e", close_tab_script],
+                       capture_output=True, text=True, timeout=5)
         time.sleep(0.3)
 
-        # 4. Cmd+S 下载截图 — 先记录 Downloads 快照，下载完后对比找新文件
-        import glob
-        import os as _os
+        if new_file:
+            msg = f"✅ 全页截图已复制到剪贴板并存盘：{new_file}"
+        else:
+            msg = "✅ 全页截图已复制到剪贴板（可直接粘贴）"
 
-        downloads_dir = _os.path.expanduser("~/Downloads")
-        # 快照：下载前所有 PNG/JPG 文件的路径集合
-        def _snap():
-            return set(
-                glob.glob(_os.path.join(downloads_dir, "*.png")) +
-                glob.glob(_os.path.join(downloads_dir, "*.jpg")) +
-                glob.glob(_os.path.join(downloads_dir, "*.jpeg"))
-            )
-
-        before_snap = _snap()
-
-        # 5. 等新文件出现（GoFullPage 打开预览 Tab 时已自动下载，无需 Cmd+S）
-        #    Cmd+S 在 GoFullPage 页面触发的是「保存网页」对话框，不是保存图片
-        new_file = None
-        for _ in range(75):          # 每 0.2s 检测一次，共 15s
-            time.sleep(0.2)
-            after_snap = _snap()
-            diff = after_snap - before_snap
-            if diff:
-                new_file = max(diff, key=_os.path.getctime)
-                print(f"📁 找到新截图文件：{new_file}")
-                break
-
-        if not new_file:
-            print("⚠️ 未找到新下载文件，使用 Downloads 最新 PNG 兜底")
-            all_pngs = glob.glob(_os.path.join(downloads_dir, "*.png"))
-            if all_pngs:
-                new_file = max(all_pngs, key=_os.path.getctime)
-
-        # 6. Cmd+W 关闭截图 Tab，回到原页面
-        self.check_cancel()
-        print("🗑️ 关闭截图 Tab...")
-        actions.hotkey("command", "w")
-        time.sleep(0.4)
-
-        msg = f"✅ 全页截图已下载：{new_file}" if new_file else "✅ 截图已下载（文件路径未知）"
         return {
             "success": True,
             "message": msg,

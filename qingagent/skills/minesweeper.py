@@ -10,6 +10,7 @@ from qingagent import config
 
 class MinesweeperSkill(BaseSkill):
     app_name = "Minesweeper"
+    ui_label = "扫雷游戏"
     app_aliases = ["扫雷", "玩扫雷", "扫雷游戏"]
     app_context = "浏览器中的扫雷网页游戏界面"
 

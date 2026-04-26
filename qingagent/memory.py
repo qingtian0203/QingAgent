@@ -22,6 +22,7 @@ from typing import Tuple, Optional
 # memory.json 相对于本文件的路径
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 _MEMORY_FILE = os.path.join(_DATA_DIR, "memory.json")
+_CORRECTION_RULES_FILE = os.path.join(_DATA_DIR, "correction_rules.json")
 
 # 最多保留的历史条数（滑动窗口）
 MAX_HISTORY = 5
@@ -190,5 +191,21 @@ class MemoryManager:
                         lines.append(f"  └─ 产物：{', '.join(artifact_parts)}")
 
             parts.append("\n".join(lines))
+
+        # 5. 用户纠错规则（从 correction_rules.json 动态加载）
+        if os.path.exists(_CORRECTION_RULES_FILE):
+            try:
+                with open(_CORRECTION_RULES_FILE, "r", encoding="utf-8") as f:
+                    rules = json.load(f)
+                if rules:
+                    lines = [
+                        "【用户纠错规则（重要！优先级高于默认行为）】",
+                        "- 以下是用户曾经指出 AI 理解错误的案例，处理相似指令时必须参考：",
+                    ]
+                    for r in rules[-20:]:  # 最多注入最新 20 条，防止 prompt 过长
+                        lines.append(f"  ✗ 错误理解：{r.get('wrong', '')}  →  ✓ 正确应该：{r.get('correct', '')}")
+                    parts.append("\n".join(lines))
+            except Exception:
+                pass
 
         return "\n\n".join(parts)

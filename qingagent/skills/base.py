@@ -20,15 +20,19 @@ class Intent:
     属性:
         name: 意图标识符，如 "send_message"
         description: 自然语言描述，给 AI Planner 看的
+        ui_label: 用户可读的中文短标签，如 "发送消息/图片"
         required_slots: 必须提取的参数，如 ["contact_name", "message"]
         optional_slots: 可选参数
         examples: 示例用语，帮助 AI 匹配意图
+        output_fields: 此意图执行后会产出的数据字段，如 ["screenshot_path"]
     """
     name: str
     description: str
+    ui_label: str = ""                          # 用户可读的中文短标签
     required_slots: list[str] = field(default_factory=list)
     optional_slots: list[str] = field(default_factory=list)
     examples: list[str] = field(default_factory=list)
+    output_fields: list[str] = field(default_factory=list)  # 产物字段
 
 
 class UserCancelException(Exception):
@@ -42,6 +46,7 @@ class BaseSkill:
 
     子类需要实现：
     - app_name: 应用显示名称
+    - ui_label: 用户可读的中文 Skill 标签（默认等于 app_name）
     - app_aliases: 进程名别名列表
     - app_context: AI 视觉识别时的上下文描述
     - intents: 支持的意图列表
@@ -50,6 +55,7 @@ class BaseSkill:
 
     # --- 子类必须覆写 ---
     app_name: str = "未知应用"
+    ui_label: str = ""          # 用户可读中文标签，空则自动使用 app_name
     app_aliases: list[str] = []
     app_context: str = "软件截图"
 

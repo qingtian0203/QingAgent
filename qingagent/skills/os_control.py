@@ -6,14 +6,17 @@ from qingagent.core import actions, vision
 
 class OSControlSkill(BaseSkill):
     app_name = "System"
+    ui_label = "系统控制"
     app_aliases = ["系统", "屏幕", "系统控制", "电脑"]
     app_context = "电脑整个屏幕"
 
     def register_intents(self):
         self.add_intent(Intent(
             name="custom_screenshot",
+            ui_label="截取屏幕指定区域",
             description="截取【当前已在屏幕上可见的】某个具体元素、图表或局部区域。注意：如果用户要求给某个特定的【应用程序/软件】截图，请绝对不要用这个意图，而应该用 app_screenshot",
             required_slots=["target"],
+            output_fields=["screenshot_path"],
             examples=[
                 "帮我截取屏幕左侧的导航栏",
                 "把下面那个表格用截图工具保存",
@@ -23,8 +26,10 @@ class OSControlSkill(BaseSkill):
         
         self.add_intent(Intent(
             name="app_screenshot",
+            ui_label="给指定应用截图",
             description="给某个指定的【应用程序/软件】截图（例如备忘录、微信、日历、系统设置等）。当你识别到目标是一个软件应用时，必须强制使用本意图，因为它负责把被后台遮挡的软件拉到最前面再进行截图。",
             required_slots=["app_name"],
+            output_fields=["screenshot_path"],
             examples=[
                 "给微信截图",
                 "帮我把备忘录内容截图发一下",
@@ -35,8 +40,10 @@ class OSControlSkill(BaseSkill):
 
         self.add_intent(Intent(
             name="open_app",
+            ui_label="打开 / 切换应用",
             description="打开、启动或切换到某个指定的应用程序/软件。用户说'打开xx'、'启动xx'、'切换到xx'、'进入xx'时使用，xx 就是应用名称。",
             required_slots=["app_name"],
+            output_fields=["app_name"],
             examples=[
                 "打开微信",
                 "帮我打开备忘录",
@@ -51,9 +58,11 @@ class OSControlSkill(BaseSkill):
 
         self.add_intent(Intent(
             name="prepare_file",
+            ui_label="查找 / 准备本地文件",
             description="搜寻并准备要发送/上传的文件。如果用户明确指出了文件的所在位置（如 桌面的/下载里的/文稿里的），**必须**将其提取到 search_dir 参数中。如果用户提供的是带有前缀 '/' 的长绝对路径，直接将其作为 filename。如果是普通的模糊名字（如'年度报表'），将使用系统底层引擎全文检索。",
             required_slots=["filename"],
             optional_slots=["search_dir"],
+            output_fields=["file_path"],
             examples=[
                 "帮我把桌面的 某某测试文档 找出来",
                 "找到下载中的作业",
@@ -65,13 +74,30 @@ class OSControlSkill(BaseSkill):
         # 网页全页截图兜底路由：小模型可能误路由到 System，这里委托给浏览器处理
         self.add_intent(Intent(
             name="capture_full_page",
+            ui_label="网页全页截图（GoFullPage）",
             description="使用 GoFullPage 对当前浏览器页面进行全页截图并下载，截图后返回文件路径",
             required_slots=[],
             optional_slots=[],
+            output_fields=["screenshot_path"],
             examples=[
                 "截图当前网页",
                 "全页截图",
                 "把网页截图下载",
+            ],
+        ))
+
+        # open_url 兜底路由：Planner 可能误路由到 System，委托给 BrowserSkill 处理
+        self.add_intent(Intent(
+            name="open_url",
+            ui_label="浏览器打开网址",
+            description="在浏览器中打开指定网址（URL）。当用户说「打开某个网址/链接/http地址」时使用",
+            required_slots=["url"],
+            optional_slots=[],
+            output_fields=[],
+            examples=[
+                "打开 https://notebooklm.google/",
+                "浏览器访问 localhost:8080",
+                "帮我打开这个链接",
             ],
         ))
 
@@ -414,3 +440,9 @@ close access fileRef
         from .browser import BrowserSkill
         print("🔀 System.capture_full_page → 委托给 BrowserSkill.capture_full_page")
         return BrowserSkill().execute_capture_full_page(slots)
+
+    def execute_open_url(self, slots: dict) -> dict:
+        """委托给 BrowserSkill 打开网址（Planner 误路由到 System 时的兜底）"""
+        from .browser import BrowserSkill
+        print("🔀 System.open_url → 委托给 BrowserSkill.open_url")
+        return BrowserSkill().execute_open_url(slots)

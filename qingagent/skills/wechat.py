@@ -32,7 +32,8 @@ class WeChatSkill(BaseSkill):
     def register_intents(self):
         self.add_intent(Intent(
             name="send_message",
-            description="给指定联系人或群发消息。如果要发图片，请将 image_path 填入参数（支持 ${stepN.screenshot_path}）；如果只提了发图片但没路径，message可以填'[粘贴]'作为后备。",
+            ui_label="发送消息 / 图片 / 文件",
+            description="给指定联系人或群发消息。如果要发图片，请将 image_path 填入参数（支持 ${stepN.screenshot_path}）；如果只提了发图片但没路径，message可以填'「粘贴」'作为后备。",
             required_slots=["contact_name", "message"],
             optional_slots=["image_path"],
             examples=[
@@ -45,11 +46,13 @@ class WeChatSkill(BaseSkill):
         
         self.add_intent(Intent(
             name="confirm_send_action",
+            ui_label="确认发送（按下回车）",
             description="当需要向微信补充按下回车键以确认发送前文处于待发送状态的消息/文件时使用。严格对应用户的最终发送许可动作。",
             examples=["微信确认发送", "执行微信确认发送", "确认发送微信"]
         ))
         self.add_intent(Intent(
             name="check_messages",
+            ui_label="查看最新消息",
             description="查看某个联系人或群的最新消息",
             required_slots=["contact_name"],
             optional_slots=["count"],
@@ -62,6 +65,7 @@ class WeChatSkill(BaseSkill):
 
         self.add_intent(Intent(
             name="extract_messages",
+            ui_label="提取聊天记录",
             description="提取并返回聊天记录的文字内容",
             required_slots=["contact_name"],
             optional_slots=["count", "keyword"],
@@ -114,27 +118,73 @@ class WeChatSkill(BaseSkill):
         4. 点击第一个结果
         5. 按 Esc 退出搜索状态
         """
-        rect = self._window_rect
+        import subprocess
 
-        # 1. 用 Cmd+F 激活搜索框（不依赖坐标，窗口任意大小都准）
-        actions.hotkey("command", "f", delay=0.5)
+        # 1. 轮询确认微信确实在最前台（窗口切换动画可能需要 0.5-1s）
+        print("⏳ 等待微信切换到最前台...")
+        wechat_front_script = '''
+        tell application "System Events"
+            set frontApp to name of first process whose frontmost is true
+            if frontApp is "WeChat" then
+                return "active"
+            else
+                return frontApp
+            end if
+        end tell
+        '''
+        wechat_ready = False
+        for _ in range(20):   # 最多等 4s（0.2s × 20）
+            try:
+                r = subprocess.run(["osascript", "-e", wechat_front_script],
+                                   capture_output=True, text=True, timeout=3)
+                out = r.stdout.strip()
+                if out == "active":
+                    wechat_ready = True
+                    print("✅ 微信已切换到最前台")
+                    break
+                else:
+                    pass  # 继续等，不打印避免刷屏
+            except subprocess.TimeoutExpired:
+                pass
+            _time.sleep(0.2)
 
-        # 2. 先清空搜索框已有内容，再输入联系人名
+        if not wechat_ready:
+            print("⚠️ 等待微信前台超时，继续尝试...")
+
+        # 微信在前台但焦点可能在内嵌 WebView（文章/公众号）里，
+        # 直接用 AppleScript tell process 把 Cmd+F 注入微信进程，
+        # 无需关心焦点在哪，进程级快捷键直达微信
+        print("🔑 通过进程级快捷键注入 Cmd+F...")
+        search_inject_script = '''
+        tell application "System Events"
+            tell process "WeChat"
+                keystroke "f" using command down
+            end tell
+        end tell
+        '''
+        subprocess.run(["osascript", "-e", search_inject_script],
+                       capture_output=True, text=True, timeout=5)
+        _time.sleep(0.4)
+
+
+
+        # 3. 先清空搜索框已有内容，再输入联系人名
         actions.hotkey("command", "a", delay=0.1)
         actions.type_text(contact)
 
-        # 3. 等搜索结果加载
+        # 4. 等搜索结果加载
         self.check_cancel()
         _time.sleep(1.2)
 
-        # 4. 直接回车进入第一条搜索结果（微信默认选中第一条）
+        # 5. 直接回车进入第一条搜索结果（微信默认选中第一条）
         self.check_cancel()
         actions.press_key("return", delay=0.4)  # 等搜索结果选中，0.4s 足够
 
-        # 5. 按 Esc 退出搜索状态（回到正常聊天界面）
+        # 6. 按 Esc 退出搜索状态（回到正常聊天界面）
         actions.press_key("escape", delay=0.3)
 
         return True
+
 
     def _find_contact_by_vision(self, contact: str) -> bool:
         """

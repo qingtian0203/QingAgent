@@ -6,6 +6,7 @@ Web 服务 — 提供 HTTP API 和移动端友好的 Web 聊天界面
 手机和电脑在同一局域网下即可访问，支持自然语言远程操控桌面。
 """
 import json
+import os
 import socket
 import threading
 import time
@@ -76,16 +77,36 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             self._json_response(supervisor_instance.get_status())
         elif parsed.path == "/api/supervisor/pick_queue_file":
             # 调用 macOS 系统文件选择对话框，返回所选文件的完整路径
+            # 注意：弹窗出现在 Mac 本机桌面，需要切到 Mac 操作
             import subprocess
             result = subprocess.run(
                 ["osascript", "-e",
-                 'tell application "System Events" to set theFile to POSIX path of '
-                 '(choose file with prompt "选择任务队列文件" of type {"txt"})'],
-                capture_output=True, text=True
+                 'POSIX path of (choose file with prompt "选择任务队列文件" '
+                 'of type {"txt", "public.plain-text"})'],
+                capture_output=True, text=True, timeout=120  # 给用户 2 分钟选文件
             )
-            if result.returncode == 0:
+            if result.returncode == 0 and result.stdout.strip():
                 self._json_response({"success": True, "path": result.stdout.strip()})
+            elif "-128" in result.stderr:
+                # 用户主动点了取消
+                self._json_response({"success": False, "path": None, "cancelled": True})
             else:
+                print(f"[pick_queue_file] osascript 失败: {result.stderr.strip()}")
+                self._json_response({"success": False, "path": None})
+        elif parsed.path == "/api/supervisor/pick_output_dir":
+            # 调用 macOS 系统目录选择对话框，返回所选目录完整路径
+            import subprocess
+            result = subprocess.run(
+                ["osascript", "-e",
+                 'POSIX path of (choose folder with prompt "选择档案输出目录（md 文件写入位置）")'],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                self._json_response({"success": True, "path": result.stdout.strip().rstrip("/")})
+            elif "-128" in result.stderr:
+                self._json_response({"success": False, "path": None, "cancelled": True})
+            else:
+                print(f"[pick_output_dir] osascript 失败: {result.stderr.strip()}")
                 self._json_response({"success": False, "path": None})
         elif parsed.path == "/api/image":
             # 提供图片预览接口 (限 /tmp/ 目录下的 png 图片)
@@ -144,6 +165,38 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
 
             except json.JSONDecodeError:
                 self._json_response({"success": False, "message": "请求格式错误"})
+        elif parsed.path == "/api/save_rule":
+            # 把用户纠错 (wrong→correct) 写入 correction_rules.json，供下次 Planner 注入提示词
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length).decode("utf-8")
+            try:
+                data = json.loads(body)
+                wrong = data.get("wrong", "").strip()
+                correct = data.get("correct", "").strip()
+                if not wrong or not correct:
+                    self._json_response({"success": False, "message": "wrong/correct 不能为空"})
+                    return
+
+                import os as _os
+                rules_path = _os.path.join(_os.path.dirname(__file__), "..", "data", "correction_rules.json")
+                rules_path = _os.path.abspath(rules_path)
+                # 读取已有规则
+                rules = []
+                if _os.path.exists(rules_path):
+                    try:
+                        with open(rules_path, "r", encoding="utf-8") as f:
+                            rules = json.load(f)
+                    except Exception:
+                        rules = []
+                # 去重：同一个 wrong 不重复记录
+                rules = [r for r in rules if r.get("wrong") != wrong]
+                rules.append({"wrong": wrong, "correct": correct})
+                with open(rules_path, "w", encoding="utf-8") as f:
+                    json.dump(rules, f, ensure_ascii=False, indent=2)
+                print(f"[纠错] 已保存规则：{wrong!r} → {correct!r}（共 {len(rules)} 条）")
+                self._json_response({"success": True, "total": len(rules)})
+            except Exception as e:
+                self._json_response({"success": False, "message": str(e)})
         elif parsed.path.startswith("/api/cancel/"):
             task_id = parsed.path.split("/")[-1]
             if task_id == "all":
@@ -191,12 +244,41 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             interval = int(data.get("interval", 15))
             max_loops = int(data.get("max_loops", 5))
             contact = data.get("contact", "晴天小米")
-            queue_file = data.get("queue_file") or None  # 前端传来的队列文件路径（可选）
-            success = supervisor_instance.start(interval, max_loops, contact, queue_file=queue_file)
+            queue_file = data.get("queue_file") or None
+            output_dir = data.get("output_dir") or None   # 档案输出目录（可选）
+            success = supervisor_instance.start(
+                interval, max_loops, contact,
+                queue_file=queue_file, output_dir=output_dir
+            )
             self._json_response({"success": success})
         elif parsed.path == "/api/supervisor/stop":
             supervisor_instance.stop()
             self._json_response({"success": True})
+        elif parsed.path == "/api/supervisor/queue_read":
+            # 读取当前队列文件内容，返回给前端编辑器
+            data = self._read_post_body()
+            file_path = data.get("file_path") or supervisor_instance.queue_file
+            try:
+                if os.path.exists(file_path):
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    self._json_response({"success": True, "content": content, "path": file_path})
+                else:
+                    self._json_response({"success": True, "content": "", "path": file_path})
+            except Exception as e:
+                self._json_response({"success": False, "error": str(e)})
+        elif parsed.path == "/api/supervisor/queue_save":
+            # 保存任务队列文件内容
+            data = self._read_post_body()
+            file_path = data.get("file_path") or supervisor_instance.queue_file
+            content = data.get("content", "")
+            try:
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                self._json_response({"success": True, "path": file_path})
+            except Exception as e:
+                self._json_response({"success": False, "error": str(e)})
         else:
             self.send_error(404)
 
@@ -310,22 +392,27 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
     def _api_skills(self):
-        """返回所有已注册 Skill 的描述"""
-        skills_info = {}
+        """返回所有已注册 Skill 的描述（含中文标签和产物字段）"""
+        result = []
         for name, skill in _planner.registry.get_all_skills().items():
-            intents = {}
+            # ui_label 优先用子类声明的，否则退化到 app_name
+            skill_label = getattr(skill, "ui_label", "") or skill.app_name
+            intents = []
             for intent_name, intent in skill.get_intents().items():
-                intents[intent_name] = {
+                intents.append({
+                    "id": intent_name,
+                    "label": intent.ui_label or intent.description[:20],  # 中文短标签
                     "description": intent.description,
                     "required_slots": intent.required_slots,
                     "optional_slots": intent.optional_slots,
-                    "examples": intent.examples,
-                }
-            skills_info[name] = {
-                "app_name": skill.app_name,
+                    "output_fields": getattr(intent, "output_fields", []),  # 产物字段
+                })
+            result.append({
+                "id": skill.app_name,   # 路由 key（代码层用）
+                "label": skill_label,   # 用户可读中文标签
                 "intents": intents,
-            }
-        self._json_response(skills_info)
+            })
+        self._json_response(result)
 
     def _serve_benchmark(self):
         """返回模型测试台页面"""
@@ -723,7 +810,7 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             self._json_response({"success": False, "error": str(e)})
 
     def _benchmark_vision(self):
-        """视觉定位测试：调用 vision.find_element 三段放大策略，生成阶段调试图"""
+        """视觉定位测试：支持单次定位 / 三段放大定位两种模式，方便对比精度与耗时"""
         import time, os
         try:
             data = self._read_post_body()
@@ -733,6 +820,7 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             warmup = data.get("warmup", False)
             img_w = data.get("img_w", 0)
             img_h = data.get("img_h", 0)
+            mode = data.get("mode", "triple")  # "single" | "triple"
 
             if not image_b64 or not desc:
                 self._json_response({"error": "image_b64 和 desc 不能为空"}); return
@@ -763,17 +851,37 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                     self._bench_call(mc, "好", max_tokens=8)
                     warmup_elapsed = round(time.time() - t0, 2)
 
-                # 记录 debug 目录调用前的文件集合（事后收集新生成的三段图）
+                # 记录 debug 目录调用前的文件集合（事后收集新生成的调试图）
                 debug_dir = "/tmp/qingagent_debug"
                 os.makedirs(debug_dir, exist_ok=True)
                 before_files = set(os.listdir(debug_dir))
 
-                # ── 调用三段放大定位引擎 ──
                 t0 = time.time()
-                pos = _vision.find_element(image_b64, desc, context="这是一张应用界面截图")
-                elapsed = round(time.time() - t0, 2)
+                if mode == "single":
+                    # ── 单次定位：直接调用底层推理，不做放大裁剪 ──
+                    pos = _vision._single_find_call(image_b64, desc, "这是一张应用界面截图")
+                    elapsed = round(time.time() - t0, 2)
+                    # 为单次结果生成调试标注图
+                    if pos:
+                        try:
+                            import io as _io, base64 as _b64e
+                            from PIL import Image as _PILImg
+                            _raw = _PILImg.open(_io.BytesIO(_b64e.b64decode(image_b64)))
+                            _iw, _ih = _raw.size
+                            _px = (pos["rx"] / 1000.0) * _iw
+                            _py = (pos["ry"] / 1000.0) * _ih
+                            _ts = time.strftime("%H%M%S")
+                            _kw = "".join(c for c in desc[:8] if c.isalnum() or c in "_-") or "elem"
+                            _vision._draw_cross_for_debug(_raw.copy(), _px, _py,
+                                f"{_ts}_{_kw}_single_CLICK.png", label="单次")
+                        except Exception as _de:
+                            print(f"⚠️ 单次定位调试图生成失败: {_de}")
+                else:
+                    # ── 三重放大定位（默认，原逻辑）──
+                    pos = _vision.find_element(image_b64, desc, context="这是一张应用界面截图")
+                    elapsed = round(time.time() - t0, 2)
 
-                # 收集此次新生成的三段 debug 截图
+                # 收集此次新生成的调试截图
                 after_files = set(os.listdir(debug_dir))
                 new_files = sorted(after_files - before_files)
                 debug_imgs = []
@@ -807,6 +915,7 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                     "elapsed": elapsed, "warmup_elapsed": warmup_elapsed,
                     "raw": str(pos), "coord": coord, "norm_coord": norm_coord,
                     "debug_imgs": debug_imgs,
+                    "mode": mode,
                     "error": None,
                 })
             finally:
@@ -1721,6 +1830,112 @@ def _get_ui_html() -> str:
             background: rgba(239, 68, 68, 0.15);
             box-shadow: inset 0 1px 1px rgba(239,68,68,0.3), 0 2px 8px rgba(239,68,68,0.2);
         }
+
+        /* ===== 纠错浮窗：亮色主题覆盖 ===== */
+        [data-theme="light"] #correctPanel > div {
+            background: #ffffff !important;
+            border: 1px solid rgba(90,111,232,0.18) !important;
+            box-shadow: 0 -12px 48px rgba(0,0,0,0.12) !important;
+        }
+        /* 标题文字 */
+        [data-theme="light"] #correctPanel .cp-title {
+            color: #111827 !important;
+        }
+        /* 关闭按钮 */
+        [data-theme="light"] #correctPanel .cp-close {
+            background: rgba(0,0,0,0.06) !important;
+            border: 1px solid rgba(0,0,0,0.14) !important;
+            color: #374151 !important;
+        }
+        /* "你当时说的" 小标签 */
+        [data-theme="light"] #correctPanel .cp-orig-label {
+            color: #6b7280 !important;
+        }
+        /* 原始指令文字框 */
+        [data-theme="light"] #correctPanel #correctOrig {
+            background: rgba(245,158,11,0.06) !important;
+            border-color: rgba(245,158,11,0.3) !important;
+            color: #374151 !important;
+        }
+        /* Tab 容器背景 */
+        [data-theme="light"] #correctPanel #correctTabs {
+            background: rgba(0,0,0,0.06) !important;
+        }
+        /* Tab 非激活文字 */
+        [data-theme="light"] #correctPanel #tabText {
+            color: #6b7280 !important;
+        }
+        /* 步骤卡片 */
+        [data-theme="light"] #correctPanel .cp-step-card {
+            background: #f5f6ff !important;
+            border: 1px solid rgba(90,111,232,0.16) !important;
+        }
+        /* 步骤标签 "步骤1" */
+        [data-theme="light"] #correctPanel .cp-step-label {
+            color: #d97706 !important;
+        }
+        /* select 下拉框 */
+        [data-theme="light"] #correctPanel select {
+            background: #ffffff !important;
+            border: 1px solid rgba(0,0,0,0.15) !important;
+            color: #1f2937 !important;
+        }
+        [data-theme="light"] #correctPanel select option {
+            background: #ffffff !important;
+            color: #1f2937 !important;
+        }
+        /* 产物信息行 */
+        [data-theme="light"] #correctPanel .cp-output-info {
+            color: #3b5bdb !important;
+            background: rgba(59,91,219,0.07) !important;
+        }
+        /* 产物传递 checkbox label */
+        [data-theme="light"] #correctPanel .cp-pass-wrap {
+            color: #4b5563 !important;
+        }
+        /* 删除步骤按钮 */
+        [data-theme="light"] #correctPanel .cp-del-btn {
+            color: rgba(0,0,0,0.35) !important;
+        }
+        /* + 添加步骤按钮 */
+        [data-theme="light"] #correctPanel .cp-add-step {
+            background: rgba(245,158,11,0.06) !important;
+            border-color: rgba(245,158,11,0.4) !important;
+            color: #b45309 !important;
+        }
+        [data-theme="light"] #correctPanel .cp-add-step:hover {
+            background: rgba(245,158,11,0.14) !important;
+        }
+        /* textarea */
+        [data-theme="light"] #correctPanel #correctInput {
+            background: #f9fafb !important;
+            border-color: rgba(0,0,0,0.14) !important;
+            color: #1f2937 !important;
+        }
+        /* 底部提示文字 */
+        [data-theme="light"] #correctPanel .cp-hint {
+            color: #9ca3af !important;
+        }
+        /* 分割线 */
+        [data-theme="light"] #correctPanel .cp-divider {
+            border-color: rgba(0,0,0,0.09) !important;
+        }
+        /* 存规则 label */
+        [data-theme="light"] #correctPanel .cp-save-label {
+            color: #374151 !important;
+        }
+        [data-theme="light"] #correctPanel .cp-save-sub {
+            color: #9ca3af !important;
+        }
+        /* 取消按钮 */
+        [data-theme="light"] #correctPanel .cp-cancel-btn {
+            background: rgba(0,0,0,0.05) !important;
+            border-color: rgba(0,0,0,0.15) !important;
+            color: #374151 !important;
+        }
+        [data-theme="light"] #correctPanel .cp-cancel-btn:hover {
+            background: rgba(0,0,0,0.1) !important;
+        }
     </style>
 </head>
 <body>
@@ -1781,7 +1996,113 @@ def _get_ui_html() -> str:
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
         </button>
     </div>
+
+    <!-- 纠错浮窗 -->
+    <div id="correctPanel" style="
+        display:none; opacity:0; transform:translateY(8px);
+        transition: opacity .2s ease, transform .2s ease;
+        position:fixed; inset:0; z-index:9999;
+        align-items:flex-end; justify-content:center;
+        background:rgba(0,0,0,.55); backdrop-filter:blur(4px);
+        padding-bottom:env(safe-area-inset-bottom,0);
+    " onclick="if(event.target===this)closeCorrect()">
+        <div style="
+            width:100%; max-width:520px;
+            background:#12121f;
+            border:1px solid rgba(255,255,255,.18);
+            border-radius:18px 18px 0 0;
+            padding:20px 18px 28px;
+            box-shadow:0 -8px 40px rgba(0,0,0,.4);
+            max-height:88vh; overflow-y:auto;
+        ">
+            <!-- 标题栏 -->
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:rgba(245,158,11,.15);border:1px solid rgba(245,158,11,.3);display:flex;align-items:center;justify-content:center;color:#f59e0b;">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+                    </div>
+                    <span class="cp-title" style="font-size:13px;font-weight:600;color:#eeeef8;">纠错 — 指定正确执行步骤</span>
+                </div>
+                <button onclick="closeCorrect()" style="background:none;border:none;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.22);border-radius:7px;color:#d0d0e8;cursor:pointer;padding:3px 10px;font-size:17px;line-height:1.4;">×</button>
+            </div>
+
+            <!-- 原始指令展示 -->
+            <div class="cp-orig-label" style="font-size:10px;color:#9090b8;margin-bottom:5px;letter-spacing:.4px;text-transform:uppercase;">你当时说的</div>
+            <div id="correctOrig" style="
+                font-size:12px;color:#d8d8f0;line-height:1.6;
+                background:rgba(245,158,11,.06);border:1px solid rgba(245,158,11,.2);
+                border-radius:8px;padding:8px 10px;margin-bottom:16px;
+                font-style:italic;
+            "></div>
+
+            <!-- Tab 切换：步骤构建 / 文字重述 -->
+            <div id="correctTabs" style="display:flex;gap:0;margin-bottom:14px;background:rgba(0,0,0,.2);border-radius:8px;padding:3px;">
+                <button id="tabBuild" onclick="switchCorrectTab('build')" style="
+                    flex:1;padding:6px;border:none;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;transition:.15s;
+                    background:rgba(245,158,11,.25);color:#f59e0b;">
+                    🔧 指定步骤（精准）
+                </button>
+                <button id="tabText" onclick="switchCorrectTab('text')" style="
+                    flex:1;padding:6px;border:none;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;transition:.15s;
+                    background:transparent;color:rgba(255,255,255,.4);">
+                    ✏️ 文字重述（灵活）
+                </button>
+            </div>
+
+            <!-- 步骤构建区 -->
+            <div id="correctBuildArea">
+                <div id="correctStepList" style="display:flex;flex-direction:column;gap:10px;margin-bottom:10px;"></div>
+                <button onclick="addCorrectStep()" style="
+                    width:100%;padding:8px;border-radius:8px;border:1px dashed rgba(245,158,11,.3);
+                    background:rgba(245,158,11,.04);color:#f59e0b;font-size:12px;cursor:pointer;transition:.15s;
+                " onmouseover="this.style.background='rgba(245,158,11,.1)'" onmouseout="this.style.background='rgba(245,158,11,.04)'">
+                    + 添加步骤
+                </button>
+            </div>
+
+            <!-- 文字重述区（默认隐藏）-->
+            <div id="correctTextArea" style="display:none;">
+                <textarea id="correctInput" rows="3" placeholder="换个说法描述你的意图，AI 会重新理解…" style="
+                    width:100%; box-sizing:border-box;
+                    background:rgba(0,0,0,.35);
+                    border:1px solid rgba(255,255,255,.18);
+                    border-radius:10px; padding:10px 12px;
+                    color:#e8e8f8; font-size:13px; line-height:1.6;
+                    resize:none; outline:none; font-family:inherit; transition:border-color .15s;
+                " onfocus="this.style.borderColor='rgba(245,158,11,.5)'" onblur="this.style.borderColor='rgba(255,255,255,.18)'"></textarea>
+                <div class="cp-hint" style="font-size:10px;color:#7878a8;margin-top:4px;">提交后 AI 会重新解析你的意图</div>
+            </div>
+
+            <div class="cp-divider" style="margin:14px 0 10px;border-top:1px solid rgba(255,255,255,.1);"></div>
+
+            <!-- 保存为永久规则 -->
+            <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;margin-bottom:16px;">
+                <input type="checkbox" id="correctSaveChk" checked style="width:14px;height:14px;accent-color:#f59e0b;cursor:pointer;margin-top:2px;flex-shrink:0;">
+                <span class="cp-save-label" style="font-size:12px;color:#c8c8e8;line-height:1.5;">
+                    <span style="color:#f59e0b;font-weight:500;">存为永久纠错规则</span><br>
+                    <span class="cp-save-sub" style="font-size:11px;color:#8080a8;">下次说类似的话，AI 会参考此规则优先理解</span>
+                </span>
+            </label>
+
+            <!-- 按钮 -->
+            <div style="display:flex;gap:10px;">
+                <button onclick="closeCorrect()" style="
+                    flex:1;padding:10px;border-radius:10px;
+                    background:transparent;border:1px solid rgba(255,255,255,.18);
+                    color:#d0d0e8;font-size:13px;font-weight:500;cursor:pointer;transition:.15s;
+                 cp-cancel-btn" onmouseover="this.style.background='rgba(255,255,255,.17)'" onmouseout="this.style.background='rgba(255,255,255,.1)'">取消</button>
+                <button onclick="submitCorrect()" style="
+                    flex:2;padding:10px;border-radius:10px;
+                    background:linear-gradient(135deg,#f59e0b,#d97706);
+                    border:none;color:#fff;font-size:13px;font-weight:600;cursor:pointer;transition:.15s;
+                " onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'">
+                    确认 · 重新执行
+                </button>
+            </div>
+        </div>
+    </div>
 </div>
+
 
 <script>
     const STORAGE_KEY = 'qingagent_chat_history';
@@ -1792,6 +2113,14 @@ def _get_ui_html() -> str:
     const sendBtn = document.getElementById('sendBtn');
     const statusDot = document.getElementById('statusDot');
     const micBtn = document.getElementById('micBtn');
+
+    // Shift+Enter 快捷键发送（普通 Enter 在 input[type=text] 里本身就提交）
+    cmdInput.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter' && e.shiftKey) {
+            e.preventDefault();
+            sendCmd();
+        }
+    });
 
     let _history = [];
     function saveHistory() {
@@ -1961,12 +2290,14 @@ def _get_ui_html() -> str:
         row.className = `msg-row ${type} ${cls}`;
 
         if (type === 'user') {
-            // 用户消息：附加一个重用按鈕，通过 flex 与气泡并排显示
+            // 用户消息：附加重用按钮 + 纠错按钮
             const escaped = html.replace(/"/g, '&quot;');
+            const msgId = 'umsg_' + Date.now() + '_' + Math.random().toString(36).slice(2,6);
             row.innerHTML = `
                 <div style="display:flex; align-items:flex-end; gap:6px;">
                     <button class="reuse-btn" title="再次发送" onclick="reuseMsg(this)" data-text="${escaped}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"></polyline><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path></svg></button>
-                    <div class="msg-bubble">${html}</div>
+                    <button class="reuse-btn" title="纠错：AI理解有误" style="color:#f59e0b;" onclick="openCorrect(this)" data-text="${escaped}" data-id="${msgId}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></button>
+                    <div class="msg-bubble" id="${msgId}">${html}</div>
                 </div>
                 <div class="msg-time">${timeStr}</div>
             `;
@@ -1991,14 +2322,232 @@ def _get_ui_html() -> str:
         return row;
     }
 
-    // 重用按鈕回调：将此条消息填回输入框
+    // 重用按钮回调：将此条消息填回输入框
     function reuseMsg(btn) {
         const text = btn.getAttribute('data-text').replace(/&quot;/g, '"');
         cmdInput.value = text;
         cmdInput.focus();
-        // 轻微闪烁反馈：按鈕变为彩色再恢复
         btn.style.color = 'var(--success)';
         setTimeout(() => { btn.style.color = ''; }, 600);
+    }
+
+    // ── 纠错面板 ────────────────────────────────────────────────
+    let _skillsCatalog = [];  // 缓存 /api/skills 数据
+
+    async function _loadSkills() {
+        if (_skillsCatalog.length > 0) return _skillsCatalog;
+        try {
+            const res = await fetch('/api/skills');
+            _skillsCatalog = await res.json();
+        } catch(e) { _skillsCatalog = []; }
+        return _skillsCatalog;
+    }
+
+    function switchCorrectTab(tab) {
+        const isBuild = tab === 'build';
+        document.getElementById('correctBuildArea').style.display = isBuild ? '' : 'none';
+        document.getElementById('correctTextArea').style.display = isBuild ? 'none' : '';
+        const tb = document.getElementById('tabBuild'), tt = document.getElementById('tabText');
+        tb.style.background = isBuild ? 'rgba(245,158,11,.25)' : 'transparent';
+        tb.style.color = isBuild ? '#f59e0b' : 'rgba(255,255,255,.4)';
+        tt.style.background = isBuild ? 'transparent' : 'rgba(245,158,11,.25)';
+        tt.style.color = isBuild ? 'rgba(255,255,255,.4)' : '#f59e0b';
+    }
+
+    // 构建单步卡片 DOM
+    function _buildStepCard(idx, skills) {
+        const card = document.createElement('div');
+        card.id = 'cstep_' + idx;
+        card.className = 'cp-step-card';
+        card.style.cssText = 'background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:12px;position:relative;';
+
+        // Skill 下拉
+        const skillSel = document.createElement('select');
+        skillSel.id = 'cskill_' + idx;
+        skillSel.style.cssText = 'width:100%;background:#1a1a2e;border:1px solid rgba(255,255,255,.2);border-radius:7px;padding:7px 10px;color:#e8e8f0;font-size:12px;margin-bottom:8px;outline:none;cursor:pointer;-webkit-appearance:none;appearance:none;';
+        const skillOptDef = document.createElement('option');
+        skillOptDef.value = ''; skillOptDef.textContent = '— 选择功能模块 —';
+        skillOptDef.style.cssText = 'background:#1a1a2e;color:#e8e8f0;';
+        skillSel.appendChild(skillOptDef);
+        skills.forEach(s => {
+            const opt = document.createElement('option');
+            opt.value = s.id;
+            opt.textContent = s.label;
+            opt.style.cssText = 'background:#1a1a2e;color:#e8e8f0;';
+            skillSel.appendChild(opt);
+        });
+
+        // Intent 下拉（随 Skill 联动）
+        const intentSel = document.createElement('select');
+        intentSel.id = 'cintent_' + idx;
+        intentSel.style.cssText = 'width:100%;background:#1a1a2e;border:1px solid rgba(255,255,255,.2);border-radius:7px;padding:7px 10px;color:#e8e8f0;font-size:12px;margin-bottom:8px;outline:none;cursor:pointer;-webkit-appearance:none;appearance:none;';
+        const intentOptDef = document.createElement('option');
+        intentOptDef.value = ''; intentOptDef.textContent = '— 先选功能模块 —';
+        intentOptDef.style.cssText = 'background:#1a1a2e;color:#e8e8f0;';
+        intentSel.appendChild(intentOptDef);
+
+        // 产物信息区
+        const outputInfo = document.createElement('div');
+        outputInfo.id = 'coutput_' + idx;
+        outputInfo.className = 'cp-output-info';
+        outputInfo.style.cssText = 'display:none;font-size:11px;color:#a0c4ff;padding:4px 6px;background:rgba(96,165,250,.08);border-radius:5px;margin-bottom:6px;'
+
+        // 传递到下步 checkbox
+        const passWrap = document.createElement('label');
+        passWrap.id = 'cpass_wrap_' + idx;
+        passWrap.className = 'cp-pass-wrap';
+        passWrap.style.cssText = 'display:none;align-items:center;gap:6px;cursor:pointer;font-size:11px;color:rgba(255,255,255,.7);margin-top:2px;'
+        const passChk = document.createElement('input');
+        passChk.type = 'checkbox'; passChk.id = 'cpass_' + idx;
+        passChk.style.cssText = 'accent-color:#f59e0b;';
+        passWrap.appendChild(passChk);
+        passWrap.appendChild(document.createTextNode('将此步骤产物（截图/文件路径）传递给下一步骤'));
+
+        // 删除按钮
+        const delBtn = document.createElement('button');
+        delBtn.textContent = '×';
+        delBtn.title = '删除此步骤';
+        delBtn.className = 'cp-del-btn';
+        delBtn.style.cssText = 'position:absolute;top:8px;right:10px;background:none;border:none;color:rgba(255,255,255,.3);font-size:16px;cursor:pointer;line-height:1;';
+        delBtn.onclick = () => { card.remove(); _reindexSteps(); };
+
+        // 步骤标题
+        const stepLabel = document.createElement('div');
+        stepLabel.className = 'cp-step-label';
+        stepLabel.style.cssText = 'font-size:10px;color:#f59e0b;letter-spacing:.5px;margin-bottom:8px;font-weight:500;';
+        stepLabel.textContent = `步骤 ${idx + 1}`;
+
+        // Skill→Intent 联动
+        skillSel.onchange = () => {
+            const skill = skills.find(s => s.id === skillSel.value);
+            intentSel.innerHTML = '';
+            const defOpt = document.createElement('option');
+            defOpt.value = ''; defOpt.textContent = '— 选择具体动作 —';
+            defOpt.style.cssText = 'background:#1a1a2e;color:#e8e8f0;';
+            intentSel.appendChild(defOpt);
+            outputInfo.style.display = 'none';
+            passWrap.style.display = 'none';
+            if (!skill) return;
+            skill.intents.forEach(it => {
+                const opt = document.createElement('option');
+                opt.value = it.id;
+                opt.textContent = it.label;
+                opt.dataset.outputs = JSON.stringify(it.output_fields || []);
+                opt.style.cssText = 'background:#1a1a2e;color:#e8e8f0;';
+                intentSel.appendChild(opt);
+            });
+            intentSel.onchange();
+        };
+
+        intentSel.onchange = () => {
+            const opt = intentSel.options[intentSel.selectedIndex];
+            if (!opt || !opt.dataset.outputs) { outputInfo.style.display='none'; passWrap.style.display='none'; return; }
+            const outputs = JSON.parse(opt.dataset.outputs);
+            if (outputs.length > 0) {
+                outputInfo.style.display = '';
+                outputInfo.textContent = `📦 产物：${outputs.join('、')}`;
+                passWrap.style.display = 'flex';
+            } else {
+                outputInfo.style.display = 'none';
+                passWrap.style.display = 'none';
+            }
+        };
+
+        card.appendChild(stepLabel);
+        card.appendChild(delBtn);
+        card.appendChild(skillSel);
+        card.appendChild(intentSel);
+        card.appendChild(outputInfo);
+        card.appendChild(passWrap);
+        return card;
+    }
+
+    function _reindexSteps() {
+        document.querySelectorAll('#correctStepList > div').forEach((el, i) => {
+            const label = el.querySelector('div');
+            if (label) label.textContent = `步骤 ${i + 1}`;
+        });
+    }
+
+    async function addCorrectStep() {
+        const skills = await _loadSkills();
+        const list = document.getElementById('correctStepList');
+        const idx = list.children.length;
+        list.appendChild(_buildStepCard(idx, skills));
+    }
+
+    async function openCorrect(btn) {
+        const origText = btn.getAttribute('data-text').replace(/&quot;/g, '"');
+        const panel = document.getElementById('correctPanel');
+        document.getElementById('correctOrig').textContent = origText;
+        document.getElementById('correctInput').value = '';
+        document.getElementById('correctSaveChk').checked = true;
+        document.getElementById('correctStepList').innerHTML = '';
+        panel.dataset.orig = origText;
+        panel.style.display = 'flex';
+        setTimeout(() => { panel.style.opacity = '1'; panel.style.transform = 'translateY(0)'; }, 10);
+        switchCorrectTab('build');
+        // 默认预置一个步骤
+        await addCorrectStep();
+    }
+
+    function closeCorrect() {
+        const panel = document.getElementById('correctPanel');
+        panel.style.opacity = '0';
+        panel.style.transform = 'translateY(8px)';
+        setTimeout(() => { panel.style.display = 'none'; }, 200);
+    }
+
+    async function submitCorrect() {
+        const panel = document.getElementById('correctPanel');
+        const orig = panel.dataset.orig || '';
+        const save = document.getElementById('correctSaveChk').checked;
+        const isBuildTab = document.getElementById('correctBuildArea').style.display !== 'none';
+
+        let fix = '';   // 用于重新发送的文字描述
+        let steps = []; // 结构化步骤
+
+        if (isBuildTab) {
+            // 收集步骤构建器数据
+            const stepCards = document.querySelectorAll('#correctStepList > div');
+            if (stepCards.length === 0) { addMsg('⚠️ 请至少添加一个步骤', 'agent', 'error', false); return; }
+            for (let i = 0; i < stepCards.length; i++) {
+                const card = stepCards[i];
+                const skillId = card.querySelector(`select[id^="cskill_"]`).value;
+                const intentId = card.querySelector(`select[id^="cintent_"]`).value;
+                if (!skillId || !intentId) { addMsg(`⚠️ 步骤 ${i+1} 请选择功能模块和动作`, 'agent', 'error', false); return; }
+                const intentOpt = card.querySelector(`select[id^="cintent_"]`).options;
+                const selOpt = intentOpt[intentOpt.selectedIndex];
+                const outputs = selOpt ? JSON.parse(selOpt.dataset.outputs || '[]') : [];
+                const passToNext = card.querySelector(`input[id^="cpass_"]`).checked;
+                const skillLabel = card.querySelector(`select[id^="cskill_"]`).options[card.querySelector(`select[id^="cskill_"]`).selectedIndex].text;
+                const intentLabel = selOpt ? selOpt.textContent : intentId;
+                steps.push({ skill: skillId, intent: intentId, output_fields: outputs, pass_to_next: passToNext });
+                fix += (i > 0 ? '，然后' : '') + `${skillLabel}·${intentLabel}`;
+            }
+        } else {
+            fix = document.getElementById('correctInput').value.trim();
+            if (!fix) { document.getElementById('correctInput').focus(); return; }
+        }
+
+        // 1. 保存结构化 + 自然语言规则
+        if (save) {
+            try {
+                await fetch('/api/save_rule', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ wrong: orig, correct: fix, steps: steps.length ? steps : undefined })
+                });
+                addMsg(`✅ 纠错规则已保存（${steps.length ? steps.length + '步骤结构' : '文字描述'}）`, 'agent', 'success', false);
+            } catch(e) { console.warn('保存规则失败', e); }
+        }
+
+        // 2. 关闭面板
+        closeCorrect();
+
+        // 3. 重新发送（文字重述模式 or 步骤说明）
+        cmdInput.value = fix;
+        sendCmd();
     }
 
     // 清缓存强制刷新——解决浏览器缓存旧版 JS/CSS 的问题
@@ -2748,6 +3297,19 @@ input[type=file]{color:var(--muted);}
         <input type="file" id="visionFile" accept="image/*" onchange="onImgLoad(this)">
         <label class="lbl" style="margin-top:6px;">元素描述</label>
         <input type="text" id="visionDesc" placeholder="例：右上角的绿色 + 添加按钮">
+        <label class="lbl" style="margin-top:8px;">定位模式</label>
+        <div style="display:flex;gap:6px;margin-top:2px;">
+          <label id="vision-mode-triple" style="display:flex;align-items:center;gap:5px;padding:5px 10px;border-radius:6px;border:1px solid var(--as);background:rgba(102,126,234,0.15);cursor:pointer;font-size:11px;color:var(--text);transition:.18s;">
+            <input type="radio" name="visionMode" value="triple" checked style="display:none;">
+            <svg width="11" height="11" viewBox="0 0 10 10"><polygon points="5,0.5 9.5,9.5 0.5,9.5" fill="currentColor"/></svg>
+            棱镜追踪（精准）
+          </label>
+          <label id="vision-mode-single" style="display:flex;align-items:center;gap:5px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--btn-bg);cursor:pointer;font-size:11px;color:var(--muted);transition:.18s;">
+            <input type="radio" name="visionMode" value="single" style="display:none;">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+            单次定位（快速）
+          </label>
+        </div>
       </div>
       <div id="inp-speed" class="tab-input">
         <p style="font-size:11px;color:var(--muted);line-height:1.7;">
@@ -2781,38 +3343,121 @@ input[type=file]{color:var(--muted);}
         </div>
       </div>
       <div id="inp-supervisor" class="tab-input">
-        <label class="lbl">配置后台长任务监工参数</label>
-        <div style="display:flex; flex-direction:column; gap:12px; margin-top:8px;">
+        <label class="lbl">AG 监工</label>
+        <div style="display:flex; flex-direction:column; gap:10px; margin-top:6px;">
 
-            <!-- 任务队列文件选择（调系统文件选择框，不手动输入） -->
-            <div style="display:flex; flex-direction:column; gap:6px;">
-              <span style="font-size:11px; color:var(--muted); font-weight:500;">任务队列文件</span>
-              <div style="display:flex; align-items:center; gap:8px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:7px; padding:7px 10px;">
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
-                <span id="supQueueFilePath" title="" style="flex:1; font-size:10px; color:var(--text); font-family:'JetBrains Mono',monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; opacity:0.8;">Fang_oa/docs/scan_queue.txt</span>
-                <button onclick="pickQueueFile()" style="flex-shrink:0; padding:4px 10px; border-radius:5px; border:1px solid rgba(102,126,234,0.4); background:rgba(102,126,234,0.12); color:#a5b4fc; font-size:11px; cursor:pointer; transition:all 0.18s; white-space:nowrap;" onmouseover="this.style.background='rgba(102,126,234,0.22)'" onmouseout="this.style.background='rgba(102,126,234,0.12)'">📂 选择文件</button>
+          <!-- ① 项目选择 -->
+          <div style="display:flex; flex-direction:column; gap:5px;">
+            <span style="font-size:10px; color:var(--muted); font-weight:500;">扫描项目</span>
+            <div style="display:flex; gap:6px;">
+              <button id="sup-proj-oa" onclick="selectSupProject('oa')"
+                style="flex:1; padding:7px 6px; border-radius:7px; border:1px solid var(--as);
+                  background:rgba(102,126,234,0.18); color:var(--text); font-size:12px;
+                  font-weight:600; cursor:pointer; transition:all .18s;">
+                🏢 OA
+              </button>
+              <button id="sup-proj-cend" onclick="selectSupProject('cend')"
+                style="flex:1; padding:7px 6px; border-radius:7px; border:1px solid var(--border);
+                  background:var(--btn-bg); color:var(--muted); font-size:12px;
+                  font-weight:600; cursor:pointer; transition:all .18s;">
+                📱 C端
+              </button>
+            </div>
+            <div id="supProjHint" style="font-size:10px; color:var(--muted); opacity:0.55;
+              font-family:'JetBrains Mono',monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+              Fang_oa · docs/scan_queue.txt
+            </div>
+          </div>
+
+          <!-- ② 参数 -->
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
+            <div style="display:flex; flex-direction:column; gap:3px;">
+              <span style="font-size:10px; color:var(--muted);">轮询间隔 (秒)</span>
+              <input type="number" id="supInterval" value="15"
+                style="padding:4px 8px; border-radius:4px; border:1px solid #3f3f46;
+                  background:var(--card-bg); color:var(--text); font-family:var(--font-mono);
+                  font-size:12px; width:100%; box-sizing:border-box;">
+            </div>
+            <div style="display:flex; flex-direction:column; gap:3px;">
+              <span style="font-size:10px; color:var(--muted);">最大批次</span>
+              <input type="number" id="supLoops" value="5"
+                style="padding:4px 8px; border-radius:4px; border:1px solid #3f3f46;
+                  background:var(--card-bg); color:var(--text); font-family:var(--font-mono);
+                  font-size:12px; width:100%; box-sizing:border-box;">
+            </div>
+            <div style="display:flex; flex-direction:column; gap:3px; grid-column:1/-1;">
+              <span style="font-size:10px; color:var(--muted);">失败接警人（微信）</span>
+              <input type="text" id="supContact" value="晴天小米"
+                style="padding:4px 8px; border-radius:4px; border:1px solid #3f3f46;
+                  background:var(--card-bg); color:var(--text); font-family:var(--font-mono);
+                  font-size:12px; width:100%; box-sizing:border-box;">
+            </div>
+          </div>
+
+          <!-- ③ 启动/停止 -->
+          <div style="display:flex; gap:8px;">
+            <button id="btnStartSup" onclick="startSupervisor()"
+              style="flex:1; background:#10b981; color:#fff; border:none; padding:7px;
+                border-radius:6px; cursor:pointer; font-weight:bold; font-size:12px; transition:all 0.2s;">
+              🚀 启动监工
+            </button>
+            <button id="btnStopSup" onclick="stopSupervisor()" disabled
+              style="flex:1; background:#ef4444; color:#fff; border:none; padding:7px;
+                border-radius:6px; cursor:pointer; font-weight:bold; font-size:12px; transition:all 0.2s; opacity:0.5;">
+              🛑 停止
+            </button>
+          </div>
+
+          <!-- ④ 任务队列 -->
+          <div style="display:flex; flex-direction:column; gap:4px;
+            border-top:1px solid rgba(255,255,255,0.06); padding-top:8px;">
+            <div style="display:flex; align-items:center; justify-content:space-between;">
+              <span style="font-size:10px; color:var(--muted); font-weight:500;">
+                任务队列 <span id="queueStats" style="opacity:0.5; font-size:10px;"></span>
+              </span>
+              <div style="display:flex; gap:4px;">
+                <button id="btnQueueRefresh" onclick="refreshQueueView()"
+                  style="padding:2px 7px; border-radius:4px; border:1px solid rgba(99,102,241,0.4);
+                    background:rgba(99,102,241,0.12); color:#a5b4fc; font-size:10px; cursor:pointer;"
+                  onmouseover="this.style.background='rgba(99,102,241,0.25)'"
+                  onmouseout="this.style.background='rgba(99,102,241,0.12)'">🔄</button>
+                <button id="btnQueueEdit" onclick="enterQueueEdit()"
+                  style="padding:2px 7px; border-radius:4px; border:1px solid rgba(251,191,36,0.4);
+                    background:rgba(251,191,36,0.1); color:#fbbf24; font-size:10px; cursor:pointer;"
+                  onmouseover="this.style.background='rgba(251,191,36,0.22)'"
+                  onmouseout="this.style.background='rgba(251,191,36,0.1)'">✏️</button>
+                <button id="btnQueueSave" onclick="saveQueueContent()" style="display:none;
+                  padding:2px 7px; border-radius:4px; border:1px solid rgba(16,185,129,0.4);
+                  background:rgba(16,185,129,0.15); color:#34d399; font-size:10px; cursor:pointer;"
+                  onmouseover="this.style.background='rgba(16,185,129,0.28)'"
+                  onmouseout="this.style.background='rgba(16,185,129,0.15)'">💾</button>
+                <button id="btnQueueCancel" onclick="cancelQueueEdit()" style="display:none;
+                  padding:2px 7px; border-radius:4px; border:1px solid rgba(239,68,68,0.4);
+                  background:rgba(239,68,68,0.1); color:#f87171; font-size:10px; cursor:pointer;"
+                  onmouseover="this.style.background='rgba(239,68,68,0.22)'"
+                  onmouseout="this.style.background='rgba(239,68,68,0.1)'">✕</button>
               </div>
             </div>
+            <div id="queueViewPanel"
+              style="height:150px; overflow-y:auto; display:flex; flex-direction:column; gap:3px;
+                background:#18181b; border:1px solid #3f3f46; border-radius:6px; padding:6px;">
+              <div style="font-size:11px; color:#52525b; text-align:center; padding:16px 0;">
+                点击 🔄 加载任务列表
+              </div>
+            </div>
+            <textarea id="supQueueEditor" style="display:none; width:100%; height:150px;
+              box-sizing:border-box; padding:8px 10px;
+              font-family:'JetBrains Mono',monospace; font-size:11px; line-height:1.7;
+              background:#18181b; color:#d4d4d8; border:1px solid rgba(251,191,36,0.5);
+              border-radius:6px; resize:none; outline:none;"
+              placeholder="每行一个任务名&#10;MyOfficeSignActivity&#10;SponsorProcessActivity"
+            ></textarea>
+          </div>
 
-            <div style="display:flex; align-items:center; justify-content:space-between;">
-                <span style="font-size:12px; color:var(--muted);">轮询间隔 (秒)</span>
-                <input type="number" id="supInterval" value="15" style="width:100px; padding:4px 8px; border-radius:4px; border:1px solid #3f3f46; background:var(--card-bg); color:var(--text); font-family:var(--font-mono);">
-            </div>
-            <div style="display:flex; align-items:center; justify-content:space-between;">
-                <span style="font-size:12px; color:var(--muted);">接力续批次数上限</span>
-                <input type="number" id="supLoops" value="5" style="width:100px; padding:4px 8px; border-radius:4px; border:1px solid #3f3f46; background:var(--card-bg); color:var(--text); font-family:var(--font-mono);">
-            </div>
-            <div style="display:flex; align-items:center; justify-content:space-between;">
-                <span style="font-size:12px; color:var(--muted);">失败微信接警人</span>
-                <input type="text" id="supContact" value="晴天小米" style="width:100px; padding:4px 8px; border-radius:4px; border:1px solid #3f3f46; background:var(--card-bg); color:var(--text); font-family:var(--font-mono);">
-            </div>
-        </div>
-        <div style="display:flex; gap:12px; margin-top:16px;">
-            <button id="btnStartSup" onclick="startSupervisor()" style="flex:1; background:#10b981; color:#fff; border:none; padding:8px; border-radius:6px; cursor:pointer; font-weight:bold; transition:all 0.2s;">🚀 启动监工</button>
-            <button id="btnStopSup" onclick="stopSupervisor()" style="flex:1; background:#ef4444; color:#fff; border:none; padding:8px; border-radius:6px; cursor:pointer; font-weight:bold; transition:all 0.2s; opacity:0.5;" disabled>🛑 强行停止</button>
         </div>
       </div>
-    </div>
+
+
 
     <!-- 选项 -->
     <div class="section" id="optSec">
@@ -2956,6 +3601,9 @@ function switchTab(id, el) {
   const optSec = document.getElementById('optSec');
   if (runActionRow) runActionRow.style.display = id==='supervisor' ? 'none' : 'flex';
   if (optSec) optSec.style.display = id==='supervisor' ? 'none' : 'block';
+  // 视觉定位画布：仅在 vision tab 且已有上传图时显示
+  const visionWS = document.getElementById('visionWS');
+  if (visionWS) visionWS.style.display = (id === 'vision' && visionB64) ? '' : 'none';
 }
 
 // ── 模型选择 ────────────────────────────────────────────────
@@ -3065,26 +3713,67 @@ async function runCode(warmup, m) {
 }
 
 // ── 视觉定位 ─────────────────────────────────────────────────
+// 模式切换 UI 联动
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('input[name="visionMode"]').forEach(radio => {
+    radio.addEventListener('change', () => {
+      const tripleLabel = document.getElementById('vision-mode-triple');
+      const singleLabel = document.getElementById('vision-mode-single');
+      if (radio.value === 'triple' && radio.checked) {
+        tripleLabel.style.borderColor = 'var(--as)';
+        tripleLabel.style.background = 'rgba(102,126,234,0.15)';
+        tripleLabel.style.color = 'var(--text)';
+        singleLabel.style.borderColor = 'var(--border)';
+        singleLabel.style.background = 'var(--btn-bg)';
+        singleLabel.style.color = 'var(--muted)';
+      } else if (radio.value === 'single' && radio.checked) {
+        singleLabel.style.borderColor = 'var(--as)';
+        singleLabel.style.background = 'rgba(102,126,234,0.15)';
+        singleLabel.style.color = 'var(--text)';
+        tripleLabel.style.borderColor = 'var(--border)';
+        tripleLabel.style.background = 'var(--btn-bg)';
+        tripleLabel.style.color = 'var(--muted)';
+      }
+    });
+  });
+  // label 点击也触发 radio change
+  document.querySelectorAll('#vision-mode-triple, #vision-mode-single').forEach(lbl => {
+    lbl.addEventListener('click', () => {
+      const radio = lbl.querySelector('input[type=radio]');
+      if (radio) { radio.checked = true; radio.dispatchEvent(new Event('change')); }
+    });
+  });
+});
+
 async function runVision(warmup, m) {
   if (!visionB64) { alert('请先上传截图'); return; }
   const desc = document.getElementById('visionDesc').value.trim();
   if (!desc) { alert('请输入元素描述'); return; }
+  const modeEl = document.querySelector('input[name="visionMode"]:checked');
+  const mode = modeEl ? modeEl.value : 'triple';
   const t_start = Date.now();
   const res = await fetch('/api/benchmark/vision', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
       image_b64: visionB64, desc, model_id: m.id, warmup,
-      img_w: visionImgNW, img_h: visionImgNH
+      img_w: visionImgNW, img_h: visionImgNH, mode
     })
   });
   const d = await res.json();
   const total_elapsed = (Date.now() - t_start) / 1000;
   if (!d.success) { alert('失败：'+(d.error||'')); return; }
-  history.vision.unshift({...d, input: desc, ts: Date.now(), total_elapsed});
+  const modeTag = d.mode === 'single' ? '⚡单次' : '🔺棱镜';
+  history.vision.unshift({...d, input: `[${modeTag}] ${desc}`, ts: Date.now(), total_elapsed});
 
-  // 如果有归一化坐标，加入画布点
+  // 如果有归一化坐标，加入画布点（颜色跟随模型，形状区分模式：圆=单次，三角=棱镜追踪）
   if (d.norm_coord) {
-    visionDots.push({label:d.label, color:d.color, nx:d.norm_coord.x, ny:d.norm_coord.y});
+    visionDots.push({
+      label: `${modeTag}·${d.label}`,
+      color: d.color,
+      nx: d.norm_coord.x,
+      ny: d.norm_coord.y,
+      mode: d.mode || 'triple'
+    });
     updateLegend();
     redrawDots();
   }
@@ -3167,28 +3856,52 @@ function redrawDots() {
   ctx.clearRect(0,0,c.width,c.height);
   visionDots.forEach(pt => {
     const px = pt.nx * c.width, py = pt.ny * c.height;
-    // 光晕
-    ctx.beginPath(); ctx.arc(px,py,sz+5,0,Math.PI*2);
-    ctx.fillStyle = pt.color+'28'; ctx.fill();
-    // 实心圆
-    ctx.beginPath(); ctx.arc(px,py,sz/2,0,Math.PI*2);
-    ctx.fillStyle = pt.color; ctx.fill();
-    // 十字
-    ctx.strokeStyle = pt.color; ctx.lineWidth = 1.5; ctx.globalAlpha = .7;
-    ctx.beginPath();
-    ctx.moveTo(px-sz,py); ctx.lineTo(px+sz,py);
-    ctx.moveTo(px,py-sz); ctx.lineTo(px,py+sz);
-    ctx.stroke(); ctx.globalAlpha = 1;
+    if (pt.mode === 'triple') {
+      // 🔺 棱镜追踪：等边三角形 + 光晕
+      const h = sz * 1.3;
+      const drawTri = (scale, alpha) => {
+        ctx.beginPath();
+        ctx.moveTo(px, py - h * scale * 0.65);
+        ctx.lineTo(px + h * scale * 0.75, py + h * scale * 0.35);
+        ctx.lineTo(px - h * scale * 0.75, py + h * scale * 0.35);
+        ctx.closePath();
+        return ctx;
+      };
+      // 光晕三角
+      drawTri(1.4);
+      ctx.fillStyle = pt.color + '28'; ctx.fill();
+      // 实心三角
+      drawTri(1);
+      ctx.fillStyle = pt.color; ctx.fill();
+      // 描边
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.2; ctx.globalAlpha = 0.6;
+      ctx.stroke(); ctx.globalAlpha = 1;
+    } else {
+      // ⚡ 单次定位：实心圆 + 十字准星
+      // 光晕
+      ctx.beginPath(); ctx.arc(px, py, sz + 5, 0, Math.PI * 2);
+      ctx.fillStyle = pt.color + '28'; ctx.fill();
+      // 实心圆
+      ctx.beginPath(); ctx.arc(px, py, sz / 2, 0, Math.PI * 2);
+      ctx.fillStyle = pt.color; ctx.fill();
+      // 十字准星
+      ctx.strokeStyle = pt.color; ctx.lineWidth = 1.5; ctx.globalAlpha = .7;
+      ctx.beginPath();
+      ctx.moveTo(px - sz, py); ctx.lineTo(px + sz, py);
+      ctx.moveTo(px, py - sz); ctx.lineTo(px, py + sz);
+      ctx.stroke(); ctx.globalAlpha = 1;
+    }
   });
 }
 
 function updateLegend() {
   const el = document.getElementById('dotLegend');
-  el.innerHTML = visionDots.map(pt =>
-    `<div class="legend-item">
-      <span class="legend-dot" style="background:${pt.color}"></span>
-      ${escHtml(pt.label)}
-    </div>`).join('');
+  el.innerHTML = visionDots.map(pt => {
+    const icon = pt.mode === 'triple'
+      ? `<svg width="9" height="9" viewBox="0 0 10 10" style="flex-shrink:0;"><polygon points="5,0.5 9.5,9.5 0.5,9.5" fill="${pt.color}" stroke="rgba(255,255,255,0.5)" stroke-width="0.8"/></svg>`
+      : `<span class="legend-dot" style="background:${pt.color};flex-shrink:0;"></span>`;
+    return `<div class="legend-item">${icon} ${escHtml(pt.label)}</div>`;
+  }).join('');
 }
 
 window.addEventListener('resize', () => { if(visionDots.length) redrawDots(); });
@@ -3427,41 +4140,176 @@ function escHtml(s) {
 }
 
 window.supervisorTimer = null;
-// 当前已选的队列文件路径（默认值，可通过「选择文件」按钮更换）
-let _supQueueFile = '/Users/konglingjia/AndroidStudioProjects/Fang_oa/docs/scan_queue.txt';
 
-// 初始化文件路径显示（只展示文件名+父目录，避免全路径太长）
-(function _initQueueFileDisplay() {
-  const el = document.getElementById('supQueueFilePath');
-  if (el) {
-    const parts = _supQueueFile.split('/');
-    el.textContent = parts.slice(-3).join('/');
-    el.title = _supQueueFile;
+// ── 监工项目预设配置（写死，切换简单）──────────────────────────
+const SUPERVISOR_PROJECTS = {
+  oa: {
+    label: 'OA',
+    queue_file: '/Users/konglingjia/AndroidStudioProjects/Fang_oa/docs/scan_queue.txt',
+    output_dir: '/Users/konglingjia/AndroidStudioProjects/Fang_oa/docs/ai-native/domains/auto-scan',
+    hint: 'Fang_oa · docs/scan_queue.txt'
+  },
+  cend: {
+    label: 'C端',
+    queue_file: '/Users/konglingjia/AndroidStudioProjects/e-user-android/docs/scan_queue.txt',
+    output_dir: '/Users/konglingjia/AndroidStudioProjects/e-user-android/docs/ai-native/domains/auto-scan',
+    hint: 'e-user-android · docs/scan_queue.txt'
   }
-})();
+};
+let _supProjectId = 'oa';
+// 供队列读写函数复用
+let _supQueueFile = SUPERVISOR_PROJECTS.oa.queue_file;
 
-// 调用后端弹出 macOS 系统文件选择框
-async function pickQueueFile() {
-  const btn = document.querySelector('[onclick="pickQueueFile()"]');
-  if (btn) { btn.textContent = '⏳ 选择中...'; btn.disabled = true; }
-  try {
-    const res = await fetch('/api/supervisor/pick_queue_file');
-    const data = await res.json();
-    if (data.success && data.path) {
-      _supQueueFile = data.path;
-      const el = document.getElementById('supQueueFilePath');
-      if (el) {
-        const parts = data.path.split('/');
-        el.textContent = parts.slice(-3).join('/');
-        el.title = data.path;
-      }
+// 切换项目：更新 UI 和 _supQueueFile
+function selectSupProject(id) {
+  _supProjectId = id;
+  _supQueueFile = SUPERVISOR_PROJECTS[id].queue_file;
+  // 按钮高亮
+  const activeStyle  = 'border:1px solid var(--as); background:rgba(102,126,234,0.18); color:var(--text);';
+  const defaultStyle = 'border:1px solid var(--border); background:var(--btn-bg); color:var(--muted);';
+  document.getElementById('sup-proj-oa').style.cssText    += id === 'oa'   ? activeStyle : defaultStyle;
+  document.getElementById('sup-proj-cend').style.cssText  += id === 'cend' ? activeStyle : defaultStyle;
+  // 路径提示
+  const hint = document.getElementById('supProjHint');
+  if (hint) hint.textContent = SUPERVISOR_PROJECTS[id].hint;
+  // 自动刷新任务列表
+  if (!_queueEditMode) refreshQueueView();
+}
+
+let _queueEditMode = false;  // false=查看模式 true=编辑模式
+let _queueRawContent = '';   // 当前文件原始内容缓存
+
+// 解析 txt 内容为任务卡片并渲染到查看面板
+function renderQueueView(content) {
+  _queueRawContent = content;
+  const panel = document.getElementById('queueViewPanel');
+  const stats = document.getElementById('queueStats');
+  if (!panel) return;
+
+  const lines = content.split('\\n').map(l => l.trim()).filter(Boolean);
+  if (!lines.length) {
+    panel.innerHTML = '<div style="font-size:11px; color:#52525b; text-align:center; padding:20px 0;">队列为空</div>';
+    if (stats) stats.textContent = '';
+    return;
+  }
+
+  let doneCount = 0, failCount = 0, pendingCount = 0;
+  const cards = lines.map(line => {
+    let name = line, status = 'pending', badge = '', color = '#52525b', bg = 'rgba(255,255,255,0.03)';
+    if (line.includes(' [DONE]')) {
+      name = line.split(' [DONE]')[0].trim();
+      status = 'done'; doneCount++;
+      badge = '<span style="font-size:9px; color:#10b981; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:1px 5px; border-radius:10px; flex-shrink:0;">✓ 完成</span>';
+      color = '#10b981'; bg = 'rgba(16,185,129,0.04)';
+    } else if (line.includes(' [FAIL')) {
+      const reason = line.match(/\[FAIL:?(.*?)\]/)?.[1] || '';
+      name = line.split(' [FAIL')[0].trim();
+      status = 'fail'; failCount++;
+      badge = `<span style="font-size:9px; color:#ef4444; background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.3); padding:1px 5px; border-radius:10px; flex-shrink:0;">✗ 失败${reason?' · '+reason:''}</span>`;
+      color = '#ef4444'; bg = 'rgba(239,68,68,0.04)';
+    } else {
+      pendingCount++;
+      badge = '<span style="font-size:9px; color:#60a5fa; background:rgba(96,165,250,0.1); border:1px solid rgba(96,165,250,0.25); padding:1px 5px; border-radius:10px; flex-shrink:0;">待处理</span>';
+      color = '#a1a1aa'; bg = 'rgba(255,255,255,0.03)';
     }
-  } catch(e) {
-    alert('文件选择失败：' + e);
-  } finally {
-    if (btn) { btn.textContent = '📂 选择文件'; btn.disabled = false; }
+    return `<div style="display:flex; align-items:center; gap:8px; padding:4px 8px;
+      background:${bg}; border-radius:4px; border-left:2px solid ${color}40;">
+      <span style="flex:1; font-family:'JetBrains Mono',monospace; font-size:10px; color:${color};
+        overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escHtml(name)}">${escHtml(name)}</span>
+      ${badge}
+    </div>`;
+  });
+
+  panel.innerHTML = cards.join('');
+  if (stats) stats.textContent = ` · 待${pendingCount} · 完成${doneCount}${failCount?` · 失败${failCount}`:''}`;
+}
+
+// 从文件读取并刷新查看面板
+async function refreshQueueView() {
+  const btn = document.getElementById('btnQueueRefresh');
+  if (btn) { btn.textContent = '⏳'; btn.disabled = true; }
+  try {
+    const res = await fetch('/api/supervisor/queue_read', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({file_path: _supQueueFile})
+    });
+    const data = await res.json();
+    if (data.success) {
+      renderQueueView(data.content);
+    }
+  } catch(e) { console.warn('刷新队列失败:', e); }
+  finally {
+    if (btn) { btn.textContent = '🔄 刷新'; btn.disabled = false; }
   }
 }
+
+// 从文件加载内容（外部兼容调用）
+async function loadQueueContent() {
+  await refreshQueueView();
+}
+
+// 进入编辑模式
+function enterQueueEdit() {
+  _queueEditMode = true;
+  const view = document.getElementById('queueViewPanel');
+  const ta = document.getElementById('supQueueEditor');
+  const btnEdit = document.getElementById('btnQueueEdit');
+  const btnRefresh = document.getElementById('btnQueueRefresh');
+  const btnSave = document.getElementById('btnQueueSave');
+  const btnCancel = document.getElementById('btnQueueCancel');
+  if (view) view.style.display = 'none';
+  if (ta) { ta.style.display = ''; ta.value = _queueRawContent; ta.focus(); }
+  if (btnEdit) btnEdit.style.display = 'none';
+  if (btnRefresh) btnRefresh.style.display = 'none';
+  if (btnSave) btnSave.style.display = '';
+  if (btnCancel) btnCancel.style.display = '';
+}
+
+// 取消编辑，回到查看模式
+function cancelQueueEdit() {
+  _queueEditMode = false;
+  const view = document.getElementById('queueViewPanel');
+  const ta = document.getElementById('supQueueEditor');
+  const btnEdit = document.getElementById('btnQueueEdit');
+  const btnRefresh = document.getElementById('btnQueueRefresh');
+  const btnSave = document.getElementById('btnQueueSave');
+  const btnCancel = document.getElementById('btnQueueCancel');
+  if (ta) ta.style.display = 'none';
+  if (view) view.style.display = '';
+  if (btnEdit) btnEdit.style.display = '';
+  if (btnRefresh) btnRefresh.style.display = '';
+  if (btnSave) btnSave.style.display = 'none';
+  if (btnCancel) btnCancel.style.display = 'none';
+}
+
+// 保存编辑内容并回到查看模式
+async function saveQueueContent() {
+  const ta = document.getElementById('supQueueEditor');
+  if (!ta) return;
+  const content = ta.value;
+  const btnSave = document.getElementById('btnQueueSave');
+  if (btnSave) { btnSave.textContent = '⏳'; btnSave.disabled = true; }
+  try {
+    const res = await fetch('/api/supervisor/queue_save', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({file_path: _supQueueFile, content})
+    });
+    const data = await res.json();
+    if (data.success) {
+      renderQueueView(content);  // 立即更新查看面板
+      cancelQueueEdit();         // 退出编辑模式
+    } else {
+      alert('保存失败：' + (data.error || '未知错误'));
+    }
+  } catch(e) { alert('保存失败：' + e); }
+  finally {
+    if (btnSave) { btnSave.textContent = '💾 保存'; btnSave.disabled = false; }
+  }
+}
+
+// 页面就绪后自动加载
+setTimeout(() => { refreshQueueView(); }, 600);
+
 
 async function startSupervisor() {
   const btnStart = document.getElementById('btnStartSup');
@@ -3473,10 +4321,13 @@ async function startSupervisor() {
   const interval = document.getElementById('supInterval').value;
   const max_loops = document.getElementById('supLoops').value;
   const contact = document.getElementById('supContact').value;
+  const proj = SUPERVISOR_PROJECTS[_supProjectId];
+  const queue_file = proj.queue_file;
+  const output_dir = proj.output_dir;
   try {
       await fetch('/api/supervisor/start', {
           method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({interval, max_loops, contact, queue_file: _supQueueFile})
+          body: JSON.stringify({interval, max_loops, contact, queue_file, output_dir})
       });
       if(!window.supervisorTimer) {
           window.supervisorTimer = setInterval(pollSupervisor, 2000);
@@ -3498,6 +4349,8 @@ async function pollSupervisor() {
       const res = await fetch('/api/supervisor/status');
       const data = await res.json();
       renderSupervisorData(data);
+      // 监工运行时同步刷新任务列表（非编辑模式才刷新，防止覆盖正在编辑的内容）
+      if (!_queueEditMode) refreshQueueView();
       if(!data.running && window.supervisorTimer) {
           clearInterval(window.supervisorTimer);
           window.supervisorTimer = null;
@@ -3541,8 +4394,8 @@ function renderSupervisorData(data) {
       </div>
   </div>`);
   if (data.logs && data.logs.length > 0) {
-      html.push('<div style="font-weight:600; margin-bottom:8px;">实时监工日志 (Top 50)</div>');
-      html.push('<div style="font-family:var(--font-mono); font-size:11px; line-height:1.6; background:#18181b; padding:12px; border-radius:6px; max-height:400px; overflow-y:auto; color:#a1a1aa; border:1px inset #27272a;">');
+      html.push(`<div style="font-weight:600; margin-bottom:8px;">实时监工日志（共 ${data.logs.length} 条）</div>`);
+      html.push('<div style="font-family:var(--font-mono); font-size:11px; line-height:1.6; background:#18181b; padding:12px; border-radius:6px; height:calc(100vh - 360px); min-height:300px; overflow-y:auto; color:#a1a1aa; border:1px inset #27272a;">');
       data.logs.forEach(lg => {
           html.push(`<div style="margin-bottom:4px; padding-bottom:4px; border-bottom:1px solid #27272a;"><span style="color:#60a5fa">[${lg.time}]</span> ${escHtml(lg.message)}</div>`);
       });

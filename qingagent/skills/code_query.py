@@ -97,6 +97,7 @@ class CodeQuerySkill(BaseSkill):
     """多项目代码知识库查询 Skill。"""
 
     app_name    = "CodeQuery"
+    ui_label    = "代码知识库查询"
     app_aliases = [
         "查代码", "查项目", "查接口", "查页面", "查跳转",
         "代码查询", "oa查询", "项目知识库",

@@ -23,14 +23,16 @@ class AGSupervisor:
         self.idle_no_status_count = 0  # 连续空闲但文件无状态的计数器
         # 默认扫库队列文件路径（start() 调用时可覆盖）
         self.queue_file = "/Users/konglingjia/AndroidStudioProjects/Fang_oa/docs/scan_queue.txt"
-        # review 追踪日志路径
-        self.review_log_file = "/Users/konglingjia/AndroidStudioProjects/Fang_oa/docs/ai-native/domains/auto-scan/review_log.md"
+        # 档案输出目录（auto-scan md 文件写入位置，start() 调用时可覆盖）
+        self.output_dir = "/Users/konglingjia/AndroidStudioProjects/Fang_oa/docs/ai-native/domains/auto-scan"
+        # review 追踪日志路径（自动跟随 output_dir，也可在 start() 中单独覆盖）
+        self.review_log_file = os.path.join(self.output_dir, "review_log.md")
 
     def log(self, msg: str):
         with self.lock:
             ts = datetime.now().strftime("%H:%M:%S")
             self._logs.insert(0, {"time": ts, "message": msg})
-            if len(self._logs) > 50:
+            if len(self._logs) > 200:
                 self._logs.pop()
 
     def get_status(self):
@@ -99,7 +101,8 @@ class AGSupervisor:
         except Exception as e:
             self.log(f"⚠️ 更新 review_log 失败: {e}")
 
-    def start(self, interval: int, max_loops: int, contact_name: str, queue_file: str = None):
+    def start(self, interval: int, max_loops: int, contact_name: str,
+              queue_file: str = None, output_dir: str = None):
         with self.lock:
             if self._running:
                 return False
@@ -113,7 +116,11 @@ class AGSupervisor:
             # 若传入了自定义队列文件路径，则覆盖默认值
             if queue_file:
                 self.queue_file = queue_file
-            self.log(f"🚀 AG 监工启动 | 间隔: {interval}秒 | 批次: {max_loops} | 队列: {self.queue_file}")
+            # 若传入了自定义输出目录，则覆盖默认值并同步更新 review_log_file
+            if output_dir:
+                self.output_dir = output_dir.rstrip("/")
+                self.review_log_file = os.path.join(self.output_dir, "review_log.md")
+            self.log(f"🚀 AG 监工启动 | 间隔: {interval}秒 | 批次: {max_loops} | 队列: {self.queue_file} | 输出目录: {self.output_dir}")
 
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
@@ -164,8 +171,9 @@ class AGSupervisor:
         skill_os = OSControlSkill()
         skill_wechat = WeChatSkill()
 
-        # 提前读取队列文件路径（避免 SUCCESS 分支才定义导致第一轮 NameError）
+        # 提前读取队列/输出目录路径（避免 SUCCESS 分支才定义导致第一轮 NameError）
         queue_file = self.queue_file
+        output_dir = self.output_dir
 
         skip_next_sleep = False
         prev_hardware_red = False  # 状态机：追踪上一轮按钮是否是 C 态（红色执行中）
@@ -416,14 +424,14 @@ class AGSupervisor:
                                 # ★ 安全设计：先构建任务文本，不立即删队列，等激活窗口成功后再出队
                                 task_target = (
                                     f"[自动调度] 扫库节点：{target_class}。请执行动态探索，严格按以下格式输出：\n\n"
-                                    f"## 步骤1：生成 domains/auto-scan/{target_class}.md\n"
+                                    f"## 步骤1：生成 {output_dir}/{target_class}.md\n"
                                     f"文件内容必须包含以下所有章节（不可省略）：\n"
                                     f"```\n"
                                     f"# [扫库档案] {target_class}\n"
-                                    f"> **父类**：`父类类名` → [父类类名.md](./父类类名.md)\n"
+                                    f"> **父类**：`父类类名` → [父类类名.md]({output_dir}/父类类名.md)\n"
                                     f"（父类通过 grep 'extends' 或 ':' 从源文件中提取；\n"
                                     f"  若父类是 BaseActivity/InitActivity/InitNewActivity/BaseNewActivity/CordovaActivityInheritor，\n"
-                                    f"  必须链接到 auto-scan/ 下对应的 .md 档案；\n"
+                                    f"  必须链接到 {output_dir}/ 下对应的 .md 档案；\n"
                                     f"  若是其他父类如 AppCompatActivity/Fragment 等，只写类名不加链接）\n"
                                     f"## 类别\n（入口层 / 业务层 / 工具层 / 组件层，选一个并说明原因）\n"
                                     f"## 职责\n（1-3句，精准描述这个类做什么）\n"
@@ -432,13 +440,13 @@ class AGSupervisor:
                                     f"## 强依赖的其他类\n（通过 new / startActivity / Intent 强调用的类名）\n"
                                     f"## 潜在风险点\n（并发问题、权限、版本兼容、历史坑点，没有就写'暂无已知风险'）\n"
                                     f"```\n\n"
-                                    f"## 步骤2：追加接口到 domains/auto-scan/api_catalog.md\n"
+                                    f"## 步骤2：追加接口到 {output_dir}/api_catalog.md\n"
                                     f"若本类有网络接口调用，向 api_catalog.md 底部追加表格行：\n"
                                     f"| {target_class} | /接口URL | GET/POST | 功能说明 |\n\n"
-                                    f"## 步骤3：顶置新依赖到 scan_queue.txt\n"
-                                    f"把本类中 startActivity 跳转的目标类、尚未在 processed_classes.txt 中的类，顶置到队列首行。\n\n"
-                                    f"## 步骤4：本类名写入 processed_classes.txt\n\n"
-                                    f"## 步骤5：路由图追加到 global_routing_graph.md\n"
+                                    f"## 步骤3：顶置新依赖到 {queue_file}\n"
+                                    f"把本类中 startActivity 跳转的目标类、尚未在 {output_dir}/processed_classes.txt 中的类，顶置到队列首行。\n\n"
+                                    f"## 步骤4：本类名写入 {output_dir}/processed_classes.txt\n\n"
+                                    f"## 步骤5：路由图追加到 {output_dir}/global_routing_graph.md\n"
                                     f"格式：上一节点 -> {target_class}(调用特征/触发条件)\n"
                                     f"{target_class} -> 跳转目标(触发条件)\n\n"
                                     f"## 步骤6（必须最后执行）：更新任务状态标记\n"

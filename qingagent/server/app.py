@@ -3541,6 +3541,7 @@ const MODELS = [
   {id:'omlx_qwen_claude_27b', label:'Claude 蒸馏版 27B', engine:'oMLX', color:'#ec4899'},
   {id:'omlx_qwen_35b_8bit', label:'Qwen 3.6 35B 8bit', engine:'oMLX',   color:'#059669'},
   {id:'ollama_qwen_35b',    label:'Qwen 3.6 35B',      engine:'Ollama', color:'#34d399'},
+  {id:'omlx_qwen25vl_7b',   label:'Qwen2.5-VL 7B',     engine:'oMLX',   color:'#a855f7'},
 ];
 
 // ── 状态 ────────────────────────────────────────────────────

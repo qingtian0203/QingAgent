@@ -127,6 +127,30 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                     self.send_error(404, "Image not found")
             else:
                 self.send_error(400, "Invalid image path")
+        elif parsed.path == "/api/sys/memory":
+            import requests as _req
+            import subprocess
+            mem_data = {"omlx": {"status": "offline", "rss_bytes": 0}, "ollama": {"status": "offline", "models": []}}
+            # 1. 抓取 oMLX 内存
+            try:
+                # 过滤出 8000 端口并找到其真实物理内存 rss（KB -> Bytes）
+                cmd = "lsof -i :8000 | grep LISTEN | awk '{print $2}' | xargs -I {} ps -o rss= -p {}"
+                res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if res.returncode == 0 and res.stdout.strip():
+                    mem_data["omlx"]["status"] = "online"
+                    mem_data["omlx"]["rss_bytes"] = int(res.stdout.strip()) * 1024
+            except Exception as e:
+                print(f"[sys_memory] omlx error: {e}")
+            
+            # 2. 抓取 Ollama 加载模型
+            try:
+                res = _req.get("http://localhost:11434/api/ps", timeout=2)
+                if res.status_code == 200:
+                    mem_data["ollama"]["status"] = "online"
+                    mem_data["ollama"]["models"] = res.json().get("models", [])
+            except Exception as e:
+                pass
+            self._json_response({"success": True, "data": mem_data})
         else:
             self.send_error(404)
 
@@ -279,6 +303,31 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                 self._json_response({"success": True, "path": file_path})
             except Exception as e:
                 self._json_response({"success": False, "error": str(e)})
+        elif parsed.path == "/api/sys/action":
+            data = self._read_post_body()
+            action = data.get("action")
+            engine = data.get("engine")
+            model = data.get("model")
+            
+            import subprocess
+            import requests as _req
+            if engine == "omlx" and action == "restart":
+                try:
+                    # 强杀 omlx 进程然后静默重启
+                    cmd = "kill -9 $(lsof -t -i :8000) 2>/dev/null; nohup /opt/homebrew/opt/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python /opt/homebrew/opt/omlx/bin/omlx serve > ~/.omlx.log 2>&1 &"
+                    subprocess.run(cmd, shell=True)
+                    self._json_response({"success": True, "message": "oMLX 引擎已触发重启"})
+                except Exception as e:
+                    self._json_response({"success": False, "error": str(e)})
+            elif engine == "ollama" and action == "unload" and model:
+                try:
+                    # Ollama unload 模型 API（发送 keep_alive=0）
+                    _req.post("http://localhost:11434/api/generate", json={"model": model, "keep_alive": 0}, timeout=2)
+                    self._json_response({"success": True, "message": f"已释放模型 {model}"})
+                except Exception as e:
+                    self._json_response({"success": False, "error": str(e)})
+            else:
+                self._json_response({"success": False, "error": "未知操作"})
         else:
             self.send_error(404)
 
@@ -3255,12 +3304,132 @@ input[type=file]{color:var(--muted);}
     </div>
   </div>
   <div style="display:flex; align-items:center; gap:16px;">
+    <button class="theme-toggle" id="sysMemBtn" onclick="toggleSysMemPanel()" title="算力引擎控制台" style="font-size:12px; padding:0 8px; display:flex; align-items:center; gap:4px;">
+      ⚡ <span id="sysMemBrief" style="font-family:'JetBrains Mono',monospace; font-size:10px;">--</span>
+    </button>
     <button class="theme-toggle" id="themeToggleBtn" onclick="toggleTheme()" title="切换明/暗主题">
         <!-- SVG -->
     </button>
     <a class="back" href="/" style="display:flex;align-items:center;gap:4px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg> 返回控制台</a>
   </div>
 </div>
+
+<!-- 算力控制台悬浮窗 -->
+<div id="sysMemPanel" style="display:none; position:absolute; top:50px; right:20px; width:280px; 
+     background:var(--card); border:1px solid var(--border); border-radius:12px; 
+     box-shadow:0 10px 30px rgba(0,0,0,0.5); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
+     z-index:9999; padding:16px; display:flex; flex-direction:column; gap:16px;">
+  
+  <div style="display:flex; justify-content:space-between; align-items:center;">
+    <div style="font-weight:600; font-size:13px; display:flex; align-items:center; gap:6px;">⚡ 算力引擎状态</div>
+    <button onclick="toggleSysMemPanel()" style="background:transparent; border:none; color:var(--muted); cursor:pointer; font-size:14px;">✕</button>
+  </div>
+  
+  <!-- oMLX -->
+  <div style="background:rgba(0,0,0,0.2); border:1px solid var(--border); border-radius:8px; padding:12px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+      <span style="font-size:12px; font-weight:600;">oMLX 守护进程</span>
+      <span id="omlxStatus" style="font-size:10px; padding:2px 6px; border-radius:10px; background:var(--bdg); color:var(--muted);">检测中...</span>
+    </div>
+    <div style="font-size:10px; color:var(--muted); font-family:'JetBrains Mono',monospace; margin-bottom:10px;">
+      物理内存驻留 (RSS): <span id="omlxRss" style="color:var(--text); font-weight:bold;">--</span>
+    </div>
+    <button onclick="sysAction('omlx', 'restart')" style="width:100%; padding:6px; font-size:11px; background:rgba(239,68,68,0.15); color:#f87171; border:1px solid rgba(239,68,68,0.3); border-radius:6px; cursor:pointer; transition:0.2s;">
+      💥 重启引擎释放显存
+    </button>
+  </div>
+  
+  <!-- Ollama -->
+  <div style="background:rgba(0,0,0,0.2); border:1px solid var(--border); border-radius:8px; padding:12px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+      <span style="font-size:12px; font-weight:600;">Ollama 服务</span>
+      <span id="ollamaStatus" style="font-size:10px; padding:2px 6px; border-radius:10px; background:var(--bdg); color:var(--muted);">检测中...</span>
+    </div>
+    <div id="ollamaModels" style="display:flex; flex-direction:column; gap:6px; margin-bottom:10px;">
+      <div style="font-size:10px; color:var(--muted); text-align:center;">暂无模型加载</div>
+    </div>
+  </div>
+
+</div>
+<script>
+  let sysMemTimer = null;
+  function toggleSysMemPanel() {
+    const p = document.getElementById('sysMemPanel');
+    if(p.style.display === 'none' || p.style.display === '') {
+      p.style.display = 'flex';
+      fetchSysMem();
+      sysMemTimer = setInterval(fetchSysMem, 3000);
+    } else {
+      p.style.display = 'none';
+      if(sysMemTimer) clearInterval(sysMemTimer);
+    }
+  }
+  
+  async function fetchSysMem() {
+    try {
+      const res = await fetch('/api/sys/memory');
+      const j = await res.json();
+      if(j.success) {
+        const d = j.data;
+        // oMLX
+        if(d.omlx.status === 'online') {
+          document.getElementById('omlxStatus').textContent = '🟢 运行中';
+          document.getElementById('omlxStatus').style.color = 'var(--green)';
+          document.getElementById('omlxStatus').style.background = 'rgba(74,222,128,0.1)';
+          const gb = (d.omlx.rss_bytes / 1024 / 1024 / 1024).toFixed(1);
+          document.getElementById('omlxRss').textContent = gb + ' GB';
+          document.getElementById('sysMemBrief').textContent = gb + 'G';
+        } else {
+          document.getElementById('omlxStatus').textContent = '🔴 离线';
+          document.getElementById('omlxStatus').style.color = 'var(--red)';
+          document.getElementById('omlxRss').textContent = '--';
+        }
+        
+        // Ollama
+        if(d.ollama.status === 'online') {
+          document.getElementById('ollamaStatus').textContent = '🟢 运行中';
+          document.getElementById('ollamaStatus').style.color = 'var(--green)';
+          const mList = document.getElementById('ollamaModels');
+          if(d.ollama.models.length === 0) {
+            mList.innerHTML = '<div style="font-size:10px; color:var(--muted); text-align:center;">无缓存模型</div>';
+          } else {
+            mList.innerHTML = d.ollama.models.map(m => {
+              const gb = (m.size_vram / 1024 / 1024 / 1024).toFixed(1);
+              return `<div style="display:flex; justify-content:space-between; align-items:center; background:rgba(255,255,255,0.05); padding:4px 8px; border-radius:4px;">
+                <span style="font-size:10px; font-family:'JetBrains Mono',monospace;">${m.name.split(':')[0]}</span>
+                <div style="display:flex; align-items:center; gap:6px;">
+                  <span style="font-size:9px; color:var(--muted);">${gb}G</span>
+                  <button onclick="sysAction('ollama', 'unload', '${m.name}')" style="background:none; border:none; color:#f87171; cursor:pointer; font-size:10px; padding:0;">✕</button>
+                </div>
+              </div>`;
+            }).join('');
+          }
+        } else {
+          document.getElementById('ollamaStatus').textContent = '🔴 离线';
+          document.getElementById('ollamaStatus').style.color = 'var(--red)';
+        }
+      }
+    } catch(e) {}
+  }
+  
+  async function sysAction(engine, action, model=null) {
+    try {
+      const res = await fetch('/api/sys/action', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({engine, action, model})
+      });
+      const j = await res.json();
+      if(!j.success) alert(j.error);
+      setTimeout(fetchSysMem, 500);
+    } catch(e) {
+      alert(e);
+    }
+  }
+  
+  // 页面加载时拉一次简报
+  window.addEventListener('DOMContentLoaded', fetchSysMem);
+</script>
+
 
 <!-- Tab 选择 -->
 <div class="tabs">

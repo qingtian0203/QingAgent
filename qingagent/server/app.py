@@ -912,29 +912,10 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                 before_files = set(os.listdir(debug_dir))
 
                 t0 = time.time()
-                if mode == "single":
-                    # ── 单次定位：直接调用底层推理，不做放大裁剪 ──
-                    pos = _vision._single_find_call(image_b64, desc, "这是一张应用界面截图")
-                    elapsed = round(time.time() - t0, 2)
-                    # 为单次结果生成调试标注图
-                    if pos:
-                        try:
-                            import io as _io, base64 as _b64e
-                            from PIL import Image as _PILImg
-                            _raw = _PILImg.open(_io.BytesIO(_b64e.b64decode(image_b64)))
-                            _iw, _ih = _raw.size
-                            _px = (pos["rx"] / 1000.0) * _iw
-                            _py = (pos["ry"] / 1000.0) * _ih
-                            _ts = time.strftime("%H%M%S")
-                            _kw = "".join(c for c in desc[:8] if c.isalnum() or c in "_-") or "elem"
-                            _vision._draw_cross_for_debug(_raw.copy(), _px, _py,
-                                f"{_ts}_{_kw}_single_CLICK.png", label="单次")
-                        except Exception as _de:
-                            print(f"⚠️ 单次定位调试图生成失败: {_de}")
-                else:
-                    # ── 三重放大定位（默认，原逻辑）──
-                    pos = _vision.find_element(image_b64, desc, context="这是一张应用界面截图")
-                    elapsed = round(time.time() - t0, 2)
+                # 兼容前端传递的 mode 参数
+                vision_mode = "SUPER_ZOOM" if mode == "super_zoom" else ("SINGLE" if mode == "single" else "CALM")
+                pos = _vision.find_element(image_b64, desc, context="这是一张应用界面截图", mode=vision_mode)
+                elapsed = round(time.time() - t0, 2)
 
                 # 收集此次新生成的调试截图
                 after_files = set(os.listdir(debug_dir))
@@ -3488,12 +3469,17 @@ input[type=file]{color:var(--muted);}
           <label id="vision-mode-triple" style="display:flex;align-items:center;gap:5px;padding:5px 10px;border-radius:6px;border:1px solid var(--as);background:rgba(102,126,234,0.15);cursor:pointer;font-size:11px;color:var(--text);transition:.18s;">
             <input type="radio" name="visionMode" value="triple" checked style="display:none;">
             <svg width="11" height="11" viewBox="0 0 10 10"><polygon points="5,0.5 9.5,9.5 0.5,9.5" fill="currentColor"/></svg>
-            棱镜追踪（精准）
+            冷静追踪（3次）
+          </label>
+          <label id="vision-mode-super_zoom" style="display:flex;align-items:center;gap:5px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--btn-bg);cursor:pointer;font-size:11px;color:var(--muted);transition:.18s;">
+            <input type="radio" name="visionMode" value="super_zoom" style="display:none;">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="4"/></svg>
+            超级多倍（5次）
           </label>
           <label id="vision-mode-single" style="display:flex;align-items:center;gap:5px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--btn-bg);cursor:pointer;font-size:11px;color:var(--muted);transition:.18s;">
             <input type="radio" name="visionMode" value="single" style="display:none;">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
-            单次定位（快速）
+            单次定位（极速）
           </label>
         </div>
       </div>
@@ -3906,23 +3892,18 @@ async function runCode(warmup, m) {
 document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('input[name="visionMode"]').forEach(radio => {
     radio.addEventListener('change', () => {
-      const tripleLabel = document.getElementById('vision-mode-triple');
-      const singleLabel = document.getElementById('vision-mode-single');
-      if (radio.value === 'triple' && radio.checked) {
-        tripleLabel.style.borderColor = 'var(--as)';
-        tripleLabel.style.background = 'rgba(102,126,234,0.15)';
-        tripleLabel.style.color = 'var(--text)';
-        singleLabel.style.borderColor = 'var(--border)';
-        singleLabel.style.background = 'var(--btn-bg)';
-        singleLabel.style.color = 'var(--muted)';
-      } else if (radio.value === 'single' && radio.checked) {
-        singleLabel.style.borderColor = 'var(--as)';
-        singleLabel.style.background = 'rgba(102,126,234,0.15)';
-        singleLabel.style.color = 'var(--text)';
-        tripleLabel.style.borderColor = 'var(--border)';
-        tripleLabel.style.background = 'var(--btn-bg)';
-        tripleLabel.style.color = 'var(--muted)';
-      }
+      document.querySelectorAll('input[name="visionMode"]').forEach(r => {
+        const lbl = r.parentElement;
+        if (r.checked) {
+          lbl.style.borderColor = 'var(--as)';
+          lbl.style.background = 'rgba(102,126,234,0.15)';
+          lbl.style.color = 'var(--text)';
+        } else {
+          lbl.style.borderColor = 'var(--border)';
+          lbl.style.background = 'var(--btn-bg)';
+          lbl.style.color = 'var(--muted)';
+        }
+      });
     });
   });
   // label 点击也触发 radio change
@@ -4086,9 +4067,14 @@ function redrawDots() {
 function updateLegend() {
   const el = document.getElementById('dotLegend');
   el.innerHTML = visionDots.map(pt => {
-    const icon = pt.mode === 'triple'
-      ? `<svg width="9" height="9" viewBox="0 0 10 10" style="flex-shrink:0;"><polygon points="5,0.5 9.5,9.5 0.5,9.5" fill="${pt.color}" stroke="rgba(255,255,255,0.5)" stroke-width="0.8"/></svg>`
-      : `<span class="legend-dot" style="background:${pt.color};flex-shrink:0;"></span>`;
+    let icon = '';
+    if (pt.mode === 'triple') {
+      icon = `<svg width="9" height="9" viewBox="0 0 10 10" style="flex-shrink:0;"><polygon points="5,0.5 9.5,9.5 0.5,9.5" fill="${pt.color}" stroke="rgba(255,255,255,0.5)" stroke-width="0.8"/></svg>`;
+    } else if (pt.mode === 'super_zoom') {
+      icon = `<svg width="10" height="10" viewBox="0 0 24 24" style="flex-shrink:0;"><circle cx="12" cy="12" r="10" fill="none" stroke="${pt.color}" stroke-width="3"/><circle cx="12" cy="12" r="4" fill="${pt.color}"/></svg>`;
+    } else {
+      icon = `<span class="legend-dot" style="background:${pt.color};flex-shrink:0;"></span>`;
+    }
     return `<div class="legend-item">${icon} ${escHtml(pt.label)}</div>`;
   }).join('');
 }

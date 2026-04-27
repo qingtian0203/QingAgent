@@ -249,17 +249,22 @@ def find_element(
     img_b64: str,
     description: str,
     context: str = "软件截图",
+    mode: str = "CALM",
 ) -> dict | None:
     """
-    用 AI 视觉模型在截图中定位元素（已升级为：三段式防偏锁心微操策略）。
-    1. 全图找大势
-    2. 300x300 截取大体框纠正漂移错觉
-    3. 80x80 指甲盖截取强迫模型中心对齐点杀
-    （自带 debug_stage1/2/3 打印机制）
+    用 AI 视觉模型在截图中定位元素（支持多模式微操策略）。
+    可选模式：
+      - SINGLE: 单次定位（全景粗寻一次即返回）
+      - CALM: 冷静追踪（3段式：全图 -> 300x300 -> 80x80）
+      - SUPER_ZOOM: 超级多倍（针对小模型眼花，5段式放大：全图 -> 600x600 -> 300x300 -> 150x150 -> 60x60）
     """
     res_stage1 = _single_find_call(img_b64, description, context)
     if not res_stage1:
         return None
+
+    if mode == "SINGLE":
+        print(f"🔍 [单次定位] {description[:10]}... 立即返回全图结果")
+        return res_stage1
 
     try:
         img = __b64_to_img(img_b64)
@@ -275,39 +280,38 @@ def find_element(
     kw = "".join(c for c in description[:8] if c.isalnum() or c in "_-") or "elem"
     prefix = f"{ts}_{kw}"
 
-    px1 = (res_stage1["rx"] / 1000.0) * img_w
-    py1 = (res_stage1["ry"] / 1000.0) * img_h
-    print(f"🔍 [段1-全景粗寻] {description[:10]}... -> x={px1:.0f}, y={py1:.0f}")
-    # 全图 + Stage1 标注（最关键，能看出截图内容对不对）
-    _draw_cross_for_debug(img.copy(), px1, py1, f"{prefix}_1_full.png", label="S1")
+    cur_px = (res_stage1["rx"] / 1000.0) * img_w
+    cur_py = (res_stage1["ry"] / 1000.0) * img_h
+    print(f"🔍 [全景寻点] {description[:10]}... -> x={cur_px:.0f}, y={cur_py:.0f}")
+    # 全图标注
+    _draw_cross_for_debug(img.copy(), cur_px, cur_py, f"{prefix}_0_full.png", label="S0")
 
-    l2, t_box2, r2, b2 = __get_crop_box(px1, py1, img_w, img_h, 300)
-    crop2 = img.crop((l2, t_box2, r2, b2))
-    res_stage2 = _single_find_call(__img_to_b64(crop2), description, context)
-    if not res_stage2:
-        return res_stage1
+    if mode == "SUPER_ZOOM":
+        box_sizes = [600, 300, 150, 60]
+    else:
+        # CALM (默认模式)
+        box_sizes = [300, 80]
 
-    px2 = l2 + (res_stage2["rx"] / 1000.0) * crop2.width
-    py2 = t_box2 + (res_stage2["ry"] / 1000.0) * crop2.height
-    print(f"🎯 [段2-包容纠偏] 300x300框定后 -> x={px2:.1f}, y={py2:.1f}")
-    # 全图上画第二轮标注点（统一全局视角）
-    _draw_cross_for_debug(img.copy(), px2, py2, f"{prefix}_2_full.png", label="S2")
+    for idx, bsize in enumerate(box_sizes):
+        left, top, right, bottom = __get_crop_box(cur_px, cur_py, img_w, img_h, bsize)
+        crop_img = img.crop((left, top, right, bottom))
+        res_crop = _single_find_call(__img_to_b64(crop_img), description, context)
+        
+        if not res_crop:
+            print(f"⚠️ 放大追踪阶段 {idx+1} ({bsize}x{bsize}) 失败，保持上一轮坐标")
+            break
+            
+        cur_px = left + (res_crop["rx"] / 1000.0) * crop_img.width
+        cur_py = top + (res_crop["ry"] / 1000.0) * crop_img.height
+        print(f"🎯 [{mode}缩放 {idx+1}] 框尺寸 {bsize}x{bsize} -> 纠偏后 x={cur_px:.1f}, y={cur_py:.1f}")
+        _draw_cross_for_debug(img.copy(), cur_px, cur_py, f"{prefix}_{idx+1}_{bsize}.png", label=f"S{idx+1}")
 
-    l3, t_box3, r3, b3 = __get_crop_box(px2, py2, img_w, img_h, 80)
-    crop3 = img.crop((l3, t_box3, r3, b3))
-    res_stage3 = _single_find_call(__img_to_b64(crop3), description, context)
-    if not res_stage3:
-        return {"rx": int(px2 / img_w * 1000), "ry": int(py2 / img_h * 1000)}
-
-    final_px = l3 + (res_stage3["rx"] / 1000.0) * crop3.width
-    final_py = t_box3 + (res_stage3["ry"] / 1000.0) * crop3.height
-    print(f"🔬 [段3-极限锁心] 80x80显微绝杀 -> x={final_px:.1f}, y={final_py:.1f}")
-    # 全图最终点击位置（最重要）
-    _draw_cross_for_debug(img.copy(), final_px, final_py, f"{prefix}_3_CLICK.png", label="点击")
+    # 全图最终点击位置
+    _draw_cross_for_debug(img.copy(), cur_px, cur_py, f"{prefix}_CLICK.png", label="点击")
 
     return {
-        "rx": int(final_px / img_w * 1000),
-        "ry": int(final_py / img_h * 1000)
+        "rx": int(cur_px / img_w * 1000),
+        "ry": int(cur_py / img_h * 1000)
     }
 
 def find_element_bounds(
@@ -368,6 +372,7 @@ def find_element_with_retry(
     description: str,
     context: str = "软件截图",
     max_retries: int = None,
+    mode: str = "CALM",
 ) -> dict | None:
     """
     带重试的元素定位 — 视觉 AI 不是 100% 准确，多试几次。
@@ -377,6 +382,7 @@ def find_element_with_retry(
         description: 元素描述
         context: 截图上下文
         max_retries: 最大重试次数（默认使用配置值）
+        mode: 视觉追踪模式 (SINGLE, CALM, SUPER_ZOOM)
 
     返回:
         归一化坐标或 None
@@ -388,7 +394,7 @@ def find_element_with_retry(
             print(f"🔄 第 {attempt + 1}/{retries} 次重试定位【{description}】...")
             time.sleep(1)
 
-        result = find_element(img_b64, description, context)
+        result = find_element(img_b64, description, context, mode=mode)
         if result:
             return result
 

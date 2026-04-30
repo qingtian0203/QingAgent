@@ -59,7 +59,15 @@ class OSControlSkill(BaseSkill):
         self.add_intent(Intent(
             name="prepare_file",
             ui_label="查找 / 准备本地文件",
-            description="搜寻并准备要发送/上传的文件。如果用户明确指出了文件的所在位置（如 桌面的/下载里的/文稿里的），**必须**将其提取到 search_dir 参数中。如果用户提供的是带有前缀 '/' 的长绝对路径，直接将其作为 filename。如果是普通的模糊名字（如'年度报表'），将使用系统底层引擎全文检索。",
+            description=(
+                "搜寻本地文件并将其放入剪贴板，为下一步发送做准备。"
+                "⚠️ 本步骤只负责查找+放入剪贴板，不负责发送！发送必须由 WeChat.send_message 等后续步骤完成。\n"
+                "- 用户给出绝对路径（以 '/' 开头）：直接作为 filename 参数。\n"
+                "- 用户说'桌面的/下载里的/文稿里的'：提取目录到 search_dir。\n"
+                "- 模糊文件名：全文检索。\n"
+                "续接任务场景：如果指令包含'续接任务'或'选定的文件路径'，"
+                "说明这是多步任务的中间结果，文件路径后面必须跟着 send_message 步骤发给对应联系人。"
+            ),
             required_slots=["filename"],
             optional_slots=["search_dir"],
             output_fields=["file_path"],
@@ -70,6 +78,7 @@ class OSControlSkill(BaseSkill):
                 "搜一下年度报表",
             ]
         ))
+
 
         # 网页全页截图兜底路由：小模型可能误路由到 System，这里委托给浏览器处理
         self.add_intent(Intent(
@@ -424,6 +433,13 @@ close access fileRef
         try:
             subprocess.run(["osascript", "-e", script])
             print(f"📋 幽灵载入：文件 {filepath} 已灌入物理剪贴板！")
+            # 把路径写入临时文件，供后续 send_message 在搜索联系人后重新灌入
+            # （macOS 搜索框输入中文时会用剪贴板传输汉字，把文件挤到第二位）
+            try:
+                with open("/tmp/qingagent_last_clipboard_file.txt", "w") as _f:
+                    _f.write(filepath)
+            except Exception as _e:
+                print(f"⚠️ 临时路径记录失败（不影响主流程）: {_e}")
             return {
                 "success": True,
                 "message": f"文件锁具确认，已装填入剪贴板发射舱准备接续动作：{filepath}",

@@ -262,10 +262,6 @@ def find_element(
     if not res_stage1:
         return None
 
-    if mode == "SINGLE":
-        print(f"🔍 [单次定位] {description[:10]}... 立即返回全图结果")
-        return res_stage1
-
     try:
         img = __b64_to_img(img_b64)
         img_w, img_h = img.width, img.height
@@ -283,6 +279,12 @@ def find_element(
     cur_px = (res_stage1["rx"] / 1000.0) * img_w
     cur_py = (res_stage1["ry"] / 1000.0) * img_h
     print(f"🔍 [全景寻点] {description[:10]}... -> x={cur_px:.0f}, y={cur_py:.0f}")
+
+    if mode == "SINGLE":
+        print(f"🔍 [单次定位] 立即返回全图结果")
+        _draw_cross_for_debug(img.copy(), cur_px, cur_py, f"{prefix}_single_CLICK.png", label="单次")
+        return res_stage1
+
     # 全图标注
     _draw_cross_for_debug(img.copy(), cur_px, cur_py, f"{prefix}_0_full.png", label="S0")
 

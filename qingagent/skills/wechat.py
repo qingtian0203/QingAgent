@@ -33,13 +33,22 @@ class WeChatSkill(BaseSkill):
         self.add_intent(Intent(
             name="send_message",
             ui_label="发送消息 / 图片 / 文件",
-            description="给指定联系人或群发消息。如果要发图片，请将 image_path 填入参数（支持 ${stepN.screenshot_path}）；如果只提了发图片但没路径，message可以填'「粘贴」'作为后备。",
-            required_slots=["contact_name", "message"],
-            optional_slots=["image_path"],
+            description=(
+                "给指定联系人或群发送消息、图片或文件。\n"
+                "- 发文字：填 contact_name + message。\n"
+                "- 发图片/文件，且上一步有 file_path 或 screenshot_path 输出：\n"
+                "  **必须**用 image_path=${stepN.file_path} 或 image_path=${stepN.screenshot_path} 传路径。\n"
+                "  这样会在找到联系人之后才重新把文件灌入剪贴板，\n"
+                "  避免搜索框输入中文时覆盖剪贴板内容导致粘贴出错。\n"
+                "- 只在上一步没有 file_path/screenshot_path 输出、文件已在剪贴板时才用 use_clipboard=true。\n"
+                "- 不要用'[粘贴]'等魔法字符串。"
+            ),
+            required_slots=["contact_name"],
+            optional_slots=["message", "image_path", "use_clipboard"],
             examples=[
                 "给晴天发条微信说下午开会",
                 "把自己刚刚截的图发给老板",
-                "把剪贴板的内容粘贴给丸子",
+                "把刚才准备好的文件发给刘婷婷",
             ],
         ))
 
@@ -208,8 +217,13 @@ class WeChatSkill(BaseSkill):
         3. 点击输入框
         4. 输入消息并发送
         """
-        contact = slots["contact_name"]
-        message = slots["message"]
+        contact = slots.get("contact_name", "").strip()
+        if not contact:
+            return {"success": False, "message": "缺少联系人名称（contact_name），请告诉我要发给谁", "data": None}
+        # message 现在是可选的，Planner 不填时默认空字符串
+        message = slots.get("message", "")
+        # use_clipboard=true 表示前序步骤已把文件/图片灌入剪贴板，直接 Cmd+V 即可
+        use_clipboard = str(slots.get("use_clipboard", "false")).lower() in ("true", "1", "yes")
 
         # 步骤 1：激活微信
         if not self.activate():
@@ -253,17 +267,36 @@ class WeChatSkill(BaseSkill):
             actions.hotkey("command", "v")
             _time.sleep(0.8)  # 粘贴后等多媒体/文件对象渲染，留足缓冲时间
                 
-        elif message == "[粘贴]" or "{{clipboard" in message or "剪贴板" in message.lower():
-            # 传统方案兜底
-            print("📋 未收到强力绝对路径，使用兜底机制调起剪贴板管理器...")
-            actions.hotkey("shift", "command", "space")
-            _time.sleep(0.6)
-            actions.press_key("right")
-            _time.sleep(0.2)
-            actions.press_key("enter")
-            _time.sleep(0.5)
-        else:
+        elif use_clipboard or (
+            message in ("[粘贴]", "「粘贴」", "粘贴")
+            or "{{clipboard" in message
+            or "剪贴板" in message.lower()
+            or "paste" in message.lower()
+        ):
+            # 搜索框输入中文时 macOS 会用剪贴板传输汉字，导致文件被挤到第二位
+            # 修复方案：先从临时文件读回路径，重新把文件灌入剪贴板第一位，再 Cmd+V
+            import subprocess, os
+            _last_file_cache = "/tmp/qingagent_last_clipboard_file.txt"
+            _reloaded = False
+            try:
+                if os.path.exists(_last_file_cache):
+                    with open(_last_file_cache, "r") as _f:
+                        _last_file = _f.read().strip()
+                    if _last_file and os.path.exists(_last_file):
+                        print(f"📋 搜索中文导致剪贴板被覆盖，重新灌入文件: {_last_file}")
+                        subprocess.run(["osascript", "-e", f'set the clipboard to POSIX file "{_last_file}"'])
+                        _time.sleep(0.4)  # 等剪贴板生效
+                        _reloaded = True
+            except Exception as _e:
+                print(f"⚠️ 重新灌入剪贴板失败: {_e}")
+            if not _reloaded:
+                print("📋 找不到临时记录，直接 Cmd+V 尝试粘贴")
+            actions.hotkey("command", "v")
+            _time.sleep(0.8)  # 等文件/图片对象渲染完成
+        elif message:
             actions.type_text(message)
+        else:
+            print("⚠️ message 为空且未设置 use_clipboard，跳过输入步骤")
             
         import os
         mode = os.environ.get("QINGAGENT_MODE", "safe")

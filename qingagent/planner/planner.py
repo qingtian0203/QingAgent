@@ -42,6 +42,8 @@ class Planner:
         self._thread_local = threading.local()
         # 审核暂停-恢复：confirm_send 拦截时暂存剩余步骤，确认后自动继续
         self._pending_resume: dict | None = None
+        # 文件选择暂停-恢复：file_choice 中断时暂存剩余步骤，用户选文件后直接续接
+        self._pending_file_resume: dict | None = None
 
     def _get_global_context(self) -> dict:
         """获取当前线程的跨轮次上下文（线程安全）"""
@@ -132,6 +134,13 @@ class Planner:
   - "给AG/Antigravity/编辑器/Cursor发消息" 是 Antigravity
   - "给Codex/codex发消息" 是 Codex
   - "给xx发微信" 才是微信
+- 【截图应用别名规则】：认识到“给xxx截图”“把 xxx 截图”“xxx截图”“截图 xxx”时，必须使用 System.app_screenshot（不是 custom_screenshot！）
+  - AG / ag / Antigravity / 编辑器 均指 Antigravity 这个应用
+  - Codex / codex 均指 Codex 这个应用
+  - "截图 AG" / "把 ag 截图" / "ag 截图" → System.app_screenshot(app_name="Antigravity")
+  - "截图微信" / "微信截图" → System.app_screenshot(app_name="微信")
+  - "截图应用" 后跟着应用名，就是 System.app_screenshot
+  - 【严禁】用户说“截图”+应用名，绝对不允许映射到 prepare_file 或 send_prompt！
 - message/prompt 参数是最终要发给对方的内容，不要包含"问一下""告诉他""说一下"等指令描述词
 - 人称转换：用户说"问她干嘛呢"，实际发给对方应该是"你干嘛呢"
 - 示例1："给丸子发条微信说下午开会" → 1步，微信 send_message
@@ -455,7 +464,7 @@ class Planner:
             # 刷新本线程的跨轮次上下文（线程安全，不影响其他并发任务）
             self._set_global_context(context[f"step{step_num}"])
 
-            # ── 失败处理：区分「审核暂停」和「真正失败」──
+            # ── 失败处理：区分「审核暂停」「文件选择」和「真正失败」──
             if not result["success"]:
                 if _is_confirm:
                     # 审核拦截不是真正失败，暂存后续步骤，等用户确认后恢复
@@ -467,6 +476,21 @@ class Planner:
                             "original_user_input": user_input,
                         }
                         print(f"⏸️  [审核暂停] 已暂存后续 {len(remaining)} 个步骤，确认后自动继续")
+                    return {"success": False, "message": result["message"], "data": result["data"]}
+
+                # 检测 file_choice：多文件让用户选，暂存剩余步骤，选完直接续接，不走 Planner 重新规划
+                _is_file_choice = (
+                    isinstance(result.get("data"), dict)
+                    and result["data"].get("type") == "file_choice"
+                )
+                if _is_file_choice:
+                    remaining = steps[step_index:]
+                    self._pending_file_resume = {
+                        "remaining_steps": remaining,
+                        "context": dict(context),
+                        "file_step_num": step_num,  # 用于把选定文件路径注入上下文
+                    }
+                    print(f"⏸️  [文件选择暂停] 已暂存后续 {len(remaining)} 个步骤，选文件后直接续接")
                     return {"success": False, "message": result["message"], "data": result["data"]}
 
                 if total_steps == 1:
@@ -503,3 +527,107 @@ class Planner:
             "message": final_msg,
             "data": last_result.get("data") if last_result else None,
         }
+    def resume_with_file(self, file_path: str) -> dict:
+        """
+        用户从 file_choice 选定文件后，直接续接剩余步骤，不重新走 Planner 规划。
+        这样多步骤任务中「准备文件」后的发送步骤不会被重复执行。
+        """
+        import time as _time
+        if not self._pending_file_resume:
+            return {"success": False, "message": "没有待续接的文件选择任务", "data": None}
+
+        resume_data = self._pending_file_resume
+        self._pending_file_resume = None
+
+        remaining_steps = resume_data["remaining_steps"]
+        context = resume_data["context"]
+        file_step_num = resume_data["file_step_num"]
+
+        print(f"\n{'='*50}")
+        print(f"▶️  [文件续接] 用户选定文件：{file_path}")
+        print(f"{'='*50}")
+
+        # 把选定文件灌入剪贴板，并写入临时缓存（供 use_clipboard 恢复使用）
+        try:
+            import subprocess, os
+            subprocess.run(["osascript", "-e", f'set the clipboard to POSIX file "{file_path}"'])
+            with open("/tmp/qingagent_last_clipboard_file.txt", "w") as _f:
+                _f.write(file_path)
+            print(f"📋 [续接] 文件已灌入剪贴板并写入临时缓存")
+        except Exception as _e:
+            print(f"⚠️ 灌入剪贴板失败（不中断后续步骤）: {_e}")
+
+        # 把选定文件路径注入上下文，供后续步骤通过 ${stepN.file_path} 引用
+        context[f"step{file_step_num}"] = {"file_path": file_path, "value": file_path}
+
+        if not remaining_steps:
+            return {"success": True, "message": f"文件已准备完毕：{file_path}", "data": {"file_path": file_path}}
+
+        print(f"📋 续接执行 {len(remaining_steps)} 个剩余步骤：")
+        for s in remaining_steps:
+            print(f"  → [{s.get('app')}] {s.get('intent')} — {s.get('description', '')}")
+
+        total_start = _time.time()
+        last_result = None
+
+        for _idx, step in enumerate(remaining_steps):
+            step_num = step.get("step", 0)
+            app_name = step.get("app", "")
+            intent_name = step.get("intent", "")
+            slots = self._resolve_placeholders(step.get("slots", {}), context)
+            description = step.get("description", f"{app_name}.{intent_name}")
+
+            print(f"\n{'─'*40}")
+            print(f"▶️  续接步骤 {step_num}：{description}")
+            print(f"  参数：{slots}")
+
+            skill = self.registry.get_skill_by_name(app_name)
+            if not skill:
+                result_tuple = self.registry.find_skill_for_intent(intent_name)
+                if result_tuple:
+                    skill, intent_name = result_tuple
+                else:
+                    return {"success": False, "message": f"找不到应用「{app_name}」的操作能力", "data": None}
+
+            t0 = _time.time()
+            try:
+                result = skill.execute(intent_name, slots)
+            except Exception as e:
+                result = {"success": False, "message": f"续接步骤 {step_num} 执行异常：{e}", "data": None}
+
+            print(f"⏱️ [续接步骤 {step_num} 耗时] {_time.time() - t0:.1f}s")
+            status_icon = "✅" if result["success"] else "❌"
+            print(f"{status_icon} 续接步骤 {step_num} 结果：{result['message']}")
+
+            if isinstance(result.get("data"), dict):
+                context[f"step{step_num}"] = result["data"]
+
+            last_result = result
+            if not result["success"]:
+                _data = result.get("data") or {}
+                _dtype = _data.get("type") if isinstance(_data, dict) else None
+                _remaining_after = remaining_steps[_idx + 1:]
+
+                if _dtype == "confirm_send":
+                    # 审核中断：暂存剩余步骤，用户确认后由 _run_task 续接
+                    if _remaining_after:
+                        self._pending_resume = {
+                            "remaining_steps": _remaining_after,
+                            "context": dict(context),
+                            "original_user_input": "",
+                        }
+                        print(f"⏸️  [续接中审核暂停] 已暂存剩余 {len(_remaining_after)} 个步骤")
+                elif _dtype == "file_choice":
+                    # 文件选择中断：暂存剩余步骤，用户选文件后续接
+                    self._pending_file_resume = {
+                        "remaining_steps": _remaining_after,
+                        "context": dict(context),
+                        "file_step_num": step_num,
+                    }
+                    print(f"⏸️  [续接中文件选择暂停] 已暂存剩余 {len(_remaining_after)} 个步骤")
+
+                print(f"\n⏱️ ===== 续接总耗时：{_time.time() - total_start:.1f}s =====")
+                return result
+
+        print(f"\n⏱️ ===== 续接总耗时：{_time.time() - total_start:.1f}s =====")
+        return last_result or {"success": True, "message": "续接任务完成", "data": None}

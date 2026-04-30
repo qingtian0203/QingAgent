@@ -328,6 +328,29 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                     self._json_response({"success": False, "error": str(e)})
             else:
                 self._json_response({"success": False, "error": "未知操作"})
+        elif parsed.path == "/api/resume-with-file":
+            # 用户从 file_choice 选定文件后，直接续接剩余步骤（不重走 Planner）
+            data = self._read_post_body()
+            file_path = data.get("file_path", "").strip()
+            if not file_path:
+                self._json_response({"error": "缺少 file_path 参数"}, 400)
+                return
+            import uuid as _uuid, threading as _threading
+            task_id = str(_uuid.uuid4())
+            _tasks[task_id] = {"status": "running"}
+
+            def _run_resume(_fp=file_path, _tid=task_id):
+                try:
+                    result = _planner.resume_with_file(_fp)
+                    _tasks[_tid] = {"status": "done", "result": result}
+                except Exception as _e:
+                    _tasks[_tid] = {
+                        "status": "done",
+                        "result": {"success": False, "message": f"续接执行出错：{_e}", "data": None}
+                    }
+
+            _threading.Thread(target=_run_resume, daemon=True).start()
+            self._json_response({"task_id": task_id, "status": "running"})
         else:
             self.send_error(404)
 
@@ -358,8 +381,64 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
                 from ..skills.wechat import WeChatSkill
                 skill = WeChatSkill()
                 result = skill.execute_confirm_send_action({})
-                if not cancel_check():
-                    _tasks[task_id] = {"status": "done", "result": result}
+                if cancel_check():
+                    return
+                # 确认发送成功后，检查是否有暂存的剩余步骤，有则直接续接执行（不重新走 Planner）
+                if result.get("success") and _planner._pending_resume:
+                    resume_data = _planner._pending_resume
+                    _planner._pending_resume = None
+                    remaining_steps = resume_data.get("remaining_steps", [])
+                    context = resume_data.get("context", {})
+                    original_input = resume_data.get("original_user_input", "")
+                    print(f"▶️  [确认发送后自动续接] 继续执行剩余 {len(remaining_steps)} 个步骤")
+                    # 复用 resume_with_file 同样的逻辑：直接调用 Planner 的剩余步骤续接
+                    import time as _time
+                    last_result = result
+                    for _idx, step in enumerate(remaining_steps):
+                        if cancel_check():
+                            break
+                        step_num = step.get("step", 0)
+                        app_name = step.get("app", "")
+                        intent_name = step.get("intent", "")
+                        slots = _planner._resolve_placeholders(step.get("slots", {}), context)
+                        description = step.get("description", f"{app_name}.{intent_name}")
+                        print(f"\n{'─'*40}")
+                        print(f"▶️  续接步骤 {step_num}：{description}  参数：{slots}")
+                        step_skill = _planner.registry.get_skill_by_name(app_name)
+                        if not step_skill:
+                            rt = _planner.registry.find_skill_for_intent(intent_name)
+                            if rt:
+                                step_skill, intent_name = rt
+                            else:
+                                last_result = {"success": False, "message": f"找不到应用「{app_name}」", "data": None}
+                                break
+                        try:
+                            step_result = step_skill.execute(intent_name, slots, cancel_check=cancel_check)
+                        except Exception as _se:
+                            step_result = {"success": False, "message": f"续接步骤异常：{_se}", "data": None}
+                        status_icon = "✅" if step_result["success"] else "❌"
+                        print(f"{status_icon} 续接步骤 {step_num} 结果：{step_result['message']}")
+                        if isinstance(step_result.get("data"), dict):
+                            context[f"step{step_num}"] = step_result["data"]
+                        last_result = step_result
+                        if not step_result["success"]:
+                            # 检测 file_choice：暂存剩余步骤，用户选完文件后由 resume_with_file 续接
+                            _is_fc = (
+                                isinstance(step_result.get("data"), dict)
+                                and step_result["data"].get("type") == "file_choice"
+                            )
+                            if _is_fc:
+                                # 剩余步骤 = 当前步骤之后的步骤
+                                _remaining_after = remaining_steps[_idx + 1:]
+                                _planner._pending_file_resume = {
+                                    "remaining_steps": _remaining_after,
+                                    "context": dict(context),
+                                    "file_step_num": step_num,
+                                }
+                                print(f"⏸️  [续接中文件选择暂停] 已暂存剩余 {len(_remaining_after)} 个步骤")
+                            break
+                    result = last_result
+                _tasks[task_id] = {"status": "done", "result": result}
                 return
             elif command.strip() == "已取消发件":
                 if not cancel_check():
@@ -2609,6 +2688,54 @@ def _get_ui_html() -> str:
         sendCmd();
     }
 
+    // 文件选择续接：调用后端新接口，直接续接剩余步骤，不重新触发 Planner 规划全部任务
+    async function resumeWithFile(filePath) {
+        if (isProcessing) return;
+        isProcessing = true;
+        statusDot.style.background = '#facc15';
+        addMsg(`📎 已选择文件，续接执行剩余步骤...`, 'agent', 'info', false);
+        try {
+            const res = await fetch('/api/resume-with-file', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({file_path: filePath})
+            });
+            const data = await res.json();
+            if (!data.task_id) {
+                addMsg('❌ 续接失败：' + (data.error || '未知错误'), 'agent', 'error', false);
+                isProcessing = false;
+                statusDot.style.background = '#22c55e';
+                return;
+            }
+            // 内联轮询：直接用 /api/task/{taskId} 轮询，不依赖 sendCmd 内部的 pollResult
+            const taskId = data.task_id;
+            const poll = async () => {
+                if (_pollCancelled) return;
+                try {
+                    const r = await fetch(`/api/task/${taskId}`);
+                    const d = await r.json();
+                    if (_pollCancelled) return;
+                    if (d.status === 'done') {
+                        showResult(d.result);
+                    } else if (d.status === 'cancelled') {
+                        addMsg('🛑 续接被终止', 'agent', 'error', false);
+                        finish();
+                    } else {
+                        setTimeout(poll, 1000);
+                    }
+                } catch (e) {
+                    addMsg('❌ 续接轮询失败：' + e.message, 'agent', 'error', false);
+                    finish();
+                }
+            };
+            poll();
+        } catch(e) {
+            addMsg('❌ 续接请求异常：' + e.message, 'agent', 'error', false);
+            isProcessing = false;
+            statusDot.style.background = '#22c55e';
+        }
+    }
+
     let _pollCancelled = false;  // 轮询中断标志
     let _cancelBtnCounter = 0;   // 按钮唯一 ID 计数器
 
@@ -2651,6 +2778,8 @@ def _get_ui_html() -> str:
         statusDot.style.background = '#facc15'; // 黄色=忙碌
 
         addMsg(cmd, 'user');
+        // 记录原始指令，供 file_choice 等中断场景续接时携带完整上下文
+        window._lastUserCmd = cmd;
         cmdInput.value = '';
 
         // 用唯一 ID 防止多次发送造成 DOM id 冲突
@@ -2802,7 +2931,7 @@ def _get_ui_html() -> str:
                         " 
                         onmouseover="this.style.background='rgba(102,126,234,0.12)'; this.style.borderColor='rgba(102,126,234,0.35)';"
                         onmouseout="this.style.background='var(--bg-card-inner)'; this.style.borderColor='var(--border)';"
-                        onclick="this.style.opacity='0.4'; this.style.pointerEvents='none'; quickSend('请发送：${escapedPath}');">
+                        onclick="this.style.opacity='0.4'; this.style.pointerEvents='none'; resumeWithFile('${escapedPath}');">
                             <div style="
                                 width: 36px; height: 36px;
                                 border-radius: 8px;

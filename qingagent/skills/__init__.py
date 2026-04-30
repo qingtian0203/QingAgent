@@ -8,6 +8,7 @@ Planner 通过注册中心查找能够处理某个意图的 Skill。
 from .wechat import WeChatSkill
 from .browser import BrowserSkill
 from .antigravity import AntigravitySkill
+from .codex import CodexSkill
 from .qingtian_util import QingTianUtilSkill
 from .os_control import OSControlSkill
 from .minesweeper import MinesweeperSkill
@@ -41,6 +42,7 @@ class SkillRegistry:
         self.register(WeChatSkill())
         self.register(BrowserSkill())
         self.register(AntigravitySkill())
+        self.register(CodexSkill())
         self.register(QingTianUtilSkill())
         self.register(OSControlSkill())
         self.register(MinesweeperSkill())

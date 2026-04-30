@@ -1,6 +1,6 @@
 # QingAgent — 个人 AI 自动化助手
 
-基于本机 **MLX 大模型（oMLX）**，通过自然语言在**手机/浏览器**远程控制 Mac 上的应用（微信、浏览器、编辑器等）。支持串行任务队列、截图 HITL 确认、AI 三段视觉精准定位。
+基于本机 **MLX 大模型（oMLX）**，通过自然语言在**手机/浏览器**远程控制 Mac 上的应用（微信、浏览器、编辑器等）。支持串行任务队列、截图 HITL 确认、AI 三段视觉精准定位，以及 macOS Accessibility 控件级输入框定位。
 
 ## 快速开始
 
@@ -32,6 +32,8 @@ IP 显示在「晴天 Util」的 AI Agent 面板中。
 |------|------|
 | `给丸子发微信说晚饭吃啥` | 打开微信，搜索"丸子"，截图预览后确认发送 |
 | `给AG发消息说 帮我检查一下这段代码` | 聚焦 Antigravity 编辑器的 Agent 面板，发送指令 |
+| `给Codex发消息说 帮我评审这个方案` | 聚焦 Codex 当前会话输入框，粘贴指令并回车发送 |
+| `聚焦Codex输入框` | 只验证 Codex 输入框定位，不发送消息 |
 | `帮我打开百度搜一下天气` | 打开浏览器，搜索天气 |
 | `给晴天Util发消息说 打开日历` | 操作晴天 Util 应用 |
 | `把桌面的 demo.zip 发给晴天小米` | 文件选择 + 截图预览 + 确认发送 |
@@ -44,6 +46,7 @@ IP 显示在「晴天 Util」的 AI Agent 面板中。
 |------|--------|---------|
 | 微信 | 微信 | WeChat、wechat |
 | 编辑器 | Antigravity | AG、ag、编辑器、Cursor |
+| 代码助手 | Codex | codex、代码助手 |
 | 浏览器 | 浏览器 | Safari、Chrome、browser |
 | 工具 | 晴天Util | QingUtil、工具 |
 
@@ -59,6 +62,11 @@ IP 显示在「晴天 Util」的 AI Agent 面板中。
 - 机器视觉底层采用 oMLX 三步递进缩放（`全屏 → 局部300px → 局部80px对中`），强力解决 AI 漂移。
 - 内置 `ProjectRegistrySkill` 及 `CodeQuerySkill` 等数字原生认知特性，让 Agent 具备跨文件的源码检索与项目目录级知识获取的能力，突破传统单点 AI 的认知局限。
 
+### 🎯 macOS Accessibility 控件级定位
+- `BaseSkill` 内置 `find_text_input_by_accessibility()` / `click_text_input_by_accessibility()`，可通过系统无障碍树识别 `AXTextArea`、`AXTextField` 等真实文本输入控件。
+- 这类定位不依赖截图像素、固定坐标或屏幕分辨率，适合 Codex / Antigravity 这类会在主屏、副屏之间移动的桌面应用。
+- 视觉识别仍作为兜底：当应用没有暴露无障碍控件时，再根据 hint 文案和周边 UI 描述进行定位。
+
 ## 项目结构
 
 ```
@@ -71,10 +79,11 @@ QingAgent/
 │   │   └── planner.py          # AI Planner（意图解析 → 查找 Skill → 执行）
 │   ├── skills/
 │   │   ├── __init__.py         # SkillRegistry（注册中心 + 别名查找）
-│   │   ├── base.py             # BaseSkill 基类（Intent / 能力描述 / 激活窗口）
+│   │   ├── base.py             # BaseSkill 基类（Intent / 激活窗口 / 视觉点击 / AX 输入框定位）
 │   │   ├── wechat.py           # 微信 Skill（含 HITL 截图确认）
 │   │   ├── browser.py          # 浏览器 Skill
 │   │   ├── antigravity.py      # Antigravity 编辑器 Skill
+│   │   ├── codex.py            # Codex 桌面端 Skill（聚焦输入框 / 发送消息）
 │   │   ├── qingtian_util.py    # 晴天 Util Skill
 │   │   ├── os_control.py       # 系统截图 Skill（QQ截图 / 窗口吸附）
 │   │   ├── code_query.py       # 代码检索与查阅
@@ -125,7 +134,8 @@ SERVER_PORT = 8077
        ↓
   Skill.execute()
     ├── window.activate_and_find()  # 激活应用，找窗口坐标
-    ├── Cmd+L / 快捷键              # 快速定位输入框（~0.3s）
+    ├── Accessibility AXTextArea   # 控件级定位文本输入框
+    ├── Cmd+L / 快捷键              # 应用有快捷键时快速定位输入框
     └── vision.find_element()      # AI 视觉三段定位（兜底）
     ↓（微信发送类操作）
   HITL 截图确认                    # 挂起 → 截图预览 → 用户确认 → 执行
@@ -159,11 +169,25 @@ class MyAppSkill(BaseSkill):
 
 然后在 `skills/__init__.py` 的 `auto_register()` 中注册。
 
+### 复用输入框定位底座
+
+对聊天框、搜索框、命令输入框等文本输入场景，优先复用 `BaseSkill` 的无障碍定位：
+
+```python
+ok = self.click_text_input_by_accessibility(
+    search_rect=self._window_rect,
+    placeholder_keywords=("请输入", "搜索"),
+    label="目标输入框",
+)
+```
+
+如果目标 App 是 Electron / WebView / 原生 macOS 控件，并且暴露了 `AXTextArea` 或 `AXTextField`，这会比截图识别和固定坐标稳定得多。若未命中，再用 `find_and_click()` 走视觉兜底。
+
 ### macOS 权限要求
 
 | 权限 | 用途 | 授权方式 |
 |------|------|---------|
-| 辅助功能 | 模拟鼠标/键盘点击 | 系统设置 → 隐私与安全性 → 辅助功能 |
+| 辅助功能 | 模拟鼠标/键盘点击；读取 macOS Accessibility 控件树定位输入框 | 系统设置 → 隐私与安全性 → 辅助功能 |
 | 屏幕录制 | 截图用于 AI 视觉识别 | 系统设置 → 隐私与安全性 → 屏幕录制 |
 
 > ⚠️ 如果通过「晴天 Util」启动服务，需要给 `晴天 Util.app` 授权（不是终端）。

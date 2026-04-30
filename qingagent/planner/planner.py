@@ -130,6 +130,7 @@ class Planner:
 - 用户指令中明确提到了某个应用名或别名时，必须使用该应用，不要默认去微信
   - "给AG发消息" → app=Antigravity，不是微信
   - "给AG/Antigravity/编辑器/Cursor发消息" 是 Antigravity
+  - "给Codex/codex发消息" 是 Codex
   - "给xx发微信" 才是微信
 - message/prompt 参数是最终要发给对方的内容，不要包含"问一下""告诉他""说一下"等指令描述词
 - 人称转换：用户说"问她干嘛呢"，实际发给对方应该是"你干嘛呢"

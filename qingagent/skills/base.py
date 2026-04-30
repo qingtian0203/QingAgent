@@ -287,6 +287,223 @@ class BaseSkill:
 
         return True
 
+    def find_text_input_by_accessibility(
+        self,
+        search_rect: tuple[float, float, float, float] | None = None,
+        placeholder_keywords: tuple[str, ...] = (),
+        prefer_bottom: bool = True,
+    ) -> dict | None:
+        """
+        用 macOS Accessibility 找文本输入控件。
+
+        这不是截图识别，也不是固定坐标，而是系统级 UI 控件命中：
+        在指定区域内探测 AXTextArea / AXTextField，返回控件矩形和建议点击点。
+
+        参数:
+            search_rect: 物理坐标区域；为空时使用当前应用窗口
+            placeholder_keywords: 可选 hint 文案，如 ("要求后续变更",)
+            prefer_bottom: True 时优先从底部向上探测，适合聊天输入框
+        """
+        if not self._window_rect:
+            return None
+
+        context = self._get_accessibility_context()
+        if not context:
+            return None
+
+        AS, app = context
+        rect = search_rect or self._window_rect
+
+        focused = self._ax_attr(AS, app, "AXFocusedUIElement")
+        focused_match = self._text_input_candidate(AS, focused, rect, placeholder_keywords)
+        if focused_match:
+            focused_match["source"] = "focused"
+            return focused_match
+
+        for px, py in self._iter_text_input_probe_points(rect, prefer_bottom=prefer_bottom):
+            try:
+                err, element = AS.AXUIElementCopyElementAtPosition(app, px, py, None)
+            except Exception:
+                continue
+            if err != 0 or element is None:
+                continue
+
+            match = self._text_input_candidate(AS, element, rect, placeholder_keywords)
+            if match:
+                match["source"] = "hit_test"
+                match["probe"] = (px, py)
+                return match
+
+        return None
+
+    def click_text_input_by_accessibility(
+        self,
+        search_rect: tuple[float, float, float, float] | None = None,
+        placeholder_keywords: tuple[str, ...] = (),
+        label: str = "文本输入框",
+        prefer_bottom: bool = True,
+    ) -> bool:
+        """找到并点击文本输入控件。"""
+        match = self.find_text_input_by_accessibility(
+            search_rect=search_rect,
+            placeholder_keywords=placeholder_keywords,
+            prefer_bottom=prefer_bottom,
+        )
+        if not match:
+            print(f"⚠️ [AX文本输入] 未找到 {label}")
+            return False
+
+        x, y = match["point"]
+        rect = match.get("rect")
+        probe = match.get("probe")
+        print(
+            f"🧭 [AX文本输入] {label} role={match.get('role')} "
+            f"source={match.get('source')} "
+            f"probe={tuple(round(v) for v in probe) if probe else None} "
+            f"rect={tuple(round(v) for v in rect) if rect else None} "
+            f"click=({x:.0f}, {y:.0f})"
+        )
+        actions.click_at_physical(x, y, delay=0.2)
+        return True
+
+    def _get_accessibility_context(self):
+        try:
+            import ApplicationServices as AS
+            from Quartz import (
+                CGWindowListCopyWindowInfo,
+                kCGWindowListOptionOnScreenOnly,
+                kCGNullWindowID,
+            )
+        except Exception as e:
+            print(f"⚠️ [AX文本输入] 无法加载 Accessibility：{e}")
+            return None
+
+        try:
+            if hasattr(AS, "AXIsProcessTrusted") and not AS.AXIsProcessTrusted():
+                print("⚠️ [AX文本输入] 当前进程没有辅助功能权限")
+                return None
+
+            window_list = CGWindowListCopyWindowInfo(
+                kCGWindowListOptionOnScreenOnly, kCGNullWindowID
+            )
+            pid = None
+            for item in window_list:
+                owner = item.get("kCGWindowOwnerName", "")
+                if not any(alias.lower() in owner.lower() for alias in self.app_aliases):
+                    continue
+
+                bounds = item.get("kCGWindowBounds", {})
+                candidate = (
+                    int(bounds.get("X", 0)),
+                    int(bounds.get("Y", 0)),
+                    int(bounds.get("Width", 0)),
+                    int(bounds.get("Height", 0)),
+                )
+                if self._rects_close(self._window_rect, candidate):
+                    pid = item.get("kCGWindowOwnerPID")
+                    break
+
+            if not pid:
+                return None
+
+            return AS, AS.AXUIElementCreateApplication(pid)
+        except Exception as e:
+            print(f"⚠️ [AX文本输入] 获取应用上下文失败：{e}")
+            return None
+
+    def _iter_text_input_probe_points(
+        self,
+        rect: tuple[float, float, float, float],
+        prefer_bottom: bool = True,
+    ):
+        x, y, w, h = rect
+        x_ratios = (0.06, 0.10, 0.16, 0.24, 0.38, 0.55)
+        bottom_first = (0.92, 0.90, 0.88, 0.85, 0.82, 0.78, 0.72, 0.64, 0.52, 0.38)
+        top_first = tuple(reversed(bottom_first))
+        y_ratios = bottom_first if prefer_bottom else top_first
+
+        for yr in y_ratios:
+            for xr in x_ratios:
+                yield x + w * xr, y + h * yr
+
+    def _text_input_candidate(
+        self,
+        AS,
+        element,
+        search_rect: tuple[float, float, float, float],
+        placeholder_keywords: tuple[str, ...],
+    ) -> dict | None:
+        if element is None:
+            return None
+
+        role = str(self._ax_attr(AS, element, "AXRole") or "")
+        if role not in {"AXTextArea", "AXTextField", "AXComboBox"}:
+            return None
+
+        rect = self._ax_rect(AS, element)
+        if not rect or not self._rect_intersects(rect, search_rect):
+            return None
+
+        text_parts = [
+            self._ax_attr(AS, element, "AXValue"),
+            self._ax_attr(AS, element, "AXPlaceholderValue"),
+            self._ax_attr(AS, element, "AXTitle"),
+            self._ax_attr(AS, element, "AXDescription"),
+        ]
+        text = "\n".join(str(part) for part in text_parts if part is not None)
+        if placeholder_keywords and text:
+            if not any(keyword in text for keyword in placeholder_keywords):
+                # hint 没匹配不直接否定，因为不少 Electron 控件只暴露 role 和 rect。
+                pass
+
+        tx, ty, tw, th = rect
+        click_x = tx + min(28, max(12, tw * 0.05))
+        click_y = ty + min(24, max(12, th * 0.55))
+        return {
+            "role": role,
+            "rect": rect,
+            "point": (click_x, click_y),
+            "text": text,
+        }
+
+    def _rect_intersects(
+        self,
+        a: tuple[float, float, float, float],
+        b: tuple[float, float, float, float],
+    ) -> bool:
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        return ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by
+
+    def _rects_close(
+        self,
+        a: tuple[float, float, float, float],
+        b: tuple[float, float, float, float],
+        tolerance: int = 8,
+    ) -> bool:
+        return all(abs(float(a[i]) - float(b[i])) <= tolerance for i in range(4))
+
+    def _ax_rect(self, AS, element) -> tuple[float, float, float, float] | None:
+        try:
+            err_p, pos = AS.AXUIElementCopyAttributeValue(element, "AXPosition", None)
+            err_s, size = AS.AXUIElementCopyAttributeValue(element, "AXSize", None)
+            if err_p != 0 or err_s != 0:
+                return None
+            ok_p, point = AS.AXValueGetValue(pos, AS.kAXValueCGPointType, None)
+            ok_s, sz = AS.AXValueGetValue(size, AS.kAXValueCGSizeType, None)
+            if not ok_p or not ok_s:
+                return None
+            return (float(point.x), float(point.y), float(sz.width), float(sz.height))
+        except Exception:
+            return None
+
+    def _ax_attr(self, AS, element, name: str):
+        try:
+            err, value = AS.AXUIElementCopyAttributeValue(element, name, None)
+            return value if err == 0 else None
+        except Exception:
+            return None
+
     def read_content(self, question: str) -> str | None:
         """读取当前窗口中的信息"""
         img = self.screenshot()

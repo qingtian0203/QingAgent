@@ -22,6 +22,15 @@ PROJECTS: dict[str, dict] = {
         "nav_reverse": "nav_reverse.md",
         "page_knowledge_dir": "page_knowledge",
     },
+    "qingoa": {
+        "name": "QingOA FullStack",
+        "aliases": ["qingoa", "qing oa", "qingoafullstack", "晴天oa", "qingoa项目", "oa demo"],
+        "docs_root": "/Users/konglingjia/AIProject/QingOaFullStack",
+        "skill_md": "AGENTS.md",
+        "api_catalog": "AGENTS.md",
+        "nav_reverse": "AGENTS.md",
+        "page_knowledge_dir": ".agents",
+    },
     # 以后新增项目在这里追加，格式相同
     # "fangapp": {
     #     "name": "大房 App",

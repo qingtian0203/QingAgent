@@ -7,16 +7,45 @@ Web 服务 — 提供 HTTP API 和移动端友好的 Web 聊天界面
 """
 import json
 import os
+import re
 import socket
+import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
+from datetime import date, datetime, timedelta
 from http.server import HTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import urlparse
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import config
 from ..skills import SkillRegistry
 from ..planner.planner import Planner
 from .supervisor import supervisor_instance
+from ..group_chat.relay import relay_once as group_chat_relay_once
+from ..group_chat.relay import start_demo as group_chat_start_demo
+from ..group_chat.store import (
+    DEFAULT_AGENTS as GROUP_CHAT_DEFAULT_AGENTS,
+    DEFAULT_MODE as GROUP_CHAT_DEFAULT_MODE,
+    DEFAULT_SESSION as GROUP_CHAT_DEFAULT_SESSION,
+    DEFAULT_TOPIC as GROUP_CHAT_DEFAULT_TOPIC,
+    append_message as group_chat_append_message,
+    append_user_decision as group_chat_append_user_decision,
+    clear_awaiting_outbox as group_chat_clear_awaiting_outbox,
+    clear_blocked as group_chat_clear_blocked,
+    delete_session as group_chat_delete_session,
+    ensure_session as group_chat_ensure_session,
+    get_awaiting_outbox as group_chat_get_awaiting_outbox,
+    list_sessions as group_chat_list_sessions,
+    load_state as group_chat_load_state,
+    mark_blocked as group_chat_mark_blocked,
+    mark_done as group_chat_mark_done,
+    mark_forwarded as group_chat_mark_forwarded,
+    session_snapshot as group_chat_session_snapshot,
+    unmark_forwarded as group_chat_unmark_forwarded,
+    update_session_meta as group_chat_update_session_meta,
+)
 
 
 # 全局实例
@@ -30,6 +59,16 @@ _tasks: dict = {}  # task_id -> {"status": "queued"/"running"/"done", "result": 
 _task_counter = 0
 _task_lock = threading.Lock()
 _task_queue: _queue_module.Queue = _queue_module.Queue()  # 串行消费队列
+
+# ── 多 Agent 群聊后台监听器 ───────────────────────────────────────────────
+_group_chat_watchers: dict = {}
+_group_chat_watchers_lock = threading.Lock()
+
+# ── 自动化用例资产缓存 ───────────────────────────────────────────────────
+# case 切换会频繁读取 YAML；缓存按文件 mtime/size 失效，避免每次点击都启动 Ruby 解析全量用例。
+_automation_yaml_cache: dict[str, dict] = {}
+_automation_inventory_cache: dict[str, dict] = {}
+_automation_cache_lock = threading.Lock()
 
 
 def _get_local_ip() -> str:
@@ -66,10 +105,24 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             self._serve_ui()
         elif parsed.path == "/benchmark":
             self._serve_benchmark()
+        elif parsed.path.startswith("/api/automation/"):
+            self._api_automation_get(parsed.path, parsed.query)
+        elif parsed.path == "/group-chat":
+            self._serve_group_chat()
+        elif parsed.path.startswith("/static/group_chat/"):
+            self._serve_group_chat_static(parsed.path)
         elif parsed.path == "/api/skills":
             self._api_skills()
         elif parsed.path == "/api/health":
             self._json_response({"status": "ok", "version": "0.1.0"})
+        elif parsed.path == "/api/group_chat/sessions":
+            self._api_group_chat_sessions()
+        elif parsed.path == "/api/group_chat/role_templates":
+            self._api_group_chat_role_templates()
+        elif parsed.path == "/api/group_chat/session":
+            self._api_group_chat_session(parsed.query)
+        elif parsed.path == "/api/group_chat/watch/status":
+            self._api_group_chat_watch_status(parsed.query)
         elif parsed.path.startswith("/api/task/"):
             task_id = parsed.path.split("/")[-1]
             self._api_task_status(task_id)
@@ -253,6 +306,8 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
 
             threading.Thread(target=_do_emergency_stop, daemon=True).start()
             self._json_response({"success": True, "message": "🚨 紧急终止指令已发出"})
+        elif parsed.path.startswith("/api/automation/"):
+            self._api_automation_post(parsed.path)
         elif parsed.path == "/api/benchmark/intent":
             self._benchmark_intent()
         elif parsed.path == "/api/benchmark/code":
@@ -263,6 +318,26 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             self._benchmark_speed()
         elif parsed.path == "/api/benchmark/ag":
             self._benchmark_ag()
+        elif parsed.path == "/api/group_chat/create":
+            self._api_group_chat_create()
+        elif parsed.path == "/api/group_chat/start":
+            self._api_group_chat_start()
+        elif parsed.path == "/api/group_chat/relay_once":
+            self._api_group_chat_relay_once()
+        elif parsed.path == "/api/group_chat/watch/start":
+            self._api_group_chat_watch_start()
+        elif parsed.path == "/api/group_chat/watch/stop":
+            self._api_group_chat_watch_stop()
+        elif parsed.path == "/api/group_chat/retry":
+            self._api_group_chat_retry()
+        elif parsed.path == "/api/group_chat/retry_awaiting":
+            self._api_group_chat_retry_awaiting()
+        elif parsed.path == "/api/group_chat/awaiting_abnormal":
+            self._api_group_chat_awaiting_abnormal()
+        elif parsed.path == "/api/group_chat/delete":
+            self._api_group_chat_delete()
+        elif parsed.path == "/api/group_chat/user_decision":
+            self._api_group_chat_user_decision()
         elif parsed.path == "/api/supervisor/start":
             data = self._read_post_body()
             interval = int(data.get("interval", 15))
@@ -519,6 +594,32 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
+    def _serve_group_chat_static(self, request_path: str):
+        """返回群聊页静态资源。"""
+        base = Path(__file__).resolve().parent / "static" / "group_chat"
+        name = request_path.removeprefix("/static/group_chat/").strip("/")
+        if not name or "/" in name or "\\" in name:
+            self.send_error(404)
+            return
+        path = (base / name).resolve()
+        if not str(path).startswith(str(base.resolve())) or not path.is_file():
+            self.send_error(404)
+            return
+        content_type = {
+            ".svg": "image/svg+xml; charset=utf-8",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+        }.get(path.suffix.lower(), "application/octet-stream")
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _api_skills(self):
         """返回所有已注册 Skill 的描述（含中文标签和产物字段）"""
         result = []
@@ -542,9 +643,587 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
             })
         self._json_response(result)
 
+    def _api_group_chat_sessions(self):
+        """列出多 Agent 群聊会话。"""
+        self._json_response({
+            "success": True,
+            "default": {
+                "session": GROUP_CHAT_DEFAULT_SESSION,
+                "topic": GROUP_CHAT_DEFAULT_TOPIC,
+                "mode": GROUP_CHAT_DEFAULT_MODE,
+                "agents": GROUP_CHAT_DEFAULT_AGENTS,
+            },
+            "sessions": group_chat_list_sessions(),
+        })
+
+    def _api_group_chat_role_templates(self):
+        """读取多 Agent 群聊角色模板配置。"""
+        path = (
+            os.environ.get("QINGAGENT_ROLE_TEMPLATES_PATH")
+            or "/Users/konglingjia/AIProject/AI 文档/qingagent/role_templates.json"
+        )
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                templates = json.load(f)
+            if not isinstance(templates, list):
+                raise ValueError("role_templates.json 必须是数组")
+        except Exception as exc:
+            self._json_response({
+                "success": False,
+                "error": f"读取角色模板失败：{exc}",
+                "path": path,
+            }, 500)
+            return
+
+        first_batch = [
+            item for item in templates
+            if int(item.get("priority_batch") or 0) == 1
+        ][:5]
+        self._json_response({
+            "success": True,
+            "path": path,
+            "templates": templates,
+            "recommended": first_batch,
+        })
+
+    def _api_group_chat_session(self, query: str):
+        """读取单个群聊会话快照。"""
+        from urllib.parse import parse_qs
+        params = parse_qs(query or "")
+        session = params.get("session", [GROUP_CHAT_DEFAULT_SESSION])[0]
+        if not session:
+            self._json_response({"success": False, "error": "缺少 session"}, 400)
+            return
+        self._json_response({
+            "success": True,
+            **group_chat_session_snapshot(session),
+            "watcher": self._group_chat_watcher_status(session),
+        })
+
+    def _api_group_chat_watch_status(self, query: str):
+        from urllib.parse import parse_qs
+        params = parse_qs(query or "")
+        session = params.get("session", [GROUP_CHAT_DEFAULT_SESSION])[0]
+        self._json_response({"success": True, "watcher": self._group_chat_watcher_status(session)})
+
+    def _api_group_chat_create(self):
+        """创建或更新群聊会话。"""
+        data = self._read_post_body()
+        session = self._normalize_group_chat_session_id(data.get("session") or "")
+        if not session:
+            self._json_response({"success": False, "error": "会话 ID 不能为空"}, 400)
+            return
+
+        topic = (data.get("topic") or GROUP_CHAT_DEFAULT_TOPIC).strip()
+        agents = {
+            "codex": (data.get("codex_role") or GROUP_CHAT_DEFAULT_AGENTS["codex"]).strip(),
+            "antigravity": (
+                data.get("antigravity_role")
+                or GROUP_CHAT_DEFAULT_AGENTS["antigravity"]
+            ).strip(),
+        }
+        start_target = data.get("start_target") or "codex"
+        max_rounds = int(data.get("max_rounds") or 8)
+        mode = data.get("mode") or GROUP_CHAT_DEFAULT_MODE
+        group_chat_ensure_session(
+            session,
+            topic=topic,
+            agents=agents,
+            start_target=start_target,
+            max_rounds=max_rounds,
+            mode=mode,
+        )
+        meta = group_chat_update_session_meta(
+            session,
+            topic=topic,
+            agents=agents,
+            start_target=start_target,
+            max_rounds=max_rounds,
+            mode=mode,
+        )
+        self._json_response({
+            "success": True,
+            "session": session,
+            "meta": meta,
+            **group_chat_session_snapshot(session),
+        })
+
+    def _api_group_chat_start(self):
+        """把初始任务发送给指定 Agent。"""
+        data = self._read_post_body()
+        session = self._normalize_group_chat_session_id(
+            data.get("session") or GROUP_CHAT_DEFAULT_SESSION
+        )
+        snapshot = group_chat_session_snapshot(session)
+        target = data.get("target") or snapshot.get("meta", {}).get("start_target") or "codex"
+        ok = group_chat_start_demo(
+            session=session,
+            topic=snapshot.get("meta", {}).get("topic") or GROUP_CHAT_DEFAULT_TOPIC,
+            target_agent=target,
+            dry_run=bool(data.get("dry_run")),
+        )
+        self._json_response({
+            "success": bool(ok),
+            "session": session,
+            "target": target,
+            "snapshot": group_chat_session_snapshot(session),
+        })
+
+    def _api_group_chat_relay_once(self):
+        """转发一条待处理消息。"""
+        data = self._read_post_body()
+        session = self._normalize_group_chat_session_id(
+            data.get("session") or GROUP_CHAT_DEFAULT_SESSION
+        )
+        auto_message = self._ensure_group_chat_continuable(session)
+        count = group_chat_relay_once(
+            session=session,
+            dry_run=bool(data.get("dry_run")),
+            max_forwards=int(data.get("max_forwards") or 1),
+        )
+        self._json_response({
+            "success": True,
+            "forwarded": count,
+            "auto_message": auto_message,
+            "snapshot": group_chat_session_snapshot(session),
+        })
+
+    def _api_group_chat_watch_start(self):
+        """启动某个会话的后台转发监听。"""
+        data = self._read_post_body()
+        session = self._normalize_group_chat_session_id(
+            data.get("session") or GROUP_CHAT_DEFAULT_SESSION
+        )
+        interval = float(data.get("interval") or 3)
+        max_total = int(data.get("max_total") or 20)
+        auto_message = self._ensure_group_chat_continuable(session)
+        watcher = self._start_group_chat_watcher(session, interval=interval, max_total=max_total)
+        self._json_response({
+            "success": True,
+            "auto_message": auto_message,
+            "watcher": watcher,
+        })
+
+    def _api_group_chat_watch_stop(self):
+        """停止某个会话的后台转发监听。"""
+        data = self._read_post_body()
+        session = self._normalize_group_chat_session_id(
+            data.get("session") or GROUP_CHAT_DEFAULT_SESSION
+        )
+        stopped = self._stop_group_chat_watcher(session)
+        self._json_response({
+            "success": True,
+            "stopped": stopped,
+            "watcher": self._group_chat_watcher_status(session),
+        })
+
+    def _api_group_chat_retry(self):
+        """把一条已转发消息重新发送给对方。"""
+        data = self._read_post_body()
+        session = self._normalize_group_chat_session_id(
+            data.get("session") or GROUP_CHAT_DEFAULT_SESSION
+        )
+        message_id = (data.get("message_id") or "").strip()
+        if not message_id:
+            self._json_response({"success": False, "error": "缺少 message_id"}, 400)
+            return
+        group_chat_unmark_forwarded(session, message_id)
+        try:
+            count = group_chat_relay_once(session=session, max_forwards=1)
+        except Exception as exc:
+            self._json_response({"success": False, "error": str(exc)}, 500)
+            return
+        self._json_response({
+            "success": True,
+            "forwarded": count,
+            "snapshot": group_chat_session_snapshot(session),
+        })
+
+    def _api_group_chat_retry_awaiting(self):
+        """对 awaiting_outbox 中记录的当前等待任务做一次恢复发送。"""
+        data = self._read_post_body()
+        session = self._normalize_group_chat_session_id(
+            data.get("session") or GROUP_CHAT_DEFAULT_SESSION
+        )
+        awaiting = group_chat_get_awaiting_outbox(session)
+        if not awaiting:
+            self._json_response({"success": False, "error": "当前没有等待 outbox 的记录"}, 400)
+            return
+        source_message_id = (awaiting.get("source_message_id") or "").strip()
+        action = "relay"
+        try:
+            if source_message_id:
+                group_chat_unmark_forwarded(session, source_message_id)
+                count = group_chat_relay_once(session=session, max_forwards=1)
+            else:
+                snapshot = group_chat_session_snapshot(session)
+                meta = snapshot.get("meta") or {}
+                target_agent = (awaiting.get("from") or meta.get("start_target") or "codex").strip()
+                topic = meta.get("topic") or GROUP_CHAT_DEFAULT_TOPIC
+                ok = group_chat_start_demo(
+                    session=session,
+                    topic=topic,
+                    target_agent=target_agent,
+                )
+                count = 1 if ok else 0
+                action = "start"
+        except Exception as exc:
+            self._json_response({"success": False, "error": str(exc)}, 500)
+            return
+        self._json_response({
+            "success": True,
+            "action": action,
+            "forwarded": count,
+            "snapshot": group_chat_session_snapshot(session),
+        })
+
+    def _api_group_chat_awaiting_abnormal(self):
+        """由用户手动把长时间未写入 outbox 的等待状态标记为阻塞。"""
+        data = self._read_post_body()
+        session = self._normalize_group_chat_session_id(
+            data.get("session") or GROUP_CHAT_DEFAULT_SESSION
+        )
+        awaiting = group_chat_get_awaiting_outbox(session)
+        if not awaiting:
+            self._json_response({"success": False, "error": "当前没有等待 outbox 的记录"}, 400)
+            return
+        agent = awaiting.get("from") or "Agent"
+        reason = (
+            f"等待 {agent} 写入 outbox 异常：任务已发送，"
+            "但 messages.jsonl 中没有出现对应回复"
+        )
+        group_chat_mark_blocked(session, None, reason)
+        group_chat_clear_awaiting_outbox(session)
+        self._json_response({
+            "success": True,
+            "snapshot": group_chat_session_snapshot(session),
+        })
+
+    def _api_group_chat_delete(self):
+        """删除一个本地群聊会话目录。"""
+        data = self._read_post_body()
+        session = self._normalize_group_chat_session_id(data.get("session") or "")
+        if not session:
+            self._json_response({"success": False, "error": "缺少 session"}, 400)
+            return
+        with _group_chat_watchers_lock:
+            watcher = _group_chat_watchers.pop(session, None)
+            if watcher:
+                watcher["stop"].set()
+        try:
+            deleted = group_chat_delete_session(session)
+        except Exception as exc:
+            self._json_response({"success": False, "error": str(exc)}, 400)
+            return
+        self._json_response({
+            "success": True,
+            "deleted": deleted,
+            "sessions": group_chat_list_sessions(),
+        })
+
+    def _api_group_chat_user_decision(self):
+        """用户介入阻塞会话后，追加决策并恢复下一轮。"""
+        data = self._read_post_body()
+        session = self._normalize_group_chat_session_id(
+            data.get("session") or GROUP_CHAT_DEFAULT_SESSION
+        )
+        body = (data.get("body") or "").strip()
+        if not body:
+            self._json_response({"success": False, "error": "请输入你的决策或补充约束"}, 400)
+            return
+        before_snapshot = group_chat_session_snapshot(session)
+        messages = before_snapshot.get("messages", [])
+        before_state = before_snapshot.get("state") or {}
+        workspace_status = (before_snapshot.get("workspace") or {}).get("status") or {}
+        route = self._group_chat_user_decision_route(messages, before_state)
+        has_active_block = bool(
+            route.get("block_message_id")
+            or before_state.get("blocked")
+            or workspace_status.get("blocking")
+            or workspace_status.get("needs_user_decision")
+        )
+        if not has_active_block:
+            self._json_response({
+                "success": False,
+                "error": "当前没有待用户介入的问题，请刷新会话状态",
+            }, 409)
+            return
+        try:
+            group_chat_append_user_decision(session, body)
+            if route.get("block_message_id"):
+                group_chat_mark_forwarded(session, route["block_message_id"])
+        except Exception as exc:
+            self._json_response({"success": False, "error": str(exc)}, 400)
+            return
+        round_no = 1
+        if messages:
+            round_no = max(int(item.get("round") or 0) for item in messages) + 1
+        meta = before_snapshot.get("meta") or {}
+        if meta.get("mode") != "development":
+            group_chat_clear_blocked(session, phase="planning")
+            msg = group_chat_append_message(
+                session=session,
+                from_agent=route["from"],
+                to_agent=route["to"],
+                round_no=round_no,
+                msg_type="decision",
+                body=(
+                    "用户已补充回复，请把它作为当前讨论的新约束继续推进。\n\n"
+                    "用户回复：\n"
+                    f"{body}"
+                ),
+            )
+            self._json_response({
+                "success": True,
+                "message": msg,
+                "route": route,
+                "snapshot": group_chat_session_snapshot(session),
+            })
+            return
+
+        msg = group_chat_append_message(
+            session=session,
+            from_agent=route["from"],
+            to_agent=route["to"],
+            round_no=round_no,
+            msg_type="decision",
+            body=(
+                "用户已介入并补充决策，内容已追加到 brief.md。\n\n"
+                "这条消息是对上一条阻塞问题的 AI 对 AI 续接，不代表用户成为第三个对话 Agent。\n\n"
+                "用户决策：\n"
+                f"{body}\n\n"
+                "请重新读取 brief.md、proposal.md、implementation.md、review.md，"
+                "把该决策作为新增约束继续推进。"
+            ),
+        )
+        self._json_response({
+            "success": True,
+            "message": msg,
+            "route": route,
+            "snapshot": group_chat_session_snapshot(session),
+        })
+
+    @staticmethod
+    def _opposite_group_chat_agent(agent: str) -> str:
+        agent = (agent or "").strip().lower()
+        if agent == "codex":
+            return "antigravity"
+        return "codex"
+
+    @staticmethod
+    def _latest_group_chat_block_message(messages: list[dict], state: dict) -> dict | None:
+        forwarded = set(state.get("forwarded_ids") or [])
+        block_id = state.get("block_message_id")
+        if block_id and block_id not in forwarded:
+            for message in messages:
+                if message.get("id") == block_id:
+                    return message
+        for message in reversed(messages):
+            if message.get("id") in forwarded:
+                continue
+            msg_type = (message.get("type") or "").lower()
+            to_agent = (message.get("to") or "").lower()
+            if msg_type == "blocked" or (to_agent == "user" and not message.get("done")):
+                return message
+        return None
+
+    @staticmethod
+    def _group_chat_user_decision_route(messages: list[dict], state: dict) -> dict:
+        blocker = QingAgentHandler._latest_group_chat_block_message(messages, state)
+        from_agent = (blocker.get("from") if blocker else "") or "antigravity"
+        from_agent = from_agent.strip().lower()
+        if from_agent not in {"codex", "antigravity"}:
+            from_agent = "antigravity"
+        return {
+            "from": from_agent,
+            "to": QingAgentHandler._opposite_group_chat_agent(from_agent),
+            "block_message_id": blocker.get("id") if blocker else None,
+        }
+
+    @staticmethod
+    def _ensure_group_chat_continuable(session: str) -> dict | None:
+        """在开发模式下修复“实现产物误发给 user 导致监听空转”的会话。
+
+        正常链路应该是 Codex 完成 proposal/implementation/fix 后发给
+        Antigravity 评审；只有 blocked/final 才发给 user。早期提示词把
+        sender 当成了评审方，用户介入后容易生成 codex -> user 的实现消息。
+        这里在转发前做一次轻量续接，避免用户只能手工改 JSONL。
+        """
+        snapshot = group_chat_session_snapshot(session)
+        if int(snapshot.get("pending_count") or 0) > 0:
+            return None
+
+        meta = snapshot.get("meta") or {}
+        if meta.get("mode") != "development":
+            return None
+
+        state = snapshot.get("state") or {}
+        workspace = snapshot.get("workspace") or {}
+        workspace_status = workspace.get("status") or {}
+        if (
+            state.get("done")
+            or state.get("blocked")
+            or workspace_status.get("blocking")
+            or workspace_status.get("needs_user_decision")
+            or workspace_status.get("sign_off")
+        ):
+            return None
+
+        messages = snapshot.get("messages") or []
+        if not messages:
+            return None
+        last = messages[-1]
+        if (
+            (last.get("from") or "").lower() != "codex"
+            or (last.get("to") or "").lower() != "user"
+            or (last.get("type") or "").lower() not in {"reply", "proposal", "implementation", "fix"}
+        ):
+            return None
+
+        phase = (workspace_status.get("phase") or state.get("phase") or "").lower()
+        status = (workspace_status.get("status") or "").lower()
+        if phase not in {"planning", "implementation", "review", "fix"} and status != "needs_changes":
+            return None
+
+        next_round = max(int(item.get("round") or 0) for item in messages) + 1
+        return group_chat_append_message(
+            session=session,
+            from_agent="codex",
+            to_agent="antigravity",
+            round_no=next_round,
+            msg_type="implementation" if phase in {"implementation", "review", "fix"} else "reply",
+            body=(
+                "自动续接：上一轮 Codex 已完成当前阶段产物，但消息被写给了 user，"
+                "这里补发给 Antigravity 继续评审。\n\n"
+                "请重新读取 brief.md、proposal.md、implementation.md、review.md。\n"
+                "如果 implementation.md 已有实现记录，请基于目标文档、实现记录和当前 git diff 做代码评审；"
+                "如果当前只是 proposal.md 修订，请做方案复审。\n\n"
+                "上一轮 Codex 摘要：\n"
+                "---\n"
+                f"{(last.get('body') or '').strip()}\n"
+                "---"
+            ),
+        )
+
+    @staticmethod
+    def _normalize_group_chat_session_id(value: str) -> str:
+        import re
+        text = (value or "").strip()
+        text = re.sub(r"[^0-9A-Za-z_.-]+", "-", text)
+        return text.strip("-_.")
+
+    @staticmethod
+    def _group_chat_watcher_status(session: str) -> dict:
+        with _group_chat_watchers_lock:
+            item = _group_chat_watchers.get(session)
+            if not item:
+                return {"running": False}
+            return QingAgentHandler._group_chat_watcher_status_from_item(session, item)
+
+    @staticmethod
+    def _group_chat_watcher_status_from_item(session: str, item: dict) -> dict:
+        thread = item.get("thread")
+        running = bool(thread and thread.is_alive() and not item.get("stop").is_set())
+        return {
+            "running": running,
+            "session": session,
+            "interval": item.get("interval"),
+            "max_total": item.get("max_total"),
+            "forwarded": item.get("forwarded", 0),
+            "last_error": item.get("last_error"),
+            "last_event": item.get("last_event"),
+            "started_at": item.get("started_at"),
+            "updated_at": item.get("updated_at"),
+        }
+
+    @staticmethod
+    def _start_group_chat_watcher(session: str, interval: float = 3, max_total: int = 20) -> dict:
+        import threading as _threading
+
+        with _group_chat_watchers_lock:
+            existing = _group_chat_watchers.get(session)
+            if existing and existing.get("thread") and existing["thread"].is_alive():
+                existing["last_event"] = "已在监听中"
+                return QingAgentHandler._group_chat_watcher_status_from_item(session, existing)
+
+            stop_event = _threading.Event()
+            watcher = {
+                "session": session,
+                "interval": interval,
+                "max_total": max_total,
+                "forwarded": 0,
+                "stop": stop_event,
+                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "last_event": "启动中",
+                "last_error": None,
+            }
+
+            def _loop():
+                try:
+                    while not stop_event.is_set():
+                        state = group_chat_load_state(session)
+                        if state.get("done"):
+                            watcher["last_event"] = "会话已结束"
+                            watcher["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                            break
+                        if state.get("blocked"):
+                            watcher["last_event"] = "等待用户介入"
+                            watcher["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                            break
+                        if watcher["forwarded"] >= max_total:
+                            watcher["last_event"] = f"达到最大转发次数 {max_total}"
+                            watcher["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                            break
+                        count = group_chat_relay_once(session=session, max_forwards=1)
+                        watcher["forwarded"] += count
+                        if count:
+                            watcher["last_event"] = "已转发消息"
+                        else:
+                            awaiting = group_chat_get_awaiting_outbox(session)
+                            if awaiting:
+                                watcher["last_event"] = f"等待 {awaiting.get('from')} 写入 outbox"
+                            else:
+                                watcher["last_event"] = "暂无待转发消息"
+                        watcher["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                        if group_chat_load_state(session).get("done"):
+                            watcher["last_event"] = "会话已结束"
+                            break
+                        stop_event.wait(interval)
+                except Exception as exc:
+                    watcher["last_error"] = str(exc)
+                    watcher["last_event"] = "监听异常"
+                    watcher["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+            thread = _threading.Thread(target=_loop, daemon=True, name=f"group-chat-{session}")
+            watcher["thread"] = thread
+            _group_chat_watchers[session] = watcher
+            thread.start()
+            return QingAgentHandler._group_chat_watcher_status_from_item(session, watcher)
+
+    @staticmethod
+    def _stop_group_chat_watcher(session: str) -> bool:
+        with _group_chat_watchers_lock:
+            item = _group_chat_watchers.get(session)
+            if not item:
+                return False
+            item["stop"].set()
+            item["last_event"] = "手动停止"
+            item["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            return True
+
     def _serve_benchmark(self):
         """返回模型测试台页面"""
         html = _get_benchmark_html()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.end_headers()
+        self.wfile.write(html.encode("utf-8"))
+
+    def _serve_group_chat(self):
+        """返回多 Agent 群聊控制台页面。"""
+        html = _get_group_chat_html()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -556,6 +1235,646 @@ class QingAgentHandler(SimpleHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8")
         return json.loads(body) if body else {}
+
+    # ─── 自动化用例工作台 API ─────────────────────────────────────────────
+    def _api_automation_get(self, path: str, query: str = ""):
+        parts = [unquote(p) for p in path.strip("/").split("/")]
+        try:
+            if path == "/api/automation/projects":
+                self._json_response({"success": True, "projects": self._automation_projects()})
+                return
+
+            if len(parts) >= 5 and parts[:3] == ["api", "automation", "projects"]:
+                project = parts[3]
+                if len(parts) == 5 and parts[4] == "inventory":
+                    self._json_response({
+                        "success": True,
+                        **self._automation_inventory(project),
+                    })
+                    return
+                if len(parts) == 6 and parts[4] == "cases":
+                    case_id = parts[5]
+                    self._json_response({
+                        "success": True,
+                        **self._automation_case_detail(project, case_id),
+                    })
+                    return
+
+            if len(parts) >= 4 and parts[:3] == ["api", "automation", "runs"]:
+                run_id = parts[3]
+                if len(parts) == 5 and parts[4] == "report":
+                    self._json_response({
+                        "success": True,
+                        **self._automation_run_report(run_id),
+                    })
+                    return
+                if len(parts) == 4:
+                    self._json_response({
+                        "success": True,
+                        **self._automation_run_status(run_id),
+                    })
+                    return
+
+            self._json_response({"success": False, "error": "未知 automation GET 接口"}, 404)
+        except Exception as exc:
+            self._json_response({"success": False, "error": str(exc)}, 500)
+
+    def _api_automation_post(self, path: str):
+        try:
+            if path == "/api/automation/run":
+                data = self._read_post_body()
+                self._json_response({"success": True, **self._automation_run(data)})
+                return
+            self._json_response({"success": False, "error": "未知 automation POST 接口"}, 404)
+        except Exception as exc:
+            self._json_response({"success": False, "error": str(exc)}, 500)
+
+    @staticmethod
+    def _automation_runtime_root() -> Path:
+        root = Path(config.PROJECT_ROOT) / "runtime" / "case_runs"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    @staticmethod
+    def _automation_safe_name(value: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "run"
+
+    @staticmethod
+    def _automation_file_sig(path: Path):
+        if not path.exists():
+            return None
+        stat = path.stat()
+        return (stat.st_mtime_ns, stat.st_size)
+
+    @staticmethod
+    def _automation_yaml(path: Path) -> dict:
+        """用系统 Ruby 解析 YAML，避免给 QingAgent 增加 PyYAML 运行依赖。"""
+        path = path.resolve()
+        if not path.exists():
+            raise FileNotFoundError(str(path))
+        sig = QingAgentHandler._automation_file_sig(path)
+        cache_key = str(path)
+        with _automation_cache_lock:
+            cached = _automation_yaml_cache.get(cache_key)
+            if cached and cached.get("sig") == sig:
+                return cached.get("data") or {}
+        result = subprocess.run(
+            [
+                "ruby",
+                "-ryaml",
+                "-rjson",
+                "-e",
+                "puts JSON.generate(YAML.load_file(ARGV[0]))",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or f"YAML 解析失败: {path}")
+        data = json.loads(result.stdout or "{}") or {}
+        with _automation_cache_lock:
+            _automation_yaml_cache[cache_key] = {"sig": sig, "data": data}
+        return data
+
+    @staticmethod
+    def _automation_project(project: str):
+        from ..skills.project_registry import PROJECTS
+
+        cfg = PROJECTS.get(project)
+        if not cfg:
+            raise ValueError(f"未知项目: {project}")
+        root = Path(cfg.get("docs_root") or "")
+        agents = root / ".agents"
+        business_lines = agents / "business_lines.yaml"
+        return cfg, root, agents, business_lines
+
+    def _automation_projects(self) -> list[dict]:
+        from ..skills.project_registry import PROJECTS
+
+        projects = []
+        for key, cfg in PROJECTS.items():
+            root = Path(cfg.get("docs_root") or "")
+            inventory = root / ".agents" / "business_lines.yaml"
+            if inventory.exists():
+                projects.append({
+                    "id": key,
+                    "name": cfg.get("name") or key,
+                    "root": str(root),
+                    "inventory_path": str(inventory),
+                })
+        return projects
+
+    def _automation_inventory(self, project: str) -> dict:
+        cfg, root, agents, business_lines_path = self._automation_project(project)
+        inventory = self._automation_yaml(business_lines_path)
+        case_paths = []
+        for line in inventory.get("business_lines") or []:
+            for rel in line.get("cases") or []:
+                case_paths.append((root / rel).resolve())
+        cache_sig = (
+            str(business_lines_path.resolve()),
+            self._automation_file_sig(business_lines_path),
+            tuple((str(path), self._automation_file_sig(path)) for path in case_paths),
+        )
+        cache_key = f"{project}:{root.resolve()}"
+        with _automation_cache_lock:
+            cached = _automation_inventory_cache.get(cache_key)
+            if cached and cached.get("sig") == cache_sig:
+                return cached.get("data") or {}
+
+        lines = []
+        cases_flat = []
+        total_valid = 0
+        total_runnable = 0
+
+        for line in inventory.get("business_lines") or []:
+            line_cases = []
+            for case_path in ((root / rel).resolve() for rel in line.get("cases") or []):
+                summary = self._automation_case_summary(project, case_path, line)
+                line_cases.append(summary)
+                cases_flat.append(summary)
+                if summary["schema_status"] == "valid":
+                    total_valid += 1
+                if summary["runnable"]:
+                    total_runnable += 1
+            lines.append({
+                "id": line.get("id"),
+                "title": line.get("title") or line.get("id"),
+                "priority": line.get("priority") or "",
+                "layers": line.get("layers") or [],
+                "skill": line.get("skill") or "",
+                "case_count": len(line_cases),
+                "runnable_count": sum(1 for c in line_cases if c["runnable"]),
+                "cases": line_cases,
+            })
+
+        data = {
+            "project": {
+                "id": project,
+                "name": cfg.get("name") or project,
+                "root": str(root),
+                "inventory_path": str(business_lines_path),
+                "schema_version": inventory.get("schema_version"),
+                "version": inventory.get("version"),
+            },
+            "business_lines": lines,
+            "cases": cases_flat,
+            "stats": {
+                "business_line_count": len(lines),
+                "case_count": len(cases_flat),
+                "valid_count": total_valid,
+                "runnable_count": total_runnable,
+            },
+        }
+        with _automation_cache_lock:
+            _automation_inventory_cache[cache_key] = {"sig": cache_sig, "data": data}
+        return data
+
+    def _automation_case_summary(self, project: str, case_path: Path, line: dict | None = None) -> dict:
+        try:
+            case = self._automation_yaml(case_path)
+            validation = self._automation_validate_case(case)
+            executor = self._automation_executor_status(case)
+            case_id = case.get("id") or case_path.stem
+            return {
+                "id": case_id,
+                "title": case.get("title") or case_id,
+                "business_line": case.get("business_line") or (line or {}).get("id") or "",
+                "priority": case.get("priority") or (line or {}).get("priority") or "",
+                "layers": case.get("layers") or (line or {}).get("layers") or [],
+                "path": str(case_path),
+                "schema_status": "valid" if validation["valid"] else "invalid",
+                "schema_errors": validation["errors"],
+                "executor_status": executor["status"],
+                "executor_reason": executor["reason"],
+                "runnable": validation["valid"] and executor["status"] == "api_supported",
+                "step_count": len(case.get("steps") or []),
+                "expected_count": len(case.get("expected") or []),
+            }
+        except Exception as exc:
+            return {
+                "id": case_path.stem,
+                "title": case_path.stem,
+                "business_line": (line or {}).get("id") or "",
+                "priority": (line or {}).get("priority") or "",
+                "layers": (line or {}).get("layers") or [],
+                "path": str(case_path),
+                "schema_status": "invalid",
+                "schema_errors": [str(exc)],
+                "executor_status": "invalid",
+                "executor_reason": "case 文件无法解析",
+                "runnable": False,
+                "step_count": 0,
+                "expected_count": 0,
+            }
+
+    @staticmethod
+    def _automation_validate_case(case: dict) -> dict:
+        required = ["id", "title", "business_line", "priority", "steps", "expected"]
+        errors = []
+        for field in required:
+            if field not in case or case.get(field) in (None, "", []):
+                errors.append(f"缺少必填字段: {field}")
+        if "steps" in case and not isinstance(case.get("steps"), list):
+            errors.append("steps 必须是数组")
+        if "expected" in case and not isinstance(case.get("expected"), list):
+            errors.append("expected 必须是数组")
+        return {"valid": not errors, "errors": errors}
+
+    @staticmethod
+    def _automation_executor_status(case: dict) -> dict:
+        unsupported = []
+        for item in case.get("preconditions") or []:
+            if item.get("type") not in {"http_call", "login"}:
+                unsupported.append(item.get("type") or "unknown_precondition")
+        for item in case.get("steps") or []:
+            action = item.get("action")
+            if action not in {
+                "http_call",
+                "approve_task_for_instance",
+                "reject_task_for_instance",
+                "return_task_for_instance",
+            }:
+                unsupported.append(action or "unknown_action")
+        for item in case.get("expected") or []:
+            if item.get("type") not in {"http_call", "assert", "request_log"}:
+                unsupported.append(item.get("type") or "unknown_expected")
+        if unsupported:
+            uniq = sorted({str(x) for x in unsupported})
+            return {
+                "status": "unsupported_executor",
+                "reason": "第一版仅支持 API executor；暂不支持 " + "、".join(uniq),
+            }
+        return {"status": "api_supported", "reason": "可由 API runner 执行"}
+
+    def _automation_case_detail(self, project: str, case_id: str) -> dict:
+        inventory = self._automation_inventory(project)
+        target = next((c for c in inventory["cases"] if c["id"] == case_id), None)
+        if not target:
+            raise ValueError(f"找不到 case: {case_id}")
+        case = self._automation_yaml(Path(target["path"]))
+        return {"project": inventory["project"], "summary": target, "case": case}
+
+    def _automation_run(self, data: dict) -> dict:
+        project = data.get("project") or "qingoa"
+        case_id = data.get("case_id") or ""
+        api_base = (data.get("api_base") or "http://127.0.0.1:8010").rstrip("/")
+        detail = self._automation_case_detail(project, case_id)
+        summary = detail["summary"]
+        case = detail["case"]
+        run_id = (
+            datetime.now().strftime("%Y%m%d-%H%M%S")
+            + "-"
+            + self._automation_safe_name(case_id)
+        )
+        run_dir = self._automation_runtime_root() / project / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        if not summary["runnable"]:
+            result = {
+                "run_id": run_id,
+                "project": project,
+                "case_id": case_id,
+                "status": "unsupported",
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "api_base": api_base,
+                "summary": summary,
+                "steps": [],
+                "error": summary["executor_reason"],
+            }
+        else:
+            result = self._automation_run_api_case(project, case, api_base, run_id)
+
+        result["run_dir"] = str(run_dir)
+        result["report_path"] = str(run_dir / "report.md")
+        report = self._automation_render_report(result)
+        (run_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        (run_dir / "report.md").write_text(report, encoding="utf-8")
+        return {"run_id": run_id, "run": result}
+
+    def _automation_run_status(self, run_id: str) -> dict:
+        root = self._automation_runtime_root()
+        matches = list(root.glob(f"*/*{self._automation_safe_name(run_id)}*"))
+        if not matches:
+            matches = list(root.glob(f"*/{run_id}"))
+        if not matches:
+            raise ValueError(f"找不到运行记录: {run_id}")
+        result_path = matches[0] / "result.json"
+        return {"run": json.loads(result_path.read_text(encoding="utf-8"))}
+
+    def _automation_run_report(self, run_id: str) -> dict:
+        root = self._automation_runtime_root()
+        matches = list(root.glob(f"*/*{self._automation_safe_name(run_id)}*"))
+        if not matches:
+            matches = list(root.glob(f"*/{run_id}"))
+        if not matches:
+            raise ValueError(f"找不到运行报告: {run_id}")
+        report_path = matches[0] / "report.md"
+        return {"run_id": run_id, "report": report_path.read_text(encoding="utf-8"), "path": str(report_path)}
+
+    def _automation_run_api_case(self, project: str, case: dict, api_base: str, run_id: str) -> dict:
+        ctx = {"tokens": {}, "actors": case.get("actors") or {}}
+        result = {
+            "run_id": run_id,
+            "project": project,
+            "case_id": case.get("id"),
+            "title": case.get("title"),
+            "status": "running",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "api_base": api_base,
+            "steps": [],
+            "assertions": [],
+            "error": None,
+        }
+        try:
+            for item in case.get("preconditions") or []:
+                result["steps"].append(self._automation_execute_item(item, ctx, api_base, phase="precondition"))
+            for item in case.get("steps") or []:
+                result["steps"].append(self._automation_execute_item(item, ctx, api_base, phase="step"))
+            for item in case.get("expected") or []:
+                outcome = self._automation_execute_expected(item, ctx, api_base)
+                result["assertions"].append(outcome)
+                if outcome.get("status") == "failed":
+                    raise AssertionError(outcome.get("message") or "断言失败")
+            result["status"] = "passed"
+        except Exception as exc:
+            result["status"] = "failed"
+            result["error"] = str(exc)
+        result["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        return result
+
+    def _automation_execute_item(self, item: dict, ctx: dict, api_base: str, phase: str) -> dict:
+        kind = item.get("type") or item.get("action")
+        item_id = item.get("id") or kind or phase
+        if kind == "login":
+            username = item.get("username")
+            password = item.get("password") or "123456"
+            response = self._automation_http(api_base, "POST", "/api/auth/login", {"username": username, "password": password})
+            token = self._automation_get_path(response["body"], "data.token") or self._automation_get_path(response["body"], "token")
+            if token:
+                ctx["tokens"][item.get("actor") or username] = token
+            ctx[item_id] = {"response": response["body"], "http_status": response["http_status"]}
+            return {"id": item_id, "phase": phase, "kind": "login", "status": "passed", "username": username}
+
+        if kind == "http_call":
+            actor = item.get("actor")
+            body = self._automation_resolve_obj(item.get("body"), ctx)
+            url = self._automation_resolve_text(item.get("url") or "", ctx)
+            token = self._automation_actor_token(ctx, api_base, actor)
+            response = self._automation_http(
+                api_base,
+                item.get("method") or "GET",
+                url,
+                body,
+                token=token,
+            )
+            ctx[item_id] = {"response": response["body"], "http_status": response["http_status"]}
+            self._automation_apply_save(item, item_id, ctx)
+            return {
+                "id": item_id,
+                "phase": phase,
+                "kind": "http_call",
+                "method": item.get("method") or "GET",
+                "url": url,
+                "http_status": response["http_status"],
+                "status": "passed" if response["ok"] else "failed",
+            }
+
+        if kind in {"approve_task_for_instance", "reject_task_for_instance", "return_task_for_instance"}:
+            actor = item.get("actor")
+            action = kind.split("_", 1)[0]
+            instance_id = self._automation_resolve_obj((item.get("params") or {}).get("instance_id"), ctx)
+            note = self._automation_resolve_obj((item.get("params") or {}).get("note") or "", ctx)
+            token = self._automation_actor_token(ctx, api_base, actor)
+            task_id = self._automation_find_task_id(api_base, token, instance_id)
+            response = self._automation_http(
+                api_base,
+                "POST",
+                f"/api/workflow/tasks/{task_id}/{action}",
+                {"note": note},
+                token=token,
+            )
+            ctx[item_id] = {"response": response["body"], "http_status": response["http_status"], "task_id": task_id}
+            self._automation_apply_save(item, item_id, ctx)
+            return {
+                "id": item_id,
+                "phase": phase,
+                "kind": kind,
+                "task_id": task_id,
+                "instance_id": instance_id,
+                "http_status": response["http_status"],
+                "status": "passed" if response["ok"] else "failed",
+            }
+
+        raise ValueError(f"API runner 暂不支持 {phase}: {kind}")
+
+    def _automation_actor_token(self, ctx: dict, api_base: str, actor: str | None) -> str | None:
+        if not actor:
+            return None
+        if actor in ctx["tokens"]:
+            return ctx["tokens"][actor]
+        username = (ctx.get("actors") or {}).get(actor) or actor
+        response = self._automation_http(
+            api_base,
+            "POST",
+            "/api/auth/login",
+            {"username": username, "password": "123456"},
+        )
+        token = self._automation_get_path(response["body"], "data.token") or self._automation_get_path(response["body"], "token")
+        if token:
+            ctx["tokens"][actor] = token
+        return token
+
+    def _automation_execute_expected(self, item: dict, ctx: dict, api_base: str) -> dict:
+        kind = item.get("type")
+        if kind == "http_call":
+            outcome = self._automation_execute_item(item, ctx, api_base, phase="expected")
+            return {"id": item.get("id"), "type": "http_call", "status": outcome["status"], "message": outcome.get("url")}
+        if kind == "assert":
+            source = self._automation_resolve_obj(item.get("source"), ctx)
+            actual = self._automation_get_path(source, item.get("path") or "")
+            expected = self._automation_resolve_obj(item.get("value"), ctx)
+            op = item.get("operator") or "eq"
+            ok = self._automation_compare(actual, op, expected)
+            return {
+                "type": "assert",
+                "source": item.get("source"),
+                "path": item.get("path"),
+                "operator": op,
+                "expected": expected,
+                "actual": actual,
+                "status": "passed" if ok else "failed",
+                "message": "passed" if ok else f"{actual!r} {op} {expected!r} 不成立",
+            }
+        if kind == "request_log":
+            response = self._automation_http(api_base, "GET", "/debug/requests", None)
+            logs = self._automation_get_path(response["body"], "data.requests") or self._automation_get_path(response["body"], "data") or []
+            method = item.get("method")
+            path = item.get("path")
+            code = item.get("response_code")
+            found = False
+            for row in logs if isinstance(logs, list) else []:
+                if method and str(row.get("method")).upper() != str(method).upper():
+                    continue
+                if path and path not in str(row.get("path") or row.get("url") or ""):
+                    continue
+                if code is not None and row.get("response_code") != code:
+                    continue
+                found = True
+                break
+            return {"type": "request_log", "status": "passed" if found else "failed", "message": f"{method} {path}"}
+        raise ValueError(f"API runner 暂不支持 expected: {kind}")
+
+    def _automation_http(self, api_base: str, method: str, url: str, body=None, token: str | None = None) -> dict:
+        target = url if url.startswith("http") else api_base.rstrip("/") + "/" + url.lstrip("/")
+        data = None
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        if body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(target, data=data, headers=headers, method=method.upper())
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(request, timeout=15) as resp:
+                raw = resp.read().decode("utf-8")
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            status = exc.code
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            parsed = {"raw": raw}
+        ok = 200 <= status < 300 and (not isinstance(parsed, dict) or parsed.get("code", 0) == 0)
+        return {"http_status": status, "body": parsed, "ok": ok}
+
+    def _automation_find_task_id(self, api_base: str, token: str | None, instance_id) -> int:
+        response = self._automation_http(api_base, "GET", "/api/workflow/tasks?bucket=todo", None, token=token)
+        tasks = self._automation_get_path(response["body"], "data.tasks") or []
+        for task in tasks:
+            if str(task.get("process_instance_id")) == str(instance_id):
+                return task["id"]
+        if tasks:
+            return tasks[0]["id"]
+        raise ValueError(f"找不到流程实例 {instance_id} 的待办任务")
+
+    def _automation_apply_save(self, item: dict, item_id: str, ctx: dict):
+        save = item.get("save") or {}
+        if not isinstance(save, dict):
+            return
+        ctx.setdefault(item_id, {})
+        for key, value in save.items():
+            ctx[item_id][key] = self._automation_resolve_obj(value, ctx)
+
+    def _automation_resolve_obj(self, value, ctx: dict):
+        if isinstance(value, str):
+            return self._automation_resolve_text(value, ctx)
+        if isinstance(value, list):
+            return [self._automation_resolve_obj(v, ctx) for v in value]
+        if isinstance(value, dict):
+            return {k: self._automation_resolve_obj(v, ctx) for k, v in value.items()}
+        return value
+
+    def _automation_resolve_text(self, value: str, ctx: dict):
+        value = self._automation_resolve_date_tokens(value)
+        if value.startswith("$") and re.fullmatch(r"\$[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+|\.\d+)*", value):
+            return self._automation_resolve_ref(value, ctx)
+
+        def repl(match):
+            resolved = self._automation_resolve_ref(match.group(0), ctx)
+            return "" if resolved is None else str(resolved)
+
+        return re.sub(r"\$[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+|\.\d+)*", repl, value)
+
+    @staticmethod
+    def _automation_resolve_date_tokens(value: str) -> str:
+        today = date.today()
+        def repl(match):
+            offset = int(match.group(1) or 0)
+            return (today + timedelta(days=offset)).isoformat()
+        return re.sub(r"\{\{today(?:\+(\d+))?\}\}", repl, value)
+
+    def _automation_resolve_ref(self, ref: str, ctx: dict):
+        path = ref[1:].split(".")
+        if not path:
+            return None
+        root = ctx.get(path[0])
+        if root is None:
+            return None
+        return self._automation_get_path(root, ".".join(path[1:]))
+
+    @staticmethod
+    def _automation_get_path(obj, dotted: str):
+        cur = obj
+        if not dotted:
+            return cur
+        for part in dotted.split("."):
+            if isinstance(cur, list) and part.isdigit():
+                idx = int(part)
+                cur = cur[idx] if idx < len(cur) else None
+            elif isinstance(cur, dict):
+                cur = cur.get(part)
+            else:
+                return None
+        return cur
+
+    @staticmethod
+    def _automation_compare(actual, operator: str, expected) -> bool:
+        if operator == "eq":
+            return actual == expected
+        if operator == "ne":
+            return actual != expected
+        if operator == "gt":
+            return actual > expected
+        if operator == "gte":
+            return actual >= expected
+        if operator == "lt":
+            return actual < expected
+        if operator == "lte":
+            return actual <= expected
+        if operator == "contains":
+            if isinstance(actual, list) and any(isinstance(x, dict) and x.get("action") == expected for x in actual):
+                return True
+            return expected in (actual or [])
+        if operator == "not_contains":
+            if isinstance(actual, list) and any(isinstance(x, dict) and x.get("action") == expected for x in actual):
+                return False
+            return expected not in (actual or [])
+        if operator == "len_gte":
+            return len(actual or []) >= int(expected)
+        if operator == "len_eq":
+            return len(actual or []) == int(expected)
+        if operator == "exists":
+            return actual is not None
+        if operator == "not_exists":
+            return actual is None
+        raise ValueError(f"未知断言操作符: {operator}")
+
+    @staticmethod
+    def _automation_render_report(result: dict) -> str:
+        lines = [
+            f"# Automation Case Report",
+            "",
+            f"- run_id: `{result.get('run_id')}`",
+            f"- project: `{result.get('project')}`",
+            f"- case: `{result.get('case_id')}`",
+            f"- status: `{result.get('status')}`",
+            f"- api_base: `{result.get('api_base')}`",
+            "",
+            "## Steps",
+        ]
+        for step in result.get("steps") or []:
+            lines.append(f"- `{step.get('id')}` {step.get('kind')} -> {step.get('status')}")
+        lines += ["", "## Assertions"]
+        for assertion in result.get("assertions") or []:
+            lines.append(f"- {assertion.get('type')} `{assertion.get('path') or assertion.get('message')}` -> {assertion.get('status')}")
+        if result.get("error"):
+            lines += ["", "## Error", str(result["error"])]
+        return "\n".join(lines) + "\n"
 
     # ─── 模型注册表 ───────────────────────────────────────────────────────
     @staticmethod
@@ -2072,6 +3391,10 @@ def _get_ui_html() -> str:
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
             <span>测试台</span>
         </button>
+        <button class="header-btn" onclick="window.location.href='/group-chat'" title="多 Agent 群聊控制台">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"></path><path d="M8 9h8"></path><path d="M8 13h5"></path></svg>
+            <span>群聊</span>
+        </button>
         <button class="theme-toggle" id="themeToggleBtn" onclick="toggleTheme()" title="切换明/暗主题">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
@@ -3252,6 +4575,143 @@ def _get_ui_html() -> str:
 
 
 
+def _get_group_chat_html() -> str:
+    """生成多 Agent 群聊控制台 HTML。"""
+    return '''
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>多 Agent 群聊 · QingAgent</title>
+<style>
+:root{--bg:#f5f7fb;--panel:#fff;--panel2:#f8fafc;--line:#e5e7eb;--text:#111827;--muted:#6b7280;--soft:#eef2ff;--blue:#4f6bed;--green:#16a34a;--red:#dc2626;--amber:#d97706;--codex:#edf2ff;--codex-line:#dbe4ff;--ag:#f0fbf7;--ag-line:#d7f4e7;--mono:"SFMono-Regular",Consolas,monospace}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font-size:13px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,textarea,select{font:inherit}
+.top{height:50px;display:flex;align-items:center;justify-content:space-between;padding:0 16px;background:rgba(255,255,255,.88);border-bottom:1px solid var(--line);backdrop-filter:blur(16px);position:sticky;top:0;z-index:3}.brand{display:flex;align-items:center;gap:9px;font-weight:700}.mark{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,#5eead4,#5975f6);display:grid;place-items:center;color:#fff;font-size:12px;font-weight:800}.top a{color:var(--muted);font-size:12px;text-decoration:none;border:1px solid var(--line);padding:5px 9px;border-radius:7px;background:#fff}
+.shell{display:grid;grid-template-columns:326px 1fr;gap:12px;padding:12px;min-height:calc(100vh - 50px)}.side,.main{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}.side{display:flex;flex-direction:column;min-height:0}.side-top{padding:12px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#fff,#f8fafc)}.side-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.side-title{font-size:14px;font-weight:850}.side-sub{margin-top:3px;color:var(--muted);font-size:11px}.side-actions{display:flex;gap:6px}.icon-btn{border:1px solid var(--line);background:#fff;border-radius:9px;height:30px;padding:0 9px;font-size:12px;font-weight:800;cursor:pointer}.icon-btn:hover{background:var(--panel2)}.icon-btn.primary{background:var(--blue);border-color:var(--blue);color:#fff;box-shadow:0 8px 18px rgba(79,107,237,.18)}.section{padding:12px;border-bottom:1px solid var(--line)}.config-panel{background:#fff}.config-panel.hidden{display:none}.config-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:10px}.config-title{font-size:12px;font-weight:850}.config-note{font-size:10px;color:var(--muted);margin-top:2px;line-height:1.45}.config-close{border:0;background:#f3f4f6;color:#6b7280;border-radius:8px;padding:4px 8px;cursor:pointer;font-size:11px;font-weight:800}.config-close:hover{background:#e5e7eb;color:#111827}.label{font-size:11px;font-weight:700;color:var(--muted);margin-bottom:7px}.field{display:flex;flex-direction:column;gap:5px;margin-bottom:9px}.field span{font-size:11px;color:var(--muted)}
+input,textarea,select{width:100%;border:1px solid var(--line);border-radius:8px;padding:7px 9px;background:#fff;color:var(--text);font-size:12px;outline:none}textarea{resize:vertical;min-height:58px;line-height:1.5}#topic{min-height:66px}input:focus,textarea:focus,select:focus{border-color:rgba(79,107,237,.55);box-shadow:0 0 0 3px rgba(79,107,237,.1)}.row{display:flex;gap:7px;align-items:center}.btn{border:1px solid var(--line);background:#fff;color:var(--text);font-size:12px;padding:7px 10px;border-radius:8px;cursor:pointer;transition:.14s}.btn:hover{background:var(--panel2);transform:translateY(-1px)}.btn:active{transform:translateY(0);box-shadow:inset 0 1px 2px rgba(15,23,42,.12)}.btn.primary{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:700}.btn.green{background:#ecfdf5;border-color:#bbf7d0;color:#047857;font-weight:700}.btn.red{background:#fff1f2;border-color:#fecdd3;color:#be123c;font-weight:700}.btn:disabled{opacity:.55;cursor:not-allowed;transform:none}.btn.loading{position:relative;color:transparent!important;pointer-events:none}.btn.loading:after{content:"";position:absolute;left:50%;top:50%;width:14px;height:14px;margin:-7px 0 0 -7px;border:2px solid currentColor;border-right-color:transparent;border-top-color:transparent;border-radius:50%;animation:spin .72s linear infinite;color:#fff}.btn:not(.primary).loading:after{color:var(--blue)}@keyframes spin{to{transform:rotate(360deg)}}
+.template-toggle{width:100%;border:1px solid var(--line);background:#f8fafc;border-radius:10px;padding:8px 9px;display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:pointer;text-align:left}.template-toggle:hover{background:#fff;border-color:rgba(79,107,237,.42)}.template-summary{min-width:0}.template-summary strong{display:block;font-size:12px;color:#111827;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.template-summary span{display:block;margin-top:2px;font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.template-arrow{font-size:12px;color:var(--muted);transition:.14s}.template-picker{display:none;margin-top:7px}.template-picker.open{display:block}.template-toggle.open .template-arrow{transform:rotate(180deg)}.template-grid{display:grid;grid-template-columns:1fr;gap:6px}.template-card{border:1px solid var(--line);background:#fff;border-radius:10px;padding:8px 9px;text-align:left;cursor:pointer;transition:.14s}.template-card:hover,.template-card:focus{border-color:rgba(79,107,237,.45);box-shadow:0 6px 16px rgba(17,24,39,.05);transform:translateY(-1px);outline:none}.template-card.active{border-color:rgba(79,107,237,.72);background:#f5f7ff;box-shadow:0 0 0 3px rgba(79,107,237,.08)}.template-name{font-size:12px;font-weight:850;color:#111827}.template-meta{margin-top:4px;display:flex;gap:5px;flex-wrap:wrap}.template-chip{font-size:10px;border:1px solid var(--line);border-radius:999px;background:#f8fafc;color:#4b5563;padding:1px 6px}.template-desc{margin-top:7px;font-size:10px;color:#4b5563;line-height:1.45}.template-usage{margin-top:7px;border:1px solid #dbe4ff;background:#f8faff;border-radius:9px;padding:6px 7px;font-size:10px;line-height:1.45;color:#374151}.template-usage strong{display:block;color:#3730a3;font-size:10px;margin-bottom:2px}.template-example{display:none;margin-top:4px;color:#475569}.template-card:hover .template-example,.template-card:focus .template-example,.template-card.active .template-example{display:block}.template-empty{font-size:11px;color:var(--muted);padding:8px;border:1px dashed var(--line);border-radius:10px;background:#fafafa}.role-hint{margin-top:-3px;margin-bottom:8px;font-size:10px;color:var(--muted);line-height:1.45}.role-hint b{color:#374151}.role-swap{display:flex;justify-content:center;margin:-2px 0 9px}.swap-role-btn{border:1px solid #dbe4ff;background:#f5f7ff;color:#4359d6;border-radius:999px;padding:5px 10px;font-size:11px;font-weight:850;cursor:pointer}.swap-role-btn:hover{background:#eef2ff;border-color:rgba(79,107,237,.45);transform:translateY(-1px)}.swap-role-btn:active{transform:translateY(0)}.swap-role-btn:disabled{opacity:.55;cursor:not-allowed;transform:none}
+.sessions-head{display:flex;align-items:center;justify-content:space-between;padding:9px 10px 0;color:var(--muted);font-size:11px;font-weight:800}.sessions-head button{border:0;background:transparent;color:var(--blue);font-size:11px;font-weight:800;cursor:pointer}.sessions-head button.active{color:#be123c}.sessions{overflow:auto;padding:8px;display:flex;flex-direction:column;gap:7px;min-height:0;flex:1}.session-item{border:1px solid var(--line);background:#fff;border-radius:10px;padding:9px;cursor:pointer}.session-item:hover{background:#fafafa}.session-item.active{border-color:rgba(79,107,237,.55);background:#f5f7ff}.session-item.draft{border-style:dashed;background:#fff7ed;border-color:#fed7aa}.session-item.editing{border-style:dashed}.session-title{font-weight:700;font-size:12px;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.session-meta{font-size:10px;color:var(--muted);display:flex;gap:7px;flex-wrap:wrap}.session-tools{display:flex;gap:5px;margin-top:7px}.mini-link{border:0;background:#eef2ff;color:#4359d6;border-radius:999px;font-size:10px;font-weight:800;padding:3px 7px;cursor:pointer}.mini-link:hover{background:#e0e7ff}.mini-link.danger{background:#fff1f2;color:#be123c}.mini-link.danger:hover{background:#ffe4e6}
+.main{display:grid;grid-template-rows:auto 1fr;min-width:0}.toolbar{padding:12px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:minmax(0,1fr) minmax(390px,430px);gap:16px;align-items:start}.title{min-width:0;border:1px solid var(--line);border-radius:12px;background:linear-gradient(180deg,#fff,#f8fafc);padding:10px 12px;box-shadow:0 8px 20px rgba(17,24,39,.035)}.title-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px}.title-label{font-size:11px;color:var(--muted);font-weight:850}.title-action{border:0;background:#eef2ff;color:#4359d6;border-radius:999px;padding:4px 9px;font-size:11px;font-weight:850;cursor:pointer;white-space:nowrap}.title-action:hover{background:#e0e7ff}.title h1{font-size:17px;line-height:1.34;margin:0 0 5px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;max-height:46px}.title p{margin:0;color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.run-panel{display:flex;flex-direction:column;align-items:stretch;gap:9px;min-width:0}.status{display:grid;grid-template-columns:repeat(4,minmax(72px,1fr));gap:6px;width:100%}.status-card{border:1px solid var(--line);border-radius:10px;background:#fff;padding:7px 9px;min-height:48px}.status-card strong{display:block;font-size:12px;line-height:1.1;color:#111827;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status-card span{display:block;margin-top:5px;font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status-card.green{background:#ecfdf5;border-color:#bbf7d0}.status-card.green strong{color:#047857}.status-card.amber{background:#fffbeb;border-color:#fde68a}.status-card.amber strong{color:#92400e}.status-card.red{background:#fff1f2;border-color:#fecdd3}.status-card.red strong{color:#be123c}.controlbar{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;align-items:center}.control-btn{height:34px;border-radius:10px;font-weight:800;box-shadow:0 6px 14px rgba(17,24,39,.06);display:inline-flex;align-items:center;justify-content:center;white-space:nowrap}.control-btn.subtle{background:#f8fafc}.control-btn.primary{box-shadow:0 10px 20px rgba(79,107,237,.22)}.control-btn.danger{background:#fff1f2;border-color:#fecdd3;color:#be123c}.toast{position:fixed;right:24px;bottom:24px;z-index:30;display:none;max-width:320px;border:1px solid var(--line);border-radius:12px;background:#fff;box-shadow:0 18px 48px rgba(15,23,42,.18);padding:10px 12px;font-size:12px;color:#111827}.toast.show{display:block}.toast.ok{border-color:#bbf7d0;background:#ecfdf5;color:#047857}.toast.err{border-color:#fecdd3;background:#fff1f2;color:#be123c}
+.content{display:grid;grid-template-columns:minmax(0,1fr) 286px;min-height:0}.timeline{padding:14px;overflow:auto;display:flex;flex-direction:column;gap:10px;background:linear-gradient(180deg,#fff,#f8fafc)}.empty{height:100%;display:grid;place-items:center;color:var(--muted);font-size:13px}.block-panel{border:1px solid #fecdd3;background:#fff1f2;color:#9f1239;border-radius:12px;padding:10px;margin-bottom:10px}.block-title{font-weight:800;font-size:12px}.block-text{font-size:11px;line-height:1.5;margin-top:4px}.block-question{margin-top:8px;border:1px solid #f9a8d4;background:#fff;border-radius:10px;overflow:hidden}.block-question-title{font-size:11px;font-weight:800;color:#9f1239;background:#fff5f7;border-bottom:1px solid #fce7f3;padding:7px 9px}.block-question-body{max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;line-height:1.58;font-size:12px;color:#3f1728;padding:9px}.block-panel textarea{margin-top:8px;min-height:92px;background:#fff}.awaiting-panel{border:1px solid #fde68a;background:#fffbeb;color:#92400e;border-radius:12px;padding:10px;margin-bottom:10px}.awaiting-title{font-weight:850;font-size:12px}.awaiting-text{font-size:11px;line-height:1.5;margin-top:4px}.awaiting-meta{margin-top:7px;font-family:var(--mono);font-size:10px;color:#92400e;background:rgba(255,255,255,.62);border:1px solid #fde68a;border-radius:8px;padding:6px 8px}.awaiting-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:9px}.btn.danger{color:#be123c;border-color:#fecdd3;background:#fff1f2}.msg-row{display:flex;align-items:flex-start;gap:9px;width:100%}.msg-row.codex{justify-content:flex-end}.msg-row.antigravity{justify-content:flex-start}.msg-row.user{justify-content:center}.msg-row.codex .avatar{order:2}.avatar{width:34px;height:34px;border-radius:12px;display:grid;place-items:center;flex:0 0 auto;color:#fff;font-size:10px;font-weight:800;box-shadow:0 8px 18px rgba(17,24,39,.1);overflow:hidden;background:#fff;border:1px solid rgba(255,255,255,.8)}.avatar img{width:100%;height:100%;object-fit:cover;display:block}.avatar.codex{background:linear-gradient(135deg,#6b7cff,#8aa4ff)}.avatar.antigravity{background:linear-gradient(135deg,#111827,#374151)}.avatar.user{background:#9ca3af}.msg{max-width:min(82%,900px);border:1px solid var(--line);border-radius:14px;background:#fff;overflow:hidden;box-shadow:0 10px 24px rgba(17,24,39,.045)}.msg-row.codex .msg{background:var(--codex);border-color:var(--codex-line);border-bottom-right-radius:5px}.msg-row.antigravity .msg{background:var(--ag);border-color:var(--ag-line);border-bottom-left-radius:5px}.msg-row.user .msg{max-width:min(92%,980px);background:#fffaf0;border-color:#fde68a}.msg-head{display:flex;justify-content:space-between;gap:10px;padding:8px 10px;background:rgba(255,255,255,.45);border-bottom:1px solid rgba(229,231,235,.72)}.msg-route{font-size:11px;font-weight:800}.msg-route .from{color:var(--blue)}.msg-route .to{color:#0f766e}.msg-time{margin-top:2px;font-family:var(--mono);font-size:10px;color:var(--muted);display:flex;gap:7px;flex-wrap:wrap}.msg-duration{color:#475569;background:rgba(255,255,255,.62);border:1px solid rgba(148,163,184,.22);border-radius:999px;padding:0 5px}.msg-tags{display:flex;gap:5px;align-items:center;flex-wrap:wrap;justify-content:flex-end}.tag{font-size:10px;background:rgba(255,255,255,.72);color:#3730a3;border:1px solid rgba(79,70,229,.08);border-radius:999px;padding:2px 6px}.tag.round{color:#1d4ed8;background:#eff6ff}.tag.type{color:#6d28d9;background:#f5f3ff}.tag.flow{color:#047857;background:#ecfdf5;border-color:#bbf7d0}.tag.flow.pending{color:#92400e;background:#fffbeb;border-color:#fde68a}.tag.flow.open{color:#475569;background:#f8fafc;border-color:#e2e8f0}.tag.done{color:#be123c;background:#fff1f2;border-color:#fecdd3}.msg-body{white-space:pre-wrap;word-break:break-word;line-height:1.62;font-size:12px;padding:10px 11px}.file-list{margin:0 10px 10px;border:1px solid rgba(148,163,184,.26);background:rgba(255,255,255,.56);border-radius:10px;overflow:hidden}.file-list summary{cursor:pointer;list-style:none;padding:7px 9px;font-size:11px;font-weight:850;color:#334155}.file-list summary::-webkit-details-marker{display:none}.file-item{font-family:var(--mono);font-size:10px;color:#475569;padding:5px 9px;border-top:1px dashed rgba(148,163,184,.24);word-break:break-all}.msg-actions{display:flex;justify-content:flex-end;padding:0 10px 10px}.retry-help{font-size:10px;color:var(--muted);align-self:center;margin-right:6px}.inspector{border-left:1px solid var(--line);padding:10px;overflow:auto;background:#fff}.kv{display:grid;grid-template-columns:64px 1fr;gap:6px;font-size:10px;padding:5px 0;border-bottom:1px dashed var(--line)}.kv div:first-child{color:var(--muted)}.mono{font-family:var(--mono);font-size:10px;word-break:break-all}.docs{margin-top:0;display:flex;flex-direction:column;gap:8px}.docs-head{display:flex;justify-content:space-between;align-items:flex-end;gap:8px;margin-bottom:2px}.docs-note{font-size:10px;color:var(--muted);line-height:1.35}.state-mini{margin-top:10px;border:1px solid var(--line);border-radius:12px;background:#f8fafc;overflow:hidden}.state-mini summary{list-style:none;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 9px}.state-mini summary::-webkit-details-marker{display:none}.state-mini-title{font-size:11px;font-weight:850;color:var(--muted)}.state-mini-value{font-size:11px;font-weight:850;white-space:nowrap;color:#111827}.state-mini-grid{padding:0 9px 8px}.doc-card{border:1px solid var(--line);border-radius:12px;background:#fafafa;overflow:hidden;cursor:pointer;transition:.14s}.doc-card.done{background:#f0fdf4;border-color:#bbf7d0}.doc-card.blocked{background:#fff1f2;border-color:#fecdd3}.doc-card:hover{background:#fff;border-color:rgba(79,107,237,.42);box-shadow:0 8px 22px rgba(17,24,39,.06);transform:translateY(-1px)}.doc-card:focus{outline:3px solid rgba(79,107,237,.15);border-color:rgba(79,107,237,.52)}.doc-title{display:flex;justify-content:space-between;gap:8px;padding:8px 9px;border-bottom:1px solid var(--line)}.doc-heading{min-width:0}.doc-name{font-size:12px;font-weight:850}.doc-sub{margin-top:2px;font-size:10px;color:var(--muted);line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.doc-count{flex:0 0 auto;font-size:11px;font-weight:850;color:#111827}.doc-meta-row{display:flex;gap:5px;flex-wrap:wrap;padding:7px 9px 0}.doc-badge{font-size:10px;background:#fff;border:1px solid var(--line);border-radius:999px;padding:2px 6px;color:#4b5563}.doc-badge.blue{background:#eef2ff;border-color:#dbe4ff;color:#3730a3}.doc-badge.green{background:#ecfdf5;border-color:#bbf7d0;color:#047857}.doc-badge.red{background:#fff1f2;border-color:#fecdd3;color:#be123c}.doc-body{max-height:72px;overflow:hidden;white-space:pre-wrap;word-break:break-word;padding:7px 9px 9px;font-size:11px;line-height:1.45;color:#374151}.doc-open{font-size:10px;color:var(--blue);font-weight:850;margin-left:6px}.doc-modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.42);backdrop-filter:blur(8px);display:none;align-items:center;justify-content:center;padding:30px;z-index:20}.doc-modal-backdrop.show{display:flex}.doc-modal{width:min(960px,92vw);height:min(780px,86vh);background:#fff;border:1px solid var(--line);border-radius:16px;box-shadow:0 24px 80px rgba(15,23,42,.22);display:grid;grid-template-rows:auto 1fr;overflow:hidden}.doc-modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:14px 16px;border-bottom:1px solid var(--line);background:#f8fafc}.doc-modal-title{font-size:18px;font-weight:850;line-height:1.25}.doc-modal-meta{margin-top:4px;color:var(--muted);font-size:12px}.doc-modal-close{border:1px solid var(--line);background:#fff;border-radius:9px;padding:6px 10px;cursor:pointer;font-weight:800}.doc-modal-content{min-height:0;display:grid;grid-template-rows:auto 1fr}.doc-modal-path{font-family:var(--mono);font-size:11px;color:var(--muted);word-break:break-all;padding:10px 16px;border-bottom:1px dashed var(--line);background:#fff}.doc-modal-body{margin:0;overflow:auto;padding:16px;font-family:var(--mono);font-size:13px;line-height:1.65;white-space:pre-wrap;word-break:break-word;color:#1f2937;background:#fff}.confirm-modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.34);backdrop-filter:blur(8px);display:none;align-items:center;justify-content:center;padding:20px;z-index:25}.confirm-modal-backdrop.show{display:flex}.confirm-modal{width:min(380px,92vw);background:#fff;border:1px solid var(--line);border-radius:15px;box-shadow:0 24px 80px rgba(15,23,42,.22);padding:16px}.confirm-title{font-size:16px;font-weight:850}.confirm-text{margin-top:7px;color:#4b5563;font-size:12px;line-height:1.55}.confirm-session{margin-top:10px;padding:8px;border-radius:10px;background:#f8fafc;border:1px solid var(--line);font-family:var(--mono);font-size:11px;word-break:break-all}.confirm-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}@media(max-width:920px){.shell{grid-template-columns:1fr}.toolbar{grid-template-columns:1fr}.status{grid-template-columns:repeat(2,minmax(0,1fr))}.controlbar{grid-template-columns:repeat(2,1fr)}.content{grid-template-columns:1fr}.inspector{border-left:0;border-top:1px solid var(--line)}.msg{max-width:88%}.doc-modal-backdrop{padding:12px}.doc-modal{width:100%;height:90vh}}
+.toolbar{padding:8px 12px 9px;gap:12px;align-items:start}.title{padding:8px 10px}.title-top{margin-bottom:4px}.title h1{font-size:16px;line-height:1.26;margin-bottom:3px;max-height:40px}.title p{font-size:11px}.run-panel{gap:6px}.status-card{position:relative;min-height:42px;padding:6px 25px 6px 8px}.status-card strong{font-size:11px}.status-card span{margin-top:4px}.status-help{position:absolute;right:6px;top:6px;width:15px;height:15px;border:1px solid rgba(107,114,128,.22);border-radius:50%;background:rgba(255,255,255,.78);color:#6b7280;font-size:10px;font-weight:900;line-height:13px;padding:0;cursor:pointer}.status-help:hover{border-color:rgba(79,107,237,.45);color:var(--blue);background:#fff}.controlbar{gap:6px}.control-btn{height:31px;border-radius:9px}.state-mini{margin:0 0 10px}
+</style></head>
+<body>
+<div class="top"><div class="brand"><div class="mark">AI</div><div>QingAgent 多 Agent 群聊</div></div><div class="row"><a href="/">控制台</a><a href="/benchmark">测试台</a></div></div>
+<div class="shell"><aside class="side"><div class="side-top"><div class="side-heading"><div><div class="side-title">会话</div><div class="side-sub" id="sideHint">选择会话，或新建一个讨论。</div></div><div class="side-actions"><button class="icon-btn" title="刷新会话列表" onclick="loadSessions()">刷新</button><button class="icon-btn primary" onclick="newSession()">新建</button></div></div></div><div id="configPanel" class="section config-panel hidden"><div class="config-head"><div><div class="config-title" id="configTitle">会话配置</div><div class="config-note" id="configNote">保存后会出现在下面的会话列表里。</div></div><button class="config-close" onclick="toggleConfig(false)">收起</button></div><div class="field"><span>角色模板</span><button type="button" class="template-toggle" id="templateToggle" onclick="toggleTemplatePicker()"><span class="template-summary"><strong id="templateSummaryTitle">选择角色模板</strong><span id="templateSummarySub">新建时先选一个模板，也可以直接手写角色。</span></span><span class="template-arrow">v</span></button><div class="template-picker" id="templatePicker"><div class="template-grid" id="templateGrid"><div class="template-empty">正在读取角色模板...</div></div><div class="template-desc" id="templateDesc">选择模板会填入模式、讨论目标和两个角色；下面仍可继续微调。</div></div></div><div class="field"><span>会话 ID</span><input id="sessionId" placeholder="qingagent-group-chat-demo"></div><div class="field"><span>讨论目标</span><textarea id="topic" placeholder="让 Codex 和 Antigravity 讨论一个可落地方案"></textarea></div><div class="field"><span>协作模式</span><select id="chatMode"><option value="development">开发模式：共享文档协作</option><option value="chat">闲聊模式：仅消息转发</option><option value="debate">辩论模式：正反观点裁决</option></select></div><div class="row"><div class="field" style="flex:1"><span>起始 Agent</span><select id="startTarget"><option value="codex">Codex</option><option value="antigravity">Antigravity</option></select></div><div class="field" style="width:110px"><span>最大轮次</span><input id="maxRounds" type="number" min="2" max="30" value="8"></div></div><div class="role-hint" id="roleHint">当前使用默认工程协作角色。你可以直接改下面两段文字。</div><div class="field"><span id="codexRoleLabel">Codex 角色</span><textarea id="codexRole"></textarea></div><div class="role-swap"><button type="button" id="swapRoleBtn" class="swap-role-btn" onclick="swapAgentRoles()">⇄ 互换 Codex / Antigravity 角色</button></div><div class="field"><span id="agRoleLabel">Antigravity 角色</span><textarea id="agRole"></textarea></div><div class="row"><button id="saveSessionBtn" class="btn primary" onclick="createSession()">创建会话</button><button class="btn" onclick="toggleConfig(false)">取消</button></div></div><div class="sessions-head"><span>最近会话</span><button id="sessionEditBtn" onclick="toggleSessionEdit()">编辑列表</button></div><div class="sessions" id="sessionList"></div></aside>
+<main class="main"><div class="toolbar"><div class="title"><div class="title-top"><span class="title-label">讨论目标</span><button class="title-action" onclick="openTopicModal()">查看完整</button></div><h1 id="currentTitle">未选择会话</h1><p id="currentSub">创建或选择一个会话后开始协作。</p></div><div class="run-panel"><div class="status" id="statusPills"></div><div class="controlbar"><button id="startChatBtn" class="btn control-btn subtle" data-label="发起首轮" title="把当前目标发给起始 Agent；已有消息的会话不会重复发起。" onclick="startChat(this)">发起首轮</button><button class="btn control-btn subtle" data-label="转发下一条" title="自动转发队列里最早的一条待处理消息，不会弹出选择。" onclick="relayOnce(this)">转发下一条</button><button id="startWatchBtn" class="btn control-btn primary" data-label="开始监听" title="启动后台轮询，自动转发后续消息。" onclick="startWatch(this)">开始监听</button><button id="stopWatchBtn" class="btn control-btn danger" data-label="停止" title="只停止自动监听，不结束当前会话。" onclick="stopWatch(this)">停止</button></div></div></div><div class="content"><div class="timeline" id="timeline"><div class="empty">暂无消息</div></div><aside class="inspector" id="inspector"></aside></div></main></div>
+<div class="doc-modal-backdrop" id="docModal" onclick="closeDocModal()"><div class="doc-modal" onclick="event.stopPropagation()"><div class="doc-modal-head"><div><div class="doc-modal-title" id="docModalTitle"></div><div class="doc-modal-meta" id="docModalMeta"></div></div><button class="doc-modal-close" onclick="closeDocModal()">关闭</button></div><div class="doc-modal-content"><div class="doc-modal-path" id="docModalPath"></div><pre class="doc-modal-body" id="docModalBody"></pre></div></div></div>
+<div class="confirm-modal-backdrop" id="deleteSessionModal" onclick="closeDeleteSessionConfirm()"><div class="confirm-modal" onclick="event.stopPropagation()"><div class="confirm-title">删除会话？</div><div class="confirm-text">这会删除本地会话目录，包括消息、状态和工作文档。删除后不可从页面恢复。</div><div class="confirm-session" id="deleteSessionName"></div><div class="confirm-actions"><button class="btn" onclick="closeDeleteSessionConfirm()">取消</button><button class="btn red" onclick="confirmDeleteSession()">确认删除</button></div></div></div>
+<div class="toast" id="toast"></div>
+<script>
+let sessions=[];let selected='';let pollTimer=null;let configDirty=false;let configBound=false;let currentDocs=[];let currentTopicText='';let configOpen=false;let draftMode=false;let currentMessageCount=0;let roleTemplates=[];let selectedTemplateId='';let templateOpen=false;let codexRoleName='Codex';let agRoleName='Antigravity';let rolesSwapped=false;let sessionEditMode=false;let pendingDeleteSession='';let submittingDecision=false;
+function makeSessionId(){const d=new Date();const pad=n=>String(n).padStart(2,'0');const stamp=`${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;return 'multi-agent-'+stamp+'-'+Math.random().toString(36).slice(2,5)}
+const defaults={session:makeSessionId(),topic:'让 Codex 和 Antigravity 讨论一个可落地方案',mode:'development',codex:'你是 Codex，角色是顶级工程师和实现负责人。你要给出可落地的接口、App 交互、测试与风险处理方案。',ag:'你是 Antigravity，角色是架构评审者和质量守门员。你要从边界、风险、测试、扩展性角度挑问题并补方案。'};
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+let toastTimer=null;let lastWatcherRunning=false;
+function showToast(text,type='ok'){const el=document.getElementById('toast');if(!el)return;clearTimeout(toastTimer);el.textContent=text;el.className=`toast show ${type}`;toastTimer=setTimeout(()=>{el.className='toast'},1800)}
+async function withAction(btn,pending,success,task){const original=btn?.dataset?.label||btn?.textContent||'操作';if(btn){btn.disabled=true;btn.classList.add('loading');btn.title=pending;btn.textContent=pending}try{await task();if(success)showToast(success,'ok')}catch(err){showToast(err.message||'操作失败','err')}finally{if(btn){btn.classList.remove('loading');btn.disabled=false;btn.title='';btn.textContent=original}setWatchButtons(lastWatcherRunning)}}
+function statusHelp(key){const data={mode:['协作模式','开发模式：使用目标简报、当前方案、实现记录、评审、最终结论等共享文档，适合需求规划、实现和评审闭环。\\n\\n闲聊模式：只转发两边消息，不维护工作文档，适合脑暴、导师带练或轻量讨论。\\n\\n辩论模式：用于正反观点交锋，最终输出裁决或立场整理。'],progress:['任务状态','未结束：会话还在推进。\\n需介入：AI 发现必须你拍板的问题，自动转发会暂停。\\n已结束：出现 done/final 消息，最终结论已生成或会话被标记完成。\\n\\n阶段包括：计划、实现、评审、修复、阻塞、完成。'],watch:['监听状态','监听中：后台每隔几秒检查是否有待转发消息，并自动推进。\\n监听停止：不会自动转发，你可以手动点“转发下一条”。\\n\\n常见事件：暂无待转发消息、已转发消息、等待用户介入、会话已结束、监听异常。'],queue:['消息队列','格式是“待转发 / 已转发”。\\n待转发通常是 0 或 1，因为正常情况下 Codex 和 Antigravity 一来一回推进；只有重复写入、重试入队或多条消息未处理时才会大于 1。\\n已转发是历史处理过的消息数量。']};const item=data[key]||['状态说明','暂无说明'];return {title:item[0],body:item[1]}}
+function openStatusHelp(key){const h=statusHelp(key);openTextModal(h.title,'顶部状态说明','',h.body)}
+function statusCard(label,value,cls='',helpKey=''){const help=helpKey?`<button class="status-help" title="查看说明" aria-label="查看${esc(label)}说明" onclick="event.stopPropagation();openStatusHelp('${helpKey}')">?</button>`:'';return `<div class="status-card ${cls}"><strong>${esc(value)}</strong><span>${esc(label)}</span>${help}</div>`}
+function renderStatusCards(meta={},state={},watcher={},pending=0){lastWatcherRunning=!!watcher.running;const mode=modeLabel(meta.mode||'development');const phase=phaseLabel(state.phase||'planning');const awaiting=!!(state.awaiting_outbox&&!state.blocked&&!state.done);const progress=state.blocked?'需介入':(awaiting?'等写入':(state.done?'已结束':'未结束'));const progressCls=state.blocked?'red':(awaiting?'amber':(state.done?'green':'amber'));const watch=watcher.running?'监听中':'监听停止';const watchCls=watcher.running?'green':'';const queue=`${pending||0} / ${(state.forwarded_ids||[]).length}`;statusPills.innerHTML=statusCard('协作模式',mode,'','mode')+statusCard(`当前阶段：${phase}`,progress,progressCls,'progress')+statusCard(watcher.last_event||'手动控制',watch,watchCls,'watch')+statusCard('待转发 / 已转发',queue,'','queue');setWatchButtons(lastWatcherRunning)}
+function setWatchButtons(running){const start=document.getElementById('startWatchBtn'),stop=document.getElementById('stopWatchBtn'),first=document.getElementById('startChatBtn');if(start&&!start.classList.contains('loading'))start.disabled=!selected||running;if(stop&&!stop.classList.contains('loading'))stop.disabled=!selected||!running;if(first&&!first.classList.contains('loading')){const started=!!selected&&currentMessageCount>0&&!draftMode;first.disabled=started||(!selected&&!draftMode);first.textContent=started?'已发起':'发起首轮';first.dataset.label=first.textContent;first.title=started?'当前会话已有消息，避免重复发送首轮；新建会话后可再次发起。':'把当前目标发给起始 Agent；已有消息的会话不会重复发起。'}}
+async function api(url,body){const opt=body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)};const res=await fetch(url,opt);const data=await res.json();if(!data.success)throw new Error(data.error||data.message||'请求失败');return data}
+function configIds(){return ['sessionId','topic','chatMode','startTarget','maxRounds','codexRole','agRole']}
+function rolePrompt(role){return String(role?.system_prompt||'').trim()||`你是${role?.display_name||'该角色'}。请基于当前目标推进协作。`}
+function templateStartTarget(tpl){return tpl?.start_target==='role_b'?'antigravity':'codex'}
+function templateTopic(tpl){const outputs=Array.isArray(tpl?.outputs)?tpl.outputs.slice(0,5).join('、'):'';return `${tpl?.name||'多 Agent 协作'}\\n\\n请围绕这里填写你的具体目标。${outputs?`\\n期望产出：${outputs}。`:''}`}
+function selectedTemplate(){return roleTemplates.find(t=>t.id===selectedTemplateId)||null}
+function setRoleLabels(a='Codex',b='Antigravity',hintHtml=''){codexRoleName=a||'Codex';agRoleName=b||'Antigravity';const aLabel=document.getElementById('codexRoleLabel'),bLabel=document.getElementById('agRoleLabel'),hint=document.getElementById('roleHint');if(aLabel)aLabel.textContent=`Codex 角色：${codexRoleName}`;if(bLabel)bLabel.textContent=`Antigravity 角色：${agRoleName}`;if(hint)hint.innerHTML=hintHtml||'当前使用默认工程协作角色。你可以直接改下面两段文字。'}
+function updateRoleLabels(tpl=null){const a=rolesSwapped?(tpl?.role_b?.display_name||'Antigravity'):(tpl?.role_a?.display_name||'Codex');const b=rolesSwapped?(tpl?.role_a?.display_name||'Codex'):(tpl?.role_b?.display_name||'Antigravity');const swapped=rolesSwapped?'（已互换）':'';setRoleLabels(a,b,tpl?`已套用 <b>${esc(tpl.code||'模板')} ${esc(tpl.name||'角色模板')}${swapped}</b>，下面两段角色内容可以继续微调。`:'当前使用默认工程协作角色。你可以直接改下面两段文字。')}
+function renderTemplateChrome(){const tpl=selectedTemplate();const toggle=document.getElementById('templateToggle'),picker=document.getElementById('templatePicker'),title=document.getElementById('templateSummaryTitle'),sub=document.getElementById('templateSummarySub');if(toggle)toggle.classList.toggle('open',templateOpen);if(picker)picker.classList.toggle('open',templateOpen);if(title)title.textContent=tpl?`${tpl.code||''} ${tpl.name||'角色模板'}${rolesSwapped?'（已互换）':''}`.trim():'选择角色模板';if(sub){if(tpl)sub.textContent=`${modeLabel(tpl.mode||'development')} · ${codexRoleName} / ${agRoleName} · 点击可重新选择`;else sub.textContent='新建时先选一个模板，也可以直接手写角色。'}}
+function toggleTemplatePicker(force){templateOpen=typeof force==='boolean'?force:!templateOpen;renderTemplateChrome()}
+function templateUsageHint(tpl){return tpl?.usage_hint||((tpl?.best_for||[]).length?`适合：${(tpl.best_for||[]).slice(0,3).join('、')}`:(tpl?.done_when||'点击套用角色模板'))}
+function templateUsageExample(tpl){return tpl?.usage_example||`产出：${(tpl?.outputs||[]).slice(0,3).join('、')||'可执行结论'}`}
+function renderTemplates(){const grid=document.getElementById('templateGrid'),desc=document.getElementById('templateDesc');if(!grid){renderTemplateChrome();return}if(!roleTemplates.length){grid.innerHTML='<div class="template-empty">暂无可用模板，请检查 role_templates.json。</div>';if(desc)desc.textContent='模板不可用时仍可手动填写两个角色。';renderTemplateChrome();return}grid.innerHTML=roleTemplates.map((tpl,i)=>{const active=tpl.id===selectedTemplateId?'active':'';const best=(tpl.best_for||[]).slice(0,2).join(' / ');return `<button type="button" class="template-card ${active}" onclick="applyRoleTemplate(${i})"><div class="template-name">${esc(tpl.code||'T')} · ${esc(tpl.name||'未命名模板')}</div><div class="template-meta"><span class="template-chip">${esc(modeLabel(tpl.mode||'development'))}</span><span class="template-chip">${esc(tpl.role_a?.display_name||'角色 A')}</span><span class="template-chip">${esc(tpl.role_b?.display_name||'角色 B')}</span></div><div class="template-desc">${esc(best||tpl.done_when||'点击套用角色模板')}</div><div class="template-usage"><strong>什么时候用</strong><div>${esc(templateUsageHint(tpl))}</div><div class="template-example">例子：${esc(templateUsageExample(tpl))}</div></div></button>`}).join('');if(desc){const tpl=selectedTemplate();desc.textContent=tpl?`${templateUsageHint(tpl)} 例子：${templateUsageExample(tpl)}`:'第一批推荐模板已加载。选择模板后仍可微调讨论目标和角色内容。'}renderTemplateChrome()}
+function applyRoleTemplate(index){if(!draftMode&&selected&&currentMessageCount>0){showToast('当前会话已开始，不能切换模板；请新建会话。','err');return}const tpl=roleTemplates[index];if(!tpl)return;selectedTemplateId=tpl.id||'';rolesSwapped=false;chatMode.value=tpl.mode||'development';startTarget.value=templateStartTarget(tpl);maxRounds.value=tpl.max_rounds||8;codexRole.value=rolePrompt(tpl.role_a)||defaults.codex;agRole.value=rolePrompt(tpl.role_b)||defaults.ag;if(draftMode||!selected){topic.value=templateTopic(tpl);currentTopicText=topic.value;currentTitle.title=currentTopicText}updateRoleLabels(tpl);templateOpen=false;configDirty=true;renderTemplates();if(draftMode){currentTitle.textContent='新建会话';currentSub.textContent=sessionId.value||'未保存';renderSessions()}showToast(`已套用 ${tpl.code||''} ${tpl.name||'模板'}`.trim(),'ok')}
+function swapAgentRoles(){if(codexRole.disabled||agRole.disabled){showToast('当前会话已开始，不能互换角色；请新建会话。','err');return}const codexText=codexRole.value;codexRole.value=agRole.value;agRole.value=codexText;const oldCodex=codexRoleName;const oldAg=agRoleName;rolesSwapped=!!selectedTemplateId?!rolesSwapped:false;setRoleLabels(oldAg,oldCodex,selectedTemplateId?`已套用 <b>${esc(selectedTemplate()?.code||'模板')} ${esc(selectedTemplate()?.name||'角色模板')}${rolesSwapped?'（已互换）':''}</b>，角色已互换；起始 Agent 也已同步切换。`:'已手动互换两边角色内容；起始 Agent 也已同步切换。');startTarget.value=startTarget.value==='codex'?'antigravity':'codex';configDirty=true;renderTemplates();showToast('已互换角色和起始 Agent','ok')}
+async function loadRoleTemplates(){try{const data=await api('/api/group_chat/role_templates');roleTemplates=data.recommended||data.templates||[];renderTemplates()}catch(err){const grid=document.getElementById('templateGrid');if(grid)grid.innerHTML=`<div class="template-empty">${esc(err.message||'角色模板读取失败')}</div>`}}
+function resetTemplateSelection(){selectedTemplateId='';rolesSwapped=false;templateOpen=false;updateRoleLabels(null);renderTemplates()}
+function initDefaults(){sessionId.value=makeSessionId();topic.value=defaults.topic;chatMode.value=defaults.mode;startTarget.value='codex';maxRounds.value=8;codexRole.value=defaults.codex;agRole.value=defaults.ag;resetTemplateSelection();setConfigLocked(false);bindConfigDirty();updateConfigChrome()}
+function bindConfigDirty(){if(configBound)return;configBound=true;configIds().forEach(id=>{const el=document.getElementById(id);if(!el)return;el.addEventListener('input',()=>{configDirty=true;if(draftMode){renderSessions();currentTopicText=topic.value;currentTitle.textContent='新建会话';currentTitle.title=currentTopicText;currentSub.textContent=sessionId.value||'未保存'}});el.addEventListener('change',()=>{configDirty=true;if(draftMode)renderSessions()})})}
+function fillConfig(meta){const agents=meta.agents||{};sessionId.value=meta.session||selected;topic.value=meta.topic||'';chatMode.value=meta.mode||'development';startTarget.value=meta.start_target||'codex';maxRounds.value=meta.max_rounds||8;codexRole.value=agents.codex||defaults.codex;agRole.value=agents.antigravity||defaults.ag;selectedTemplateId='';rolesSwapped=false;templateOpen=false;updateRoleLabels(null);renderTemplates();configDirty=false}
+function updateConfigChrome(){const panel=document.getElementById('configPanel');if(panel)panel.classList.toggle('hidden',!configOpen);const title=document.getElementById('configTitle');const note=document.getElementById('configNote');const btn=document.getElementById('saveSessionBtn');const hint=document.getElementById('sideHint');if(title)title.textContent=draftMode?'新建讨论':'会话配置';if(note)note.textContent=draftMode?'填写后创建新会话；也可以直接点右侧发起首轮。':'这里只修改当前会话的配置，不会另存为新会话。';if(btn)btn.textContent=draftMode?'创建会话':'保存配置';if(hint)hint.textContent=configOpen?(draftMode?'正在创建新讨论':'正在编辑当前会话'):'选择会话，或新建一个讨论。'}
+function toggleConfig(open){configOpen=!!open;updateConfigChrome()}
+function setConfigLocked(locked){configIds().forEach(id=>{const el=document.getElementById(id);if(el)el.disabled=!!locked});const btn=document.getElementById('saveSessionBtn'),swap=document.getElementById('swapRoleBtn');if(btn)btn.disabled=!!locked;if(swap)swap.disabled=!!locked;updateConfigChrome()}
+async function loadSessions(){const data=await api('/api/group_chat/sessions');sessions=data.sessions||[];if(data.default?.agents){defaults.mode=data.default.mode||defaults.mode;defaults.codex=data.default.agents.codex||defaults.codex;defaults.ag=data.default.agents.antigravity||defaults.ag}renderSessions()}
+function modeLabel(mode){return {development:'开发模式',chat:'闲聊模式',debate:'辩论模式'}[mode]||'开发模式'}
+function phaseLabel(phase){return {planning:'计划',implementation:'实现',review:'评审',fix:'修复',blocked:'阻塞',final:'完成'}[phase]||phase||'计划'}
+function topicHeadline(text,fallback='未命名会话'){const line=String(text||'').split(/\\r?\\n/).map(v=>v.trim()).find(Boolean);return line||fallback}
+	function updateSessionEditChrome(){const btn=document.getElementById('sessionEditBtn');if(!btn)return;btn.textContent=sessionEditMode?'完成':'编辑列表';btn.classList.toggle('active',sessionEditMode)}
+	function toggleSessionEdit(force){sessionEditMode=typeof force==='boolean'?force:!sessionEditMode;updateSessionEditChrome();renderSessions()}
+	function sessionById(id){return sessions.find(s=>s.session===id)||null}
+	function sessionActionHtml(s){const parts=[];if(s.session===selected){parts.push('<button class="mini-link" onclick="event.stopPropagation();toggleConfig(true)">配置</button>')}if(sessionEditMode){parts.push(`<button class="mini-link danger" onclick="event.stopPropagation();openDeleteSessionConfirm('${esc(s.session)}')">删除</button>`)}return parts.length?`<div class="session-tools">${parts.join('')}</div>`:''}
+	function renderSessions(){updateSessionEditChrome();const el=document.getElementById('sessionList');const draftTitle=topicHeadline(topic.value,'新建讨论');const draft=(!selected&&draftMode)?`<div class="session-item draft active" title="${esc(topic.value||draftTitle)}" onclick="toggleConfig(true)"><div class="session-title">${esc(draftTitle)}</div><div class="session-meta"><span>新建草稿</span><span>未保存</span></div><div class="session-tools"><button class="mini-link" onclick="event.stopPropagation();toggleConfig(true)">继续填写</button></div></div>`:'';if(!sessions.length&&!draft){el.innerHTML='<div class="empty" style="height:140px">还没有会话</div>';return}el.innerHTML=draft+sessions.map(s=>{const title=topicHeadline(s.topic,s.session);return `<div class="session-item ${s.session===selected?'active':''} ${sessionEditMode?'editing':''}" title="${esc(s.topic||title)}" onclick="selectSession('${esc(s.session)}')"><div class="session-title">${esc(title)}</div><div class="session-meta"><span>${esc(friendlySessionTime(s.created_at||s.updated_at))}</span><span>${modeLabel(s.mode)}</span><span>${phaseLabel(s.phase)}</span><span>${s.message_count||0} 条</span><span>${s.done?'已结束':'进行中'}</span></div>${sessionActionHtml(s)}</div>`}).join('')}
+	function openDeleteSessionConfirm(id){const item=sessionById(id);pendingDeleteSession=id;const title=topicHeadline(item?.topic,id);document.getElementById('deleteSessionName').textContent=title+'\\n'+id;document.getElementById('deleteSessionModal').classList.add('show')}
+	function closeDeleteSessionConfirm(){pendingDeleteSession='';document.getElementById('deleteSessionModal').classList.remove('show')}
+	async function confirmDeleteSession(){if(!pendingDeleteSession)return;const id=pendingDeleteSession;try{await api('/api/group_chat/delete',{session:id});closeDeleteSessionConfirm();if(id===selected){selected='';draftMode=false;configDirty=false;currentMessageCount=0;if(pollTimer){clearInterval(pollTimer);pollTimer=null}toggleConfig(false);currentTitle.textContent='未选择会话';currentSub.textContent='选择左侧会话，或点击新建开始。';timeline.innerHTML='<div class="empty">请选择一个会话</div>';inspector.innerHTML='';renderStatusCards({mode:chatMode.value},{phase:'planning',done:false,blocked:false,forwarded_ids:[]},{running:false,last_event:'尚未启动'},0)}await loadSessions();showToast('会话已删除','ok')}catch(err){showToast(err.message||'删除失败','err')}}
+function startSnapshotPolling(){if(pollTimer)clearInterval(pollTimer);pollTimer=setInterval(()=>loadSnapshot(),3000)}
+function newSession(){selected='';draftMode=true;configDirty=false;currentMessageCount=0;if(pollTimer){clearInterval(pollTimer);pollTimer=null}initDefaults();templateOpen=true;renderTemplates();toggleConfig(true);renderSessions();currentTopicText=topic.value||defaults.topic;currentTitle.textContent='新建会话';currentTitle.title=currentTopicText;currentSub.textContent='填写左侧配置，保存后即可发起首轮。';renderStatusCards({mode:chatMode.value},{phase:'planning',done:false,blocked:false,forwarded_ids:[]},{running:false,last_event:'尚未启动'},0);timeline.innerHTML='<div class="empty">新会话尚未保存</div>';inspector.innerHTML=''}
+async function selectSession(id){selected=id;draftMode=false;configDirty=false;toggleConfig(false);renderSessions();await loadSnapshot({syncForm:true});startSnapshotPolling()}
+async function createSession(){const body={session:sessionId.value,topic:topic.value,mode:chatMode.value,start_target:startTarget.value,max_rounds:Number(maxRounds.value||8),codex_role:codexRole.value,antigravity_role:agRole.value,role_template_id:selectedTemplateId};const data=await api('/api/group_chat/create',body);selected=data.session;draftMode=false;configDirty=false;toggleConfig(false);await loadSessions();await loadSnapshot({syncForm:true})}
+async function startChat(btn){await withAction(btn,'发起中','首轮已发起',async()=>{if(!selected){if(!draftMode){newSession();throw new Error('请先填写新会话配置，再发起首轮')}await createSession()}await api('/api/group_chat/start',{session:selected,target:startTarget.value});await loadSnapshot();startSnapshotPolling()})}
+async function relayOnce(btn){await withAction(btn,'转发中','已转发一次',async()=>{if(!selected)throw new Error('请先选择或保存会话');await api('/api/group_chat/relay_once',{session:selected});await loadSnapshot()})}
+async function startWatch(btn){await withAction(btn,'启动中','监听已启动',async()=>{if(!selected)throw new Error('请先选择或保存会话');await api('/api/group_chat/watch/start',{session:selected,interval:3,max_total:30});await loadSnapshot();startSnapshotPolling()})}
+async function stopWatch(btn){await withAction(btn,'停止中','监听已停止',async()=>{if(!selected)throw new Error('请先选择或保存会话');await api('/api/group_chat/watch/stop',{session:selected});await loadSnapshot()})}
+async function retryMessage(id){if(!selected)return;await api('/api/group_chat/retry',{session:selected,message_id:id});await loadSnapshot()}
+async function retryAwaiting(btn){if(!selected)return;const old=btn?.textContent;if(btn){btn.disabled=true;btn.textContent='重发中...'}try{const res=await api('/api/group_chat/retry_awaiting',{session:selected});showToast(res.forwarded?'已重新发送':'已尝试重新发送','ok');await loadSnapshot()}catch(err){showToast(err.message||'重发失败','err')}finally{if(btn){btn.disabled=false;btn.textContent=old||'重新发送任务'}}}
+async function markAwaitingAbnormal(btn){if(!selected)return;const old=btn?.textContent;if(btn){btn.disabled=true;btn.textContent='标记中...'}try{await api('/api/group_chat/awaiting_abnormal',{session:selected});showToast('已标记为异常，等待用户介入','ok');await loadSnapshot()}catch(err){showToast(err.message||'标记失败','err')}finally{if(btn){btn.disabled=false;btn.textContent=old||'标记为异常'}}}
+async function submitUserDecision(btn){if(!selected||submittingDecision)return;const el=document.getElementById('userDecisionText');const body=(el?.value||'').trim();if(!body){alert('请先写你的决策或补充约束');return}submittingDecision=true;const oldText=btn?.textContent;if(btn){btn.disabled=true;btn.textContent='续接中...'}try{await api('/api/group_chat/user_decision',{session:selected,body});if(el)el.value='';await api('/api/group_chat/watch/start',{session:selected,interval:3,max_total:30});await loadSnapshot();startSnapshotPolling();showToast('已提交并恢复监听','ok')}catch(err){showToast(err.message||'提交失败','err')}finally{submittingDecision=false;if(btn){btn.disabled=false;btn.textContent=oldText||'提交决策并续接'}}}
+async function loadSnapshot(options={}){if(!selected)return;const data=await api('/api/group_chat/session?session='+encodeURIComponent(selected));renderSnapshot(data,options)}
+function renderSnapshot(data,options={}){const meta=data.meta||{},state=data.state||{},watcher=data.watcher||{},messages=data.messages||[],workspace=data.workspace||{},wsStatus=workspace.status||{};currentMessageCount=messages.length;const userActionable=!!latestBlockedMessage(messages,state);const effectiveBlocked=!!(state.blocked||wsStatus.blocking||wsStatus.needs_user_decision||userActionable);const phase=effectiveBlocked?'blocked':(state.done?'final':(wsStatus.phase||state.phase||'planning'));const viewState={...state,phase,blocked:effectiveBlocked,blocking_count:state.blocking_count||wsStatus.blocking_count||0};currentTopicText=meta.topic||selected||'';currentTitle.textContent=currentTopicText||'未选择会话';currentTitle.title=currentTopicText;currentSub.textContent=selected;renderStatusCards(meta,viewState,watcher,data.pending_count||0);renderTimeline(messages,viewState);renderInspector(meta,viewState,watcher,data.paths||{},workspace,messages,data.pending_count||0);if(options.syncForm)fillConfig(meta);setConfigLocked(!!selected&&(watcher.running||(!state.done&&messages.length>0)));if(effectiveBlocked&&pollTimer){clearInterval(pollTimer);pollTimer=null}}
+function agentLabel(name){return {codex:'Codex',antigravity:'Antigravity',user:'用户'}[name]||name}
+function agentShort(name){return {codex:'CX',antigravity:'AG',user:'U'}[name]||String(name||'?').slice(0,2).toUpperCase()}
+function docLabel(name){return { 'brief.md':'目标简报', 'proposal.md':'当前方案', 'implementation.md':'实现记录', 'review.md':'当前评审', 'decision.md':'最终结论', 'changelog.md':'变更记录' }[name]||name}
+function docPurpose(name){return {'brief.md':'固定目标、边界和用户补充要求，后续所有判断都以它为锚点。','decision.md':'最终收敛结果，出现后优先阅读，用来判断本轮讨论是否已经结束。','proposal.md':'当前最新版方案，主要看它确认设计、接口、边界是否已成形。','implementation.md':'Codex 的实现说明，记录改动文件、验证结果和剩余风险。','review.md':'当前评审意见，重点看是否通过、阻塞、需要谁继续处理。','changelog.md':'过程流水账，只追加每轮关键变化，主要用于追溯。'}[name]||'工作文档'}
+function docPriority(name,content,hasDecision){const withDecision={'decision.md':0,'brief.md':1,'proposal.md':2,'implementation.md':3,'review.md':4,'changelog.md':5};const noDecision={'brief.md':0,'proposal.md':1,'implementation.md':2,'review.md':3,'decision.md':4,'changelog.md':5};return (hasDecision?withDecision:noDecision)[name]??9}
+function docMeaningful(name,content){const text=(content||'').trim();if(!text)return false;if(name==='decision.md')return !/最终收敛后写入结论|等待.*结论/i.test(text);if(name==='proposal.md')return !/等待起始 Agent 写入/i.test(text);if(name==='implementation.md')return !/等待.*实现|changed_files\s*$/i.test(text);if(name==='review.md')return !/等待评审 Agent 写入/i.test(text);return true}
+function parseDocHeader(content,key){const m=String(content||'').match(new RegExp('^'+key+':\\s*(.+)$','m'));return m?m[1].trim():''}
+function cleanDocSummary(name,content){let lines=String(content||'').split('\\n').map(s=>s.trim()).filter(Boolean);lines=lines.filter(s=>!s.startsWith('#')&&!/^[-*]\\s*Session:/i.test(s)&&!/^[-*]\\s*Mode:/i.test(s)&&!/^[-*]\\s*Max rounds:/i.test(s)&&!/^phase:|^status:|^blocking_count:|^sign_off:|^needs_user_decision:/i.test(s));let text=lines.join(' ').replace(/`?\/Users\/[^\\s`'，。；、)）]+`?/g,'本地文件').replace(/\\s+/g,' ').trim();if(!text)return docPurpose(name);return text.length>128?text.slice(0,128)+'...':text}
+function relevantDocMessages(name,messages){return (messages||[]).filter(m=>{const t=(m.type||'').toLowerCase(),b=(m.body||'').toLowerCase(),from=(m.from||'').toLowerCase();if(name==='brief.md')return from==='user'||t==='decision'||b.includes('brief.md');if(name==='proposal.md')return t==='proposal'||b.includes('proposal.md');if(name==='implementation.md')return t==='implementation'||t==='fix'||b.includes('implementation.md');if(name==='review.md')return t==='review'||t==='blocked'||b.includes('review.md')||from==='antigravity';if(name==='decision.md')return t==='final'||m.done||b.includes('decision.md');if(name==='changelog.md')return b.includes('changelog.md')||t==='proposal'||t==='implementation'||t==='review'||t==='fix'||t==='final';return false})}
+function latestDocMessage(name,messages){const rel=relevantDocMessages(name,messages).sort((a,b)=>messageSortKey(b).localeCompare(messageSortKey(a)));return rel[0]||null}
+function docStatus(name,content,state){if(!docMeaningful(name,content))return {text:'待生成',cls:''};if(name==='decision.md')return {text:state.done?'已定稿':'有结论草稿',cls:'green'};if(name==='brief.md')return {text:'固定约束',cls:'blue'};if(name==='proposal.md')return {text:'最新版',cls:'blue'};if(name==='implementation.md')return {text:'已记录',cls:'blue'};if(name==='changelog.md')return {text:'累计记录',cls:'blue'};if(name==='review.md'){const status=parseDocHeader(content,'status'),sign=parseDocHeader(content,'sign_off'),need=parseDocHeader(content,'needs_user_decision');if(status==='blocked'||need==='true')return {text:'需介入',cls:'red'};if(status==='approved'&&sign==='true')return {text:'已签收',cls:'green'};if(status==='approved')return {text:'已通过',cls:'green'};if(status==='needs_changes')return {text:'需修改',cls:'red'};return {text:'已评审',cls:'blue'}}return {text:'已生成',cls:'blue'}}
+function docOwner(name,messages){const latest=latestDocMessage(name,messages);if(latest)return agentLabel(latest.from);return {'brief.md':'用户/中控','proposal.md':'Codex','implementation.md':'Codex','review.md':'Antigravity','decision.md':'最终发言方','changelog.md':'系统累计'}[name]||'-'}
+function docRoundBadge(name,messages){const latest=latestDocMessage(name,messages);if(!latest)return '未进入轮次';const allRounds=new Set((messages||[]).map(m=>m.round).filter(v=>v!==undefined&&v!==null));return `R${latest.round||'-'} / 共${allRounds.size||0}轮`}
+function docModifiedText(f){return f.modified_at?`更新 ${formatTime(f.modified_at)}`:'尚无更新时间'}
+function orderedDocs(files,state){const hasDecision=(files||[]).some(f=>f.name==='decision.md'&&docMeaningful(f.name,f.content));return (files||[]).map((f,i)=>({...f,_index:i})).sort((a,b)=>docPriority(a.name,a.content,hasDecision)-docPriority(b.name,b.content,hasDecision))}
+function renderStateMini(meta,state,watcher,pending){const phase=phaseLabel(state.phase||'planning');const awaiting=!!(state.awaiting_outbox&&!state.blocked&&!state.done);const progress=state.blocked?'需介入':(awaiting?'等 outbox':(state.done?'已结束':'进行中'));const watch=watcher.running?'监听中':'监听停';const queue=`${pending||0}/${(state.forwarded_ids||[]).length}`;return `<details class="state-mini"><summary><span class="state-mini-title">运行摘要</span><span class="state-mini-value">${esc(progress)} · ${esc(watch)} · ${esc(queue)}</span></summary><div class="state-mini-grid"><div class="kv"><div>阶段</div><div>${esc(phase)}</div></div><div class="kv"><div>模式</div><div>${modeLabel(meta.mode||'development')}</div></div><div class="kv"><div>更新</div><div>${esc(state.updated_at||meta.updated_at||'-')}</div></div><div class="kv"><div>监听</div><div>${watcher.running?'运行中':'停止'} · ${esc(watcher.last_event||'-')}</div></div>${watcher.last_error?`<div class="kv"><div>错误</div><div>${esc(watcher.last_error)}</div></div>`:''}</div></details>`}
+function messageSide(m){if(m.done||m.to==='user'||m.from==='user')return 'user';if(m.from==='codex')return 'codex';if(m.from==='antigravity')return 'antigravity';return 'user'}
+function formatTime(value){if(!value)return '-';const d=new Date(value);if(Number.isNaN(d.getTime()))return value;const pad=n=>String(n).padStart(2,'0');return `${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`}
+function friendlySessionTime(value){if(!value)return '未知时间';const d=new Date(value);if(Number.isNaN(d.getTime()))return value;const now=new Date();const start=t=>new Date(t.getFullYear(),t.getMonth(),t.getDate()).getTime();const diff=Math.round((start(now)-start(d))/86400000);const pad=n=>String(n).padStart(2,'0');const hm=`${pad(d.getHours())}:${pad(d.getMinutes())}`;if(diff===0)return `今天 ${hm}`;if(diff===1)return `昨天 ${hm}`;if(diff===2)return `前天 ${hm}`;const sameYear=d.getFullYear()===now.getFullYear();return sameYear?`${pad(d.getMonth()+1)}-${pad(d.getDate())} ${hm}`:`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${hm}`}
+function formatDuration(ms){if(!Number.isFinite(ms)||ms<0)return '';const s=Math.round(ms/1000);if(s<60)return `${s} 秒`;const m=Math.floor(s/60),r=s%60;if(m<60)return r?`${m} 分 ${r} 秒`:`${m} 分`;const h=Math.floor(m/60),mr=m%60;return mr?`${h} 小时 ${mr} 分`:`${h} 小时`}
+function buildReplyDurationMap(messages){const map=new Map();const ordered=[...(messages||[])].filter(m=>m.created_at).sort((a,b)=>messageSortKey(a).localeCompare(messageSortKey(b)));const lastTo={};for(const m of ordered){const from=m.from||'';const prev=lastTo[from];if(prev&&m.id){const delta=new Date(m.created_at).getTime()-new Date(prev.created_at).getTime();if(Number.isFinite(delta)&&delta>=0)map.set(m.id,delta)}const to=m.to||'';if(to)lastTo[to]=m}return map}
+function messageTypeLabel(type,done){if(type==='final'&&done)return '最终结论';return {proposal:'方案',reply:'回复',review:'评审',implementation:'实现',fix:'修复',decision:'用户决策',blocked:'需介入',final:'最终结论'}[type]||type||'消息'}
+function flowInfo(m,forwarded){if(m.done&&m.type==='final')return {text:'已完成',cls:'flow'};if(forwarded)return {text:'已转发',cls:'flow'};if(m.to==='user')return {text:'等用户',cls:'flow pending'};return {text:'未转发',cls:'flow open'}}
+function isAiPeer(name){return name==='codex'||name==='antigravity'}
+function hasLaterAiToAiMessage(message,messages){const key=messageSortKey(message);return [...(messages||[])].some(m=>m.id!==message.id&&messageSortKey(m)>key&&isAiPeer(m.from)&&isAiPeer(m.to))}
+function canRetryMessage(message,state,forwarded,messages){return !state?.done&&forwarded&&!message.done&&isAiPeer(message.to)&&!hasLaterAiToAiMessage(message,messages)}
+function agentAvatar(name){const label=agentShort(name);if(name==='codex')return `<div class="avatar codex" title="Codex"><img src="/static/group_chat/codex-avatar.svg" alt="Codex" onerror="this.replaceWith(document.createTextNode('${label}'))"></div>`;if(name==='antigravity')return `<div class="avatar antigravity" title="Antigravity"><img src="/static/group_chat/antigravity-avatar.svg" alt="Antigravity" onerror="this.replaceWith(document.createTextNode('${label}'))"></div>`;return `<div class="avatar ${esc(name||'user')}">${esc(label)}</div>`}
+function extractMessageFiles(m){const text=String(m.body||'');const files=new Set();const re=/\/Users\/[^\\s`'"，。；、)）\\]]+\\.[A-Za-z0-9_.-]+/g;let match;while((match=re.exec(text))){files.add(match[0].replace(/[.,;，。；、]+$/,''))}return [...files].slice(0,12)}
+function shortFilePath(path){const parts=String(path||'').split('/');return parts.length>4?'.../'+parts.slice(-3).join('/'):path}
+function renderMessageFiles(files){if(!files.length)return '';return `<details class="file-list"><summary>修改文件 ${files.length} 个</summary>${files.map(f=>`<div class="file-item" title="${esc(f)}">${esc(shortFilePath(f))}</div>`).join('')}</details>`}
+function messageSortKey(m){return m.created_at||m.id||''}
+function latestBlockedMessage(messages,state={}){if(!messages?.length)return null;const forwarded=new Set(state.forwarded_ids||[]);if(state.block_message_id&&!forwarded.has(state.block_message_id)){const exact=messages.find(m=>m.id===state.block_message_id);if(exact)return exact}return [...messages].filter(m=>(m.type==='blocked'||(m.to==='user'&&!m.done))&&!forwarded.has(m.id)).sort((a,b)=>messageSortKey(b).localeCompare(messageSortKey(a)))[0]||null}
+function captureDecisionDraft(){const el=document.getElementById('userDecisionText');if(!el)return null;return {value:el.value,focused:document.activeElement===el,start:el.selectionStart,end:el.selectionEnd,top:timeline.scrollTop}}
+function restoreDecisionDraft(draft){if(!draft)return;const el=document.getElementById('userDecisionText');if(!el)return;el.value=draft.value||'';if(draft.focused){el.focus();try{el.setSelectionRange(draft.start,draft.end)}catch(e){}timeline.scrollTop=draft.top}}
+function renderBlockPanel(state,messages){const blocked=latestBlockedMessage(messages,state);if(!state.blocked&&!blocked)return '';const body=(blocked?.body||state.block_reason||'当前流程要求用户补充决策，但没有找到具体阻塞消息。请查看下方最新用户消息。').trim();const from=blocked?.from||'antigravity';const next=from==='codex'?'Antigravity':'Codex';const hard=!!state.blocked;const title=hard?'需要用户介入':'等待你的回复';const text=hard?`当前有 ${Number(state.blocking_count||1)} 个阻塞问题，自动转发已暂停。你的回答会作为 ${blocked?esc(agentLabel(from)):'提问方'} -> ${next} 的续接消息，不会把你加入主对话链。`:`这条消息发给了你，但没有标记为最终结束。你的回复会作为 ${esc(agentLabel(from))} -> ${next} 的续接消息继续流转。`;return `<div class="block-panel"><div class="block-title">${title}</div><div class="block-text">${text}</div><div class="block-question"><div class="block-question-title">${hard?'需要你拍板的问题':'需要你回复的消息'}${blocked?` · ${esc(agentLabel(from))} · ${esc(formatTime(blocked.created_at))}`:''}</div><div class="block-question-body">${esc(body)}</div></div><textarea id="userDecisionText" placeholder="在这里写你的决策、回复或补充约束。"></textarea><div class="row" style="margin-top:8px;justify-content:flex-end"><button class="btn primary" onclick="submitUserDecision(this)">${hard?'提交决策并续接':'提交回复并续接'}</button></div></div>`}
+function renderAwaitingPanel(state){const awaiting=state?.awaiting_outbox;if(!awaiting||state.blocked||state.done)return '';const elapsed=Number(awaiting.elapsed_seconds)||0;if(elapsed<45)return '';const agent=agentLabel(awaiting.from||'Agent');const wait=formatDuration(elapsed*1000)||'0 秒';const round=awaiting.round?`第 ${esc(awaiting.round)} 轮`:'下一轮';const source=awaiting.source_message_id?`来源消息：${esc(awaiting.source_message_id)}`:'首轮任务';return `<div class="awaiting-panel"><div class="awaiting-title">等待 ${esc(agent)} 回复</div><div class="awaiting-text">任务已经发送给 ${esc(agent)}，本地 messages.jsonl 暂时还没有出现对应回复。已等待 ${esc(wait)}。如果对方还在思考，这是正常等待；如果对方窗口已经显示“已写入”但这里一直不更新，可能是没有真正执行写入命令。</div><div class="awaiting-meta">${round} · ${source}</div><div class="awaiting-actions"><button class="btn" onclick="retryAwaiting(this)">重新发送给 ${esc(agent)}</button><button class="btn danger" onclick="markAwaitingAbnormal(this)">标记为异常</button></div></div>`}
+function renderTimeline(messages,state){const el=timeline;const draft=captureDecisionDraft();const block=renderBlockPanel(state||{},messages||[]);const awaiting=renderAwaitingPanel(state||{});const prefix=block+awaiting;if(!messages.length){el.innerHTML=prefix||'<div class="empty">暂无消息</div>';restoreDecisionDraft(draft);return}const forwarded=new Set(state.forwarded_ids||[]);const durations=buildReplyDurationMap(messages);const ordered=[...messages].sort((a,b)=>messageSortKey(b).localeCompare(messageSortKey(a)));el.innerHTML=prefix+ordered.map(m=>{const side=messageSide(m);const hasForwarded=forwarded.has(m.id);const canRetry=canRetryMessage(m,state,hasForwarded,messages);const avatar=side==='user'?'':agentAvatar(m.from);const flow=flowInfo(m,hasForwarded);const duration=formatDuration(durations.get(m.id));const files=extractMessageFiles(m);const doneExtra=(m.done&&m.type!=='final')?'<span class="tag done">已结束</span>':'';return `<div class="msg-row ${side}">${avatar}<div class="msg"><div class="msg-head"><div><div class="msg-route"><span class="from">${esc(agentLabel(m.from))}</span> -> <span class="to">${esc(agentLabel(m.to))}</span></div><div class="msg-time"><span>${esc(formatTime(m.created_at))}</span>${duration?`<span class="msg-duration">回复用时 ${esc(duration)}</span>`:''}</div></div><div class="msg-tags"><span class="tag round">第 ${esc(m.round||'-')} 轮</span><span class="tag type">${esc(messageTypeLabel(m.type,m.done))}</span><span class="tag ${flow.cls}">${esc(flow.text)}</span>${doneExtra}</div></div><div class="msg-body">${esc(m.body||'')}</div>${renderMessageFiles(files)}${canRetry?`<div class="msg-actions"><span class="retry-help">故障恢复：再次发送给 ${esc(agentLabel(m.to))}</span><button class="btn" title="把这条已转发消息恢复为待转发，用于对方没有收到或 UI 发送失败时重试。" onclick="retryMessage('${esc(m.id)}')">重新发送给对方</button></div>`:''}</div></div>`}).join('');restoreDecisionDraft(draft);if(!draft?.focused)el.scrollTop=0}
+function openTextModal(title,meta,path,body){docModalTitle.textContent=title;docModalMeta.textContent=meta||'';docModalPath.textContent=path||'';docModalBody.textContent=body||'';docModal.classList.add('show')}
+function openTopicModal(){const body=currentTopicText||topic.value||'暂无讨论目标';openTextModal('完整讨论目标',selected?`会话：${selected}`:'新建会话','左侧配置区可编辑原文',body)}
+function openDocModal(index){const f=currentDocs[index];if(!f)return;openTextModal(docLabel(f.name),`${f.name} · ${(f.content||'').length} 字`,f.path||'',f.content||'')}
+function closeDocModal(){docModal.classList.remove('show')}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDocModal()})
+function renderInspector(meta,state,watcher,paths,workspace,messages=[],pending=0){currentDocs=orderedDocs(workspace.files||[],state);const docs=currentDocs.map((f,i)=>{const status=docStatus(f.name,f.content,state);const cardCls=status.cls==='green'?'done':(status.cls==='red'?'blocked':'');return `<div class="doc-card ${cardCls}" role="button" tabindex="0" onclick="openDocModal(${i})" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openDocModal(${i})}"><div class="doc-title"><div class="doc-heading"><div class="doc-name">${esc(docLabel(f.name))}<span class="doc-open">查看详情</span></div><div class="doc-sub">${esc(docPurpose(f.name))}</div></div><div class="doc-count">${(f.content||'').length} 字</div></div><div class="doc-meta-row"><span class="doc-badge ${status.cls}">${esc(status.text)}</span><span class="doc-badge">最后：${esc(docOwner(f.name,messages))}</span><span class="doc-badge">${esc(docRoundBadge(f.name,messages))}</span><span class="doc-badge">${esc(docModifiedText(f))}</span></div><div class="doc-body">${esc(cleanDocSummary(f.name,f.content))}</div></div>`}).join('');const docHead=`<div class="docs-head"><div><div class="label">工作文档</div><div class="docs-note">优先看结论、目标、方案和评审；路径只在详情弹窗中显示。</div></div></div>`;inspector.innerHTML=`${renderStateMini(meta,state,watcher,pending)}<div class="docs">${workspace.enabled?docHead+docs:'<div class="empty" style="height:90px">当前模式不使用工作文档</div>'}</div>`}
+initDefaults();currentTopicText=topic.value||defaults.topic;currentTitle.title=currentTopicText;renderStatusCards({mode:chatMode.value},{phase:'planning',done:false,blocked:false,forwarded_ids:[]},{running:false,last_event:'尚未启动'},0);loadRoleTemplates().finally(()=>loadSessions().catch(err=>alert(err.message)));
+</script></body></html>'''
+
+
 def _get_benchmark_html() -> str:
     """模型测试台页面 v2：单模型独立运行 + 历史对比"""
     return '''<!DOCTYPE html>
@@ -3374,6 +4834,65 @@ input[type=file]{color:var(--muted);}
 .history-head span{font-size:11px;font-weight:600;color:var(--muted);}
 .count-badge{background:var(--bdg);border-radius:20px;padding:2px 8px;font-size:10px;color:var(--muted);}
 .empty{text-align:center;padding:32px;color:var(--muted);font-size:12px;}
+
+/* 自动化用例工作台 */
+.layout.automation-mode{grid-template-columns:1fr;}
+.layout.automation-mode .config{display:none;}
+.layout.automation-mode .results{padding:14px 18px;}
+.automation-shell{display:flex;flex-direction:column;gap:12px;min-height:520px;}
+.auto-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 12px;}
+.auto-toolbar-main{display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap;}
+.auto-toolbar-title{font-size:13px;font-weight:800;color:var(--text);}
+.auto-toolbar-sub{font-size:10px;color:var(--muted);}
+.auto-toolbar-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end;}
+.auto-toolbar-select,.auto-api-input{background:var(--btn-bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:11px;padding:7px 10px;min-width:190px;}
+.auto-api-chip{font-size:10px;color:var(--muted);background:var(--btn-bg);border:1px solid var(--border);border-radius:999px;padding:6px 9px;display:inline-flex;align-items:center;gap:6px;}
+.auto-api-edit{border:1px solid var(--border);background:var(--btn-bg);color:var(--text);border-radius:7px;padding:6px 9px;font-size:10px;cursor:pointer;}
+.auto-api-edit:hover{background:var(--btn-hov);}
+.auto-stat{font-size:10px;color:var(--muted);background:var(--bdg);border-radius:999px;padding:4px 8px;}
+.auto-scenarios{display:flex;gap:8px;overflow-x:auto;padding:0 1px 2px;}
+.auto-line{min-width:182px;max-width:240px;border:1px solid var(--border);background:var(--card);border-radius:10px;padding:9px 11px;cursor:pointer;transition:.18s;flex:0 0 auto;}
+.auto-line:hover{background:var(--btn-hov);}
+.auto-line.active{border-color:var(--as);background:rgba(102,126,234,.12);box-shadow:0 8px 24px rgba(102,126,234,.10);}
+.automation-content{display:grid;grid-template-columns:320px minmax(0,1fr);gap:12px;align-items:start;}
+.automation-panel{background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden;display:flex;flex-direction:column;min-width:0;}
+.automation-panel-head{padding:10px 12px;border-bottom:1px solid var(--border);font-size:11px;font-weight:800;color:var(--muted);display:flex;align-items:center;justify-content:space-between;gap:8px;}
+.automation-panel-body{padding:10px;overflow:auto;display:flex;flex-direction:column;gap:8px;}
+.auto-case{border:1px solid var(--border);background:var(--btn-bg);border-radius:10px;padding:10px 11px;cursor:pointer;transition:.18s;}
+.auto-case:hover{background:var(--btn-hov);}
+.auto-case.active{border-color:var(--as);background:rgba(102,126,234,.14);}
+.auto-case.invalid{border-color:rgba(248,113,113,.45);background:rgba(248,113,113,.08);}
+.auto-title{font-size:12px;font-weight:800;color:var(--text);line-height:1.45;}
+.auto-meta{font-size:10px;color:var(--muted);margin-top:6px;display:flex;flex-wrap:wrap;gap:5px;}
+.auto-pill{font-size:9px;padding:2px 7px;border-radius:999px;background:var(--bdg);color:var(--muted);}
+.auto-pill.ok{background:rgba(74,222,128,.13);color:var(--green);}
+.auto-pill.warn{background:rgba(250,204,21,.15);color:#b45309;}
+.auto-pill.bad{background:rgba(248,113,113,.13);color:var(--red);}
+.auto-detail h3{font-size:18px;margin:0 0 10px;color:var(--text);letter-spacing:0;}
+.auto-detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:8px;margin:10px 0 12px;}
+.auto-kv{background:var(--btn-bg);border:1px solid var(--border);border-radius:10px;padding:9px 10px;}
+.auto-kv span{display:block;font-size:9px;color:var(--muted);margin-bottom:5px;}
+.auto-kv b{font-size:12px;color:var(--text);}
+.auto-run-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:none;border-radius:9px;background:linear-gradient(135deg,var(--as),var(--ae));color:white;font-size:12px;font-weight:800;padding:8px 13px;cursor:pointer;box-shadow:0 8px 18px rgba(102,126,234,.22);}
+.auto-run-btn:disabled{opacity:.45;cursor:not-allowed;box-shadow:none;}
+.auto-detail-section{border:1px solid var(--border);background:rgba(255,255,255,.025);border-radius:12px;padding:12px;margin-top:10px;}
+.auto-section-title{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:800;color:var(--text);margin-bottom:9px;}
+.auto-section-sub{font-size:10px;font-weight:500;color:var(--muted);}
+.auto-steps{display:flex;flex-direction:column;gap:8px;}
+.auto-step{display:grid;grid-template-columns:30px minmax(0,1fr);gap:9px;background:var(--btn-bg);border:1px solid var(--border);border-radius:10px;padding:9px;}
+.auto-step-index{width:24px;height:24px;border-radius:8px;background:rgba(102,126,234,.14);color:var(--as);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;}
+.auto-step-title{font-size:12px;font-weight:800;color:var(--text);line-height:1.45;}
+.auto-step-desc{font-size:11px;color:var(--muted);line-height:1.7;margin-top:3px;word-break:break-word;}
+.auto-hint{font-size:11px;color:var(--muted);line-height:1.7;background:var(--btn-bg);border:1px dashed var(--border);border-radius:10px;padding:10px;}
+.auto-raw{border:1px solid var(--border);border-radius:10px;background:var(--btn-bg);margin-top:10px;overflow:hidden;}
+.auto-raw summary{cursor:pointer;list-style:none;padding:10px 12px;font-size:11px;font-weight:800;color:var(--text);}
+.auto-raw summary::-webkit-details-marker{display:none;}
+.auto-code{margin:0;background:#111827;color:#e5e7eb;text-shadow:none;border-top:1px solid rgba(255,255,255,.08);padding:12px;font-size:10px;font-family:'JetBrains Mono',monospace;white-space:pre-wrap;word-break:break-word;max-height:260px;overflow:auto;}
+.auto-run-summary{border:1px solid var(--border);background:var(--card);border-radius:12px;padding:12px;margin-top:10px;}
+.auto-run-note{font-size:11px;line-height:1.7;color:#b45309;background:rgba(250,204,21,.12);border:1px solid rgba(250,204,21,.28);border-radius:10px;padding:8px 10px;margin-bottom:10px;}
+.auto-run-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:8px;}
+.auto-run-path{font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace;word-break:break-all;background:var(--btn-bg);border-radius:999px;padding:4px 8px;}
+@media(max-width:1100px){.automation-content{grid-template-columns:1fr;}.auto-detail-grid{grid-template-columns:repeat(2,minmax(0,1fr));}.auto-toolbar{align-items:flex-start;flex-direction:column;}.auto-toolbar-actions{justify-content:flex-start;}.automation-panel{min-height:220px;}}
 
 /* 历史卡片 */
 .hist-card{background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;transition:.2s;}
@@ -3560,6 +5079,7 @@ input[type=file]{color:var(--muted);}
   <button class="tab-btn" onclick="switchTab('speed',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg> 速度基准</button>
   <button class="tab-btn" onclick="switchTab('ag',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg> AG识别</button>
   <button class="tab-btn" onclick="switchTab('supervisor',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20"></path><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg> AG 监工</button>
+  <button class="tab-btn" onclick="switchTab('automation',this)" style="display:inline-flex; align-items:center; gap:5px;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"></path><path d="m9 12 2 2 4-5"></path></svg> 自动化用例</button>
 </div>
 
 <!-- 主布局 -->
@@ -3642,6 +5162,16 @@ input[type=file]{color:var(--muted);}
             <span style="font-size:12px;">🔄 切换到 Claude Sonnet 4.6 (Thinking) — Group3</span>
           </label>
         </div>
+      </div>
+      <div id="inp-automation" class="tab-input">
+        <label class="lbl">项目</label>
+        <select id="autoProject" onchange="loadAutomationInventory()" style="width:100%;padding:8px 10px;background:var(--btn-bg);border:1px solid var(--border);border-radius:7px;color:var(--text);font-size:12px;"></select>
+        <label class="lbl" style="margin-top:6px;">API Base</label>
+        <input type="text" id="autoApiBase" value="http://127.0.0.1:8010" placeholder="例：http://127.0.0.1:8010">
+        <p style="font-size:11px;color:var(--muted);line-height:1.7;margin-top:4px;">
+          读取项目 `.agents/business_lines.yaml` 和 `.agents/cases/*.yaml`。第一版执行 API case；App/WAP case 先展示步骤与断言，后续接入执行器。
+        </p>
+        <button class="clear-btn" onclick="loadAutomationInventory()" style="width:100%;margin-top:4px;">刷新用例资产</button>
       </div>
       <div id="inp-supervisor" class="tab-input">
         <label class="lbl">AG 监工</label>
@@ -3844,10 +5374,46 @@ const MODELS = [
 // ── 状态 ────────────────────────────────────────────────────
 let currentTab   = 'intent';
 let selectedModel = 'omlx_26b';
-let history      = {intent:[], code:[], vision:[], speed:[], ag:[], supervisor:[]};  // 每个 Tab 独立历史
+let history      = {intent:[], code:[], vision:[], speed:[], ag:[], supervisor:[], automation:[]};  // 每个 Tab 独立历史
 let visionDots   = [];   // 当前 vision tab 的所有坐标点 [{label,color,nx,ny}]
 let visionImgNW  = 0, visionImgNH = 0;  // 图片原始尺寸
 let visionB64    = '';
+let automationState = {
+  projects: [],
+  inventory: null,
+  selectedLine: null,
+  selectedCase: null,
+  detail: null,
+  lastRun: null,
+  loading: false,
+  showApiBase: false,
+};
+
+const ACTION_LABELS = {
+  http_call: '接口请求',
+  login: '登录',
+  app_click: 'App 点击',
+  app_fill: 'App 输入',
+  wap_click: 'WAP 页面点击',
+  approve_task_for_instance: '审批通过',
+  reject_task_for_instance: '审批驳回',
+  return_task_for_instance: '审批退回',
+};
+
+const OP_LABELS = {
+  eq: '等于',
+  ne: '不等于',
+  gt: '大于',
+  gte: '≥',
+  lt: '小于',
+  lte: '≤',
+  contains: '包含',
+  not_contains: '不包含',
+  len_gte: '数量 ≥',
+  len_eq: '数量 =',
+  exists: '存在',
+  not_exists: '不存在',
+};
 
 // ── 主题与 SVG 常量 ──────────────────────────────────────────
 const SVG_MOON = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>`;
@@ -3903,11 +5469,17 @@ function switchTab(id, el) {
   // 隐藏与本标签无关的控制区
   const runActionRow = document.querySelector('.action-row');
   const optSec = document.getElementById('optSec');
-  if (runActionRow) runActionRow.style.display = id==='supervisor' ? 'none' : 'flex';
-  if (optSec) optSec.style.display = id==='supervisor' ? 'none' : 'block';
+  const modelSec = document.getElementById('modelSec');
+  const layout = document.querySelector('.layout');
+  const specialTab = id==='supervisor' || id==='automation';
+  if (runActionRow) runActionRow.style.display = specialTab ? 'none' : 'flex';
+  if (optSec) optSec.style.display = specialTab ? 'none' : 'block';
+  if (modelSec) modelSec.style.display = id==='automation' ? 'none' : 'block';
+  if (layout) layout.classList.toggle('automation-mode', id==='automation');
   // 视觉定位画布：仅在 vision tab 且已有上传图时显示
   const visionWS = document.getElementById('visionWS');
   if (visionWS) visionWS.style.display = (id === 'vision' && visionB64) ? '' : 'none';
+  if (id === 'automation') initAutomationTab();
 }
 
 // ── 模型选择 ────────────────────────────────────────────────
@@ -4263,6 +5835,14 @@ function renderHistory() {
     pollSupervisor();
     return;
   }
+  if (currentTab === 'automation') {
+    document.getElementById('summaryWrap').style.display = 'none';
+    document.getElementById('histCount').textContent = automationState.inventory
+      ? `${automationState.inventory.stats.case_count} 个`
+      : '0 个';
+    renderAutomationWorkspace();
+    return;
+  }
 
   // 对比摘要
   renderSummary(list);
@@ -4273,6 +5853,405 @@ function renderHistory() {
     return;
   }
   el.innerHTML = list.map((r,i) => renderCard(r, i)).join('');
+}
+
+async function initAutomationTab() {
+  if (automationState.projects.length) {
+    renderAutomationWorkspace();
+    return;
+  }
+  automationState.loading = true;
+  renderAutomationWorkspace();
+  try {
+    const res = await fetch('/api/automation/projects');
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || '读取项目失败');
+    automationState.projects = data.projects || [];
+    const select = document.getElementById('autoProject');
+    if (select) {
+      select.innerHTML = automationState.projects.map(p => `<option value="${escHtml(p.id)}">${escHtml(p.name)} (${escHtml(p.id)})</option>`).join('');
+    }
+    if (automationState.projects[0]) await loadAutomationInventory();
+  } catch (e) {
+    automationState.lastRun = {status:'failed', error:String(e)};
+    renderAutomationWorkspace();
+  } finally {
+    automationState.loading = false;
+  }
+}
+
+async function loadAutomationInventory() {
+  const project = document.getElementById('autoProject')?.value || automationState.projects[0]?.id || 'qingoa';
+  automationState.loading = true;
+  automationState.inventory = null;
+  automationState.selectedLine = null;
+  automationState.selectedCase = null;
+  automationState.detail = null;
+  renderAutomationWorkspace();
+  try {
+    const res = await fetch(`/api/automation/projects/${encodeURIComponent(project)}/inventory`);
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || '读取 inventory 失败');
+    automationState.inventory = data;
+    automationState.selectedLine = data.business_lines?.[0]?.id || null;
+    automationState.selectedCase = data.business_lines?.[0]?.cases?.[0]?.id || null;
+    if (automationState.selectedCase) await selectAutomationCase(automationState.selectedCase, false);
+  } catch (e) {
+    automationState.lastRun = {status:'failed', error:String(e)};
+  } finally {
+    automationState.loading = false;
+    renderAutomationWorkspace();
+  }
+}
+
+function selectAutomationLine(id) {
+  automationState.selectedLine = id;
+  const line = automationState.inventory?.business_lines?.find(x => x.id === id);
+  automationState.selectedCase = line?.cases?.[0]?.id || null;
+  automationState.detail = null;
+  if (automationState.selectedCase) selectAutomationCase(automationState.selectedCase);
+  renderAutomationWorkspace();
+}
+
+async function selectAutomationCase(caseId, rerender=true) {
+  const project = automationState.inventory?.project?.id || document.getElementById('autoProject')?.value || 'qingoa';
+  automationState.selectedCase = caseId;
+  if (rerender) renderAutomationWorkspace();
+  try {
+    const res = await fetch(`/api/automation/projects/${encodeURIComponent(project)}/cases/${encodeURIComponent(caseId)}`);
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || '读取 case 详情失败');
+    automationState.detail = data;
+  } catch (e) {
+    automationState.detail = {error:String(e)};
+  }
+  renderAutomationWorkspace();
+}
+
+async function runAutomationCase() {
+  const caseId = automationState.selectedCase;
+  if (!caseId) return;
+  const project = automationState.inventory?.project?.id || 'qingoa';
+  const apiBase = currentAutomationApiBase();
+  automationState.lastRun = {status:'running'};
+  renderAutomationWorkspace();
+  try {
+    const res = await fetch('/api/automation/run', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({project, case_id: caseId, api_base: apiBase})
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || '运行失败');
+    automationState.lastRun = data.run;
+  } catch (e) {
+    automationState.lastRun = {status:'failed', error:String(e)};
+  }
+  renderAutomationWorkspace();
+}
+
+function currentAutomationApiBase() {
+  return document.getElementById('autoApiBase')?.value || 'http://127.0.0.1:8010';
+}
+
+function setAutomationProject(project) {
+  const select = document.getElementById('autoProject');
+  if (select) select.value = project;
+  loadAutomationInventory();
+}
+
+function toggleAutomationApiBase() {
+  automationState.showApiBase = !automationState.showApiBase;
+  renderAutomationWorkspace();
+}
+
+function setAutomationApiBase(value) {
+  const input = document.getElementById('autoApiBase');
+  if (input) input.value = value || 'http://127.0.0.1:8010';
+}
+
+function automationValueText(value) {
+  if (value === undefined || value === null || value === '') return '-';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+function automationLastPathName(path) {
+  const text = String(path || '').replace(/^\$[^.]+\.?/, '');
+  const parts = text.split('.').filter(Boolean);
+  return parts[parts.length - 1] || '结果';
+}
+
+function automationActionLabel(action) {
+  return ACTION_LABELS[action] || action || '步骤';
+}
+
+function describeAutomationAction(step) {
+  if (!step) return '未提供步骤内容';
+  const action = step.action || step.type || step.kind || 'step';
+  const label = automationActionLabel(action);
+  if (action === 'http_call' || step.method || step.url) {
+    const method = step.method || step.request?.method || 'GET';
+    const url = step.url || step.request?.url || step.endpoint || '';
+    return `${label}：${method} ${url}`;
+  }
+  if (action === 'login') {
+    return `登录账号：${step.username || step.actor || step.role || '测试用户'}`;
+  }
+  if (action === 'app_click' || action === 'wap_click') {
+    return `${label}：${step.target || step.selector || step.data_testid || step.element || '目标元素'}`;
+  }
+  if (action === 'app_fill') {
+    return `${label}：${step.target || step.selector || '输入框'} = ${automationValueText(step.value || step.text)}`;
+  }
+  if (action.includes('task_for_instance')) {
+    return `${label}：流程实例 ${step.instance_id || step.process_instance_id || '$当前流程'}`;
+  }
+  return `${label}：${automationValueText(step.title || step.target || step.description || step.id || '')}`;
+}
+
+function describeAutomationExpected(item) {
+  if (!item) return '未提供验证点';
+  if (item.type === 'http_call' || item.method || item.url) {
+    const method = item.method || 'GET';
+    return `调用断言接口：${method} ${item.url || item.endpoint || ''}`;
+  }
+  if (item.type === 'assert' || item.path || item.operator) {
+    const field = automationLastPathName(item.path);
+    const op = OP_LABELS[item.operator] || item.operator || '符合';
+    const value = (item.operator === 'exists' || item.operator === 'not_exists')
+      ? ''
+      : ` ${automationValueText(item.value ?? item.expected)}`;
+    return `验证 ${field} ${op}${value}`;
+  }
+  return automationValueText(item.message || item.description || item);
+}
+
+function renderAutomationStepList(title, items, mode) {
+  const rows = Array.isArray(items) ? items : [];
+  if (!rows.length) return '';
+  return `
+    <div class="auto-detail-section">
+      <div class="auto-section-title">
+        <span>${title}</span>
+        <span class="auto-section-sub">${rows.length} 项</span>
+      </div>
+      <div class="auto-steps">
+        ${rows.map((item, idx) => `
+          <div class="auto-step">
+            <div class="auto-step-index">${idx + 1}</div>
+            <div>
+              <div class="auto-step-title">${escHtml(mode === 'expected' ? '验证点' : automationActionLabel(item.action || item.type || item.kind))}</div>
+              <div class="auto-step-desc">${escHtml(mode === 'expected' ? describeAutomationExpected(item) : describeAutomationAction(item))}</div>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    </div>`;
+}
+
+function renderAutomationRunSteps(run) {
+  const steps = Array.isArray(run?.steps) ? run.steps : [];
+  const assertions = Array.isArray(run?.assertions) ? run.assertions : [];
+  if (!steps.length && !assertions.length) return '';
+  return `
+    ${steps.length ? `
+      <div class="auto-detail-section">
+        <div class="auto-section-title"><span>执行记录</span><span class="auto-section-sub">${steps.length} 步</span></div>
+        <div class="auto-steps">
+          ${steps.slice(0, 8).map((step, idx) => `
+            <div class="auto-step">
+              <div class="auto-step-index">${idx + 1}</div>
+              <div>
+                <div class="auto-step-title">${escHtml(step.id || automationActionLabel(step.kind || step.type))} · ${escHtml(step.status || '-')}</div>
+                <div class="auto-step-desc">${escHtml(step.url || step.message || step.error || '')}</div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>` : ''}
+    ${assertions.length ? `
+      <div class="auto-detail-section">
+        <div class="auto-section-title"><span>断言结果</span><span class="auto-section-sub">${assertions.length} 条</span></div>
+        <div class="auto-steps">
+          ${assertions.slice(0, 8).map((item, idx) => `
+            <div class="auto-step">
+              <div class="auto-step-index">${idx + 1}</div>
+              <div>
+                <div class="auto-step-title">${escHtml(item.status || '-')}</div>
+                <div class="auto-step-desc">${escHtml(item.message || describeAutomationExpected(item))}</div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>` : ''}
+  `;
+}
+
+function renderAutomationWorkspace() {
+  const el = document.getElementById('histList');
+  if (!el) return;
+  if (automationState.loading && !automationState.inventory) {
+    el.innerHTML = '<div class="empty">正在读取自动化用例资产...</div>';
+    return;
+  }
+  const inv = automationState.inventory;
+  if (!inv) {
+    const err = automationState.lastRun?.error ? `<div class="auto-hint">${escHtml(automationState.lastRun.error)}</div>` : '';
+    el.innerHTML = `<div class="empty">进入自动化用例 Tab 后会读取项目用例清单</div>${err}`;
+    return;
+  }
+  const selectedLine = inv.business_lines.find(x => x.id === automationState.selectedLine) || inv.business_lines[0];
+  const cases = selectedLine?.cases || [];
+  const selectedSummary = cases.find(x => x.id === automationState.selectedCase) || cases[0];
+  const detail = automationState.detail?.case;
+  const summary = automationState.detail?.summary || selectedSummary;
+  const apiBase = currentAutomationApiBase();
+  const projectOptions = automationState.projects.map(p =>
+    `<option value="${escHtml(p.id)}" ${p.id===inv.project?.id?'selected':''}>${escHtml(p.name)} · ${escHtml(p.id)}</option>`
+  ).join('');
+  const runButtonLabel = summary?.runnable ? '运行接口用例' : '暂不支持运行';
+  const runButtonTitle = summary?.runnable
+    ? '执行接口级 case，不会控制 App 或 WAP'
+    : (summary?.executor_reason || '当前 case 包含 App/WAP/视觉等步骤，第一版 Web runner 暂不执行');
+  el.innerHTML = `
+    <div class="automation-shell">
+      <div class="auto-toolbar">
+        <div class="auto-toolbar-main">
+          <div>
+            <div class="auto-toolbar-title">自动化测试用例</div>
+            <div class="auto-toolbar-sub">按测试场景组织 QingOA v1.7 用例，当前 Web 入口先执行接口用例</div>
+          </div>
+          <select class="auto-toolbar-select" onchange="setAutomationProject(this.value)">${projectOptions}</select>
+          <span class="auto-stat">${inv.stats.business_line_count} 个测试场景</span>
+          <span class="auto-stat">${inv.stats.case_count} 个测试用例</span>
+          <span class="auto-stat">${inv.stats.runnable_count} 个可运行</span>
+        </div>
+        <div class="auto-toolbar-actions">
+          <span class="auto-api-chip">API: ${escHtml(apiBase.replace(/^https?:\\/\\//,''))}</span>
+          <button class="auto-api-edit" onclick="toggleAutomationApiBase()">修改</button>
+          <button class="auto-api-edit" onclick="loadAutomationInventory()">刷新用例</button>
+          ${automationState.showApiBase ? `<input class="auto-api-input" value="${escHtml(apiBase)}" onchange="setAutomationApiBase(this.value)" onkeydown="if(event.key==='Enter'){setAutomationApiBase(this.value);toggleAutomationApiBase();}">` : ''}
+        </div>
+      </div>
+
+      <div class="auto-scenarios">
+        ${inv.business_lines.map(line => `
+          <div class="auto-line ${line.id===selectedLine?.id?'active':''}" onclick="selectAutomationLine('${escJs(line.id)}')">
+            <div class="auto-title">${escHtml(line.title)}</div>
+            <div class="auto-meta">
+              <span class="auto-pill">${escHtml(line.priority)}</span>
+              <span class="auto-pill">${line.case_count} 用例</span>
+              <span class="auto-pill ok">${line.runnable_count} 可运行</span>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+
+      <div class="automation-content">
+        <div class="automation-panel">
+          <div class="automation-panel-head">
+            <span>测试用例</span>
+            <span class="auto-pill">${cases.length} 个</span>
+          </div>
+          <div class="automation-panel-body">
+            ${cases.map(c => `
+              <div class="auto-case ${c.id===summary?.id?'active':''} ${c.schema_status==='invalid'?'invalid':''}" onclick="selectAutomationCase('${escJs(c.id)}')">
+                <div class="auto-title">${escHtml(c.title)}</div>
+                <div class="auto-meta">
+                  <span class="auto-pill">${escHtml(c.priority)}</span>
+                  <span class="auto-pill ${c.schema_status==='valid'?'ok':'bad'}">${c.schema_status==='valid'?'结构有效':'结构异常'}</span>
+                  <span class="auto-pill ${c.runnable?'ok':'warn'}">${c.runnable?'接口可运行':'仅查看'}</span>
+                </div>
+              </div>
+            `).join('') || '<div class="empty">当前测试场景没有用例</div>'}
+          </div>
+        </div>
+        <div class="automation-panel auto-detail">
+          <div class="automation-panel-head">
+            <span>用例详情 / 运行报告</span>
+            ${summary ? `<button class="auto-run-btn" onclick="runAutomationCase()" title="${escHtml(runButtonTitle)}" ${summary.runnable?'':'disabled'}>${runButtonLabel}</button>` : ''}
+          </div>
+          <div class="automation-panel-body">
+            ${renderAutomationDetail(detail, summary)}
+            ${renderAutomationRun(automationState.lastRun, summary?.id)}
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderAutomationDetail(detail, summary) {
+  if (!summary) return '<div class="empty">请选择一个测试用例</div>';
+  if (automationState.detail?.error) return `<div class="auto-hint">${escHtml(automationState.detail.error)}</div>`;
+  const layers = summary.layers || detail?.layers || [];
+  const preconditions = detail?.preconditions || [];
+  const steps = detail?.steps || [];
+  const expected = detail?.expected || [];
+  return `
+    <h3>${escHtml(summary.title)}</h3>
+    <div class="auto-detail-grid">
+      <div class="auto-kv"><span>测试场景</span><b>${escHtml(summary.business_line)}</b></div>
+      <div class="auto-kv"><span>优先级</span><b>${escHtml(summary.priority)}</b></div>
+      <div class="auto-kv"><span>步骤</span><b>${summary.step_count}</b></div>
+      <div class="auto-kv"><span>验证点</span><b>${summary.expected_count}</b></div>
+      <div class="auto-kv"><span>覆盖范围</span><b>${escHtml(layers.join(' / ') || '-')}</b></div>
+      <div class="auto-kv"><span>执行方式</span><b>${summary.runnable ? '接口 runner' : '暂不支持'}</b></div>
+    </div>
+    <div class="auto-meta" style="margin-bottom:8px;">
+      ${layers.map(x=>`<span class="auto-pill">${escHtml(x)}</span>`).join('')}
+      <span class="auto-pill ${summary.runnable?'ok':'warn'}">${escHtml(summary.executor_reason || (summary.runnable ? '可由 API runner 执行' : '仅查看'))}</span>
+    </div>
+    ${summary.runnable ? '' : '<div class="auto-hint">这个用例包含 App / WAP / 视觉等操作。当前 Web 入口只执行接口级步骤，所以这里先展示它要做什么、检查什么；后续接入对应执行器后再开放运行。</div>'}
+    ${summary.schema_errors?.length ? `<div class="auto-hint">${summary.schema_errors.map(escHtml).join('<br>')}</div>` : ''}
+    ${renderAutomationStepList('前置准备', preconditions, 'step')}
+    ${renderAutomationStepList('执行步骤', steps, 'step')}
+    ${renderAutomationStepList('验证点', expected, 'expected')}
+    <details class="auto-raw">
+      <summary>查看 YAML / JSON 原始定义</summary>
+      <pre class="auto-code">${escHtml(JSON.stringify(detail || {}, null, 2))}</pre>
+    </details>
+  `;
+}
+
+function renderAutomationRun(run, currentCaseId) {
+  if (!run) return '';
+  if (run.status === 'running') {
+    return `
+      <div class="auto-run-summary">
+        <div class="auto-run-row">
+          <span class="auto-pill warn">运行中</span>
+          <span class="auto-pill">正在执行接口用例...</span>
+        </div>
+      </div>`;
+  }
+  const sameCase = !currentCaseId || !run.case_id || run.case_id === currentCaseId;
+  const statusClass = run.status === 'passed' ? 'ok' : 'bad';
+  return `
+    <div class="auto-run-summary">
+      ${sameCase ? '' : '<div class="auto-run-note">下面是上一条运行记录，不属于当前选中的用例。点击“运行接口用例”后会刷新为当前用例报告。</div>'}
+      <div class="auto-section-title">
+        <span>最近运行报告</span>
+        <span class="auto-section-sub">${escHtml(run.started_at || '')}</span>
+      </div>
+      <div class="auto-run-row">
+        <span class="auto-pill ${statusClass}">${run.status === 'passed' ? '通过' : (run.status === 'failed' ? '失败' : escHtml(run.status || '未知'))}</span>
+        ${run.title ? `<span class="auto-pill">${escHtml(run.title)}</span>` : ''}
+        ${run.case_id ? `<span class="auto-pill">${escHtml(run.case_id)}</span>` : ''}
+      </div>
+      ${run.error ? `<div class="auto-hint">${escHtml(run.error)}</div>` : ''}
+      ${run.report_path ? `<div class="auto-run-path">${escHtml(run.report_path)}</div>` : ''}
+      ${renderAutomationRunSteps(run)}
+      <details class="auto-raw">
+        <summary>查看原始运行结果</summary>
+        <pre class="auto-code">${escHtml(JSON.stringify(run, null, 2))}</pre>
+      </details>
+    </div>
+  `;
+}
+
+function escJs(s) {
+  return JSON.stringify(String(s ?? '')).slice(1,-1).replace(/'/g, "\\'");
 }
 
 function renderCard(r, i) {

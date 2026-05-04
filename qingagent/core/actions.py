@@ -7,6 +7,7 @@ from __future__ import annotations
 坐标转换：归一化坐标 (0-1000) → 物理像素坐标。
 """
 import time
+import subprocess
 import pyautogui
 import pyperclip
 from .. import config
@@ -100,7 +101,6 @@ def type_text(text: str):
     参数:
         text: 要输入的文本（支持中文）
     """
-    import subprocess
     # 切换到系统 ABC 输入法（安全），避免 WeType 与 Tkinter 的兼容性 crash
     subprocess.run(
         ["osascript", "-e",
@@ -110,7 +110,16 @@ def type_text(text: str):
     time.sleep(0.15)
     
     pyperclip.copy(text)
-    pyautogui.hotkey("command", "v")
+    time.sleep(0.08)
+    # macOS 上 pyautogui.hotkey 偶发只送出普通 v；System Events 能把 command 修饰键绑定在同一次事件里。
+    paste = subprocess.run(
+        ["osascript", "-e", 'tell application "System Events" to keystroke "v" using command down'],
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    if paste.returncode != 0:
+        pyautogui.hotkey("command", "v")
     time.sleep(0.3)
     print(f"⌨️ 已输入：{text[:50]}{'...' if len(text) > 50 else ''}")
 

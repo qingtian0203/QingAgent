@@ -222,8 +222,8 @@ class QingTianUtilSkill(BaseSkill):
             return {"success": False, "message": "无法打开晴天Util", "data": None}
 
         # 步骤 1：切到工作日历标签
-        # ⚠️ 先截一次热身图，确保 _last_screenshot_rect 已被赋值含 PAD 的扩边 rect
-        # 否则激活后第一次 find_and_click 会直接用无 PAD 的 _window_rect 做坐标换算导致点歪
+        # ⚠️ 先截一次热身图，确保 _last_screenshot_rect 已绑定当前窗口 rect
+        # 否则激活后第一次 find_and_click 可能沿用过期窗口坐标导致点歪
         self.screenshot()
         self.check_cancel()
         self.find_and_click("顶部标签栏中'工作日历'文字")

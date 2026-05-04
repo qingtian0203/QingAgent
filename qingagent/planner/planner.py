@@ -145,7 +145,7 @@ class Planner:
 - 人称转换：用户说"问她干嘛呢"，实际发给对方应该是"你干嘛呢"
 - 示例1："给丸子发条微信说下午开会" → 1步，微信 send_message
 - 示例2："截图然后微信发给丸子" → 2步，先截图(step1)，再微信发送(image_path="${{step1.screenshot_path}}")
-- 示例3："截下微信的图，把这个截图发给晴天小米" → 2步：先截图System.custom_screenshot(target=微信)，再微信发图(image_path="${{step1.screenshot_path}}", contact_name=晴天小米)
+- 示例3："截下微信的图，把这个截图发给王经理" → 2步：先截图System.custom_screenshot(target=微信)，再微信发图(image_path="${{step1.screenshot_path}}", contact_name=王经理)
 - 示例4："截个图然后通过微信告诉她" → 2步：先截图，再 send_message(image_path="${{step1.screenshot_path}}")
 - 【关键判断】：只要指令同时含截图 + 发送两个动作，必须拆分为 2 步；不能把两步合并成 1 步
 - 【Web交互拦截】：如果用户说"发给我"、"让我看看"、"发到这个聊天"、"在这看"、"发给QingAI"，表示只需在当前 Web 界面上查看。**绝对不要去调用微信发送**！只需执行那个获取动作的 1 步即可（例如 1步：用 System 截图），获取完成后会自动显示展示在这里。

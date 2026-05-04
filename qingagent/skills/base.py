@@ -156,8 +156,8 @@ class BaseSkill:
             )
             print(f"✅ {self.app_name} 窗口就绪（等待了 {_time.time() - start_poll:.1f}s）：{self._window_rect}")
             print(f"⏱️ [激活应用] 耗时：{_time.time() - t0:.1f}s")
-            # 预热截图，确保 _last_screenshot_rect 已被赋值（含 PAD 扩边），
-            # 防止之后第一次 find_and_click 回退到无 PAD 的裸 _window_rect 导致偏移
+            # 预热截图，确保 _last_screenshot_rect 已被赋值为当前窗口矩形，
+            # 防止之后第一次 find_and_click 缺少截图坐标基准。
             self.screenshot()
             return True
         else:
@@ -165,7 +165,7 @@ class BaseSkill:
             return False
 
     def screenshot(self, save_path: str = None) -> str | None:
-        """截取当前应用窗口（向四周外扩 200px 以捕获溢出的弹窗和菜单）"""
+        """精确截取当前应用窗口；弹窗/菜单请先切换到对应窗口矩形。"""
         if not self._window_rect:
             print("❌ 尚未定位窗口，请先调用 activate()")
             return None
@@ -273,7 +273,7 @@ class BaseSkill:
         if not coords:
             return False
 
-        # 点击 (使用产生该截图的配套扩边 rect 进行精确换算)
+        # 点击 (使用产生该截图的窗口 rect 进行精确换算)
         self.check_cancel()
         target_rect = getattr(self, '_last_screenshot_rect', self._window_rect)
         actions.click_at_normalized(target_rect, coords)

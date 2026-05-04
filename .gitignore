@@ -37,3 +37,21 @@ test_ui.html
 
 # 运行时截图（/tmp 下已有，根目录偶发的调试图也忽略）
 *.png
+
+# 本地运行时数据
+runtime/
+
+# 本地服务运行产物
+server.log
+server.pid
+
+# 一次性调试/抓取产物
+download_model.py
+inspect_ag.py
+zh-CN.json
+app-session-*.js
+main-*.js
+
+# 运行时记忆与过渡 PoC
+qingagent/data/memory.json
+qingagent/qingoa_punch_poc.py
